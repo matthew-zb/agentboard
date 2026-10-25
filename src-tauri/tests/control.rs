@@ -205,10 +205,13 @@ fn tools_list_is_filtered_by_role() {
     let mb = fx.token(Role::Member);
     assert_eq!(
         tool_names(&fx, &m),
-        ["handoff_done", "inbox_list", "inbox_note", "inbox_post", "inbox_propose_close", "issue_create", "list_team"]
+        [
+            "dismiss", "dismiss_team", "handoff_done", "hire_lead", "inbox_list", "inbox_note", "inbox_post",
+            "inbox_propose_close", "issue_create", "list_team"
+        ]
     );
-    assert_eq!(tool_names(&fx, &d), ["handoff_done", "inbox_list"]);
-    assert_eq!(tool_names(&fx, &l), ["inbox_list", "list_team"]);
+    assert_eq!(tool_names(&fx, &d), ["create_manager_tab", "handoff_done", "inbox_list"]);
+    assert_eq!(tool_names(&fx, &l), ["dismiss", "dismiss_team", "hire_member", "inbox_list", "list_team"]);
     assert_eq!(tool_names(&fx, &mb), ["inbox_list"]);
 
     // tool defs are complete MCP tool objects
@@ -224,9 +227,10 @@ fn tools_list_is_filtered_by_role() {
     assert!(has_hangul(res["content"][0]["text"].as_str().unwrap()));
     let res = call(&fx, &m, "no_such_tool", json!({}));
     assert_eq!(res["isError"], true);
-    // planned but not yet implemented tools are refused as well
+    // a refused tool call (here: brief file missing) is isError + Korean
     let res = call(&fx, &m, "hire_lead", json!({"team":"x","brief_path":"x"}));
     assert_eq!(res["isError"], true);
+    assert!(has_hangul(res["content"][0]["text"].as_str().unwrap()));
 
     // list_team: the caller tab's teams
     let res = call(&fx, &m, "list_team", json!({}));

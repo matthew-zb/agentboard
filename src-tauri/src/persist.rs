@@ -248,7 +248,7 @@ mod tests {
         let p = api.layout.leaves()[1].clone();
         ws.apply(WsCommand::SplitPane { pane: p.clone(), dir: Dir::Vertical }, l).unwrap();
         ws.apply(
-            WsCommand::CreateTab { name: "web".into(), dir: "web".into(), template: Some("solo".into()), group: None },
+            WsCommand::CreateTab { name: "web".into(), dir: "web".into(), template: Some("solo".into()), group: None, role: None },
             l,
         )
         .unwrap();
@@ -431,7 +431,7 @@ mod tests {
         // the next id is fresh
         let mut b = back.clone();
         b.apply(
-            WsCommand::CreateTab { name: "z".into(), dir: "z".into(), template: Some("solo".into()), group: None },
+            WsCommand::CreateTab { name: "z".into(), dir: "z".into(), template: Some("solo".into()), group: None, role: None },
             &l,
         )
         .unwrap();

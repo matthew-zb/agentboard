@@ -694,6 +694,87 @@ pub fn sanitize_config(mut c: Config, file: &Path) -> (Config, Vec<ConfigError>)
     (c, errs)
 }
 
+/// Path of `config.json` under `workspace_root`.
+pub fn config_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".agentboard").join("config.json")
+}
+
+/// Outcome of [`append_config_tab`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigEdit {
+    /// The file already had this exact tab entry; nothing was written.
+    Unchanged,
+    /// Written; the previous text (`None`: there was no file) for [`restore_config_file`].
+    Written(Option<String>),
+}
+
+/// The `tabs[]` entry of `t` as written to config.json (`template` / `role` only when set).
+pub fn tab_spec_json(t: &TabSpec) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert("name".into(), t.name.clone().into());
+    m.insert("dir".into(), t.dir.clone().into());
+    if let Some(r) = t.role {
+        m.insert("role".into(), r.as_str().into());
+    }
+    if let Some(tpl) = &t.template {
+        m.insert("template".into(), tpl.clone().into());
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Append tab `t` to `tabs` of the config.json at `path` (`create_manager_tab`, Task 8). The
+/// file is round-tripped as a JSON value — never through the typed `Config` — so every other key
+/// the user wrote is kept, in its order; it is written atomically (`.tmp` + rename). An entry
+/// with the same name that is identical is left alone (`Unchanged`, a retried call); a
+/// different one is an error.
+pub fn append_config_tab(path: &Path, t: &TabSpec) -> Result<ConfigEdit, String> {
+    let prev = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("config.json을 읽을 수 없습니다 — {e}")),
+    };
+    let mut root: serde_json::Value = match &prev {
+        Some(text) => serde_json::from_str(text).map_err(|e| format!("config.json을 해석할 수 없어 탭을 추가하지 않았습니다 — {e}"))?,
+        None => serde_json::json!({}),
+    };
+    let obj = root.as_object_mut().ok_or("config.json의 최상위가 객체가 아니어서 탭을 추가하지 않았습니다")?;
+    let tabs = obj.entry("tabs").or_insert_with(|| serde_json::json!([]));
+    let arr = tabs.as_array_mut().ok_or("config.json의 tabs가 배열이 아니어서 탭을 추가하지 않았습니다")?;
+    let entry = tab_spec_json(t);
+    if let Some(old) = arr.iter().find(|v| v.get("name").and_then(|n| n.as_str()) == Some(t.name.as_str())) {
+        let same = old.get("dir").and_then(|d| d.as_str()) == Some(t.dir.as_str())
+            && old.get("role").and_then(|r| r.as_str()) == t.role.map(|r| r.as_str());
+        return if same { Ok(ConfigEdit::Unchanged) } else { Err(format!("config.json에 이름이 '{}'인 다른 탭이 이미 있습니다", t.name)) };
+    }
+    arr.push(entry);
+    let mut text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    text.push('\n');
+    write_file_atomic(path, &text)?;
+    Ok(ConfigEdit::Written(prev))
+}
+
+/// Undo an [`append_config_tab`] `Written(prev)`: put the previous text back (or remove the
+/// file it created).
+pub fn restore_config_file(path: &Path, prev: Option<&str>) -> Result<(), String> {
+    match prev {
+        Some(text) => write_file_atomic(path, text),
+        None => std::fs::remove_file(path).map_err(|e| format!("config.json을 되돌릴 수 없습니다 — {e}")),
+    }
+}
+
+/// Write `<path>.tmp` and rename it over `path` (readers never see a partial file).
+fn write_file_atomic(path: &Path, text: &str) -> Result<(), String> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, text)
+        .and_then(|_| std::fs::rename(&tmp, path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("config.json을 쓸 수 없습니다 — {e}")
+        })
+}
+
 pub fn validate_config(c: &Config, file: &Path) -> Vec<ConfigError> {
     sanitize_config(c.clone(), file).1
 }
@@ -1387,6 +1468,42 @@ mod tests {
     }
     fn paths(errs: &[ConfigError]) -> Vec<String> {
         errs.iter().map(|e| e.json_path.clone().unwrap_or_default()).collect()
+    }
+
+    #[test]
+    fn append_config_tab_keeps_other_keys_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let text = "{\n  \"nightlyRefresh\": \"04:30\",\n  \"tabs\": [{\"name\": \"a\", \"dir\": \"a\", \"x-note\": 1}],\n  \"defaultAgent\": \"claude\"\n}\n";
+        std::fs::write(&path, text).unwrap();
+        let spec = TabSpec { name: "ops".into(), dir: "ops".into(), template: None, role: Some(Role::Manager) };
+        assert_eq!(append_config_tab(&path, &spec).unwrap(), ConfigEdit::Written(Some(text.to_string())));
+        let out = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["tabs"][1], serde_json::json!({"name":"ops","dir":"ops","role":"manager"}));
+        assert_eq!(v["tabs"][0]["x-note"], 1, "unknown keys are kept");
+        assert_eq!(v["nightlyRefresh"], "04:30");
+        let (n, t, d) = (out.find("nightlyRefresh").unwrap(), out.find("\"tabs\"").unwrap(), out.find("defaultAgent").unwrap());
+        assert!(n < t && t < d, "key order kept: {out}");
+        assert!(!dir.path().join("config.json.tmp").exists());
+        // a retried identical append changes nothing; a clashing name is refused
+        assert_eq!(append_config_tab(&path, &spec).unwrap(), ConfigEdit::Unchanged);
+        let other = TabSpec { dir: "elsewhere".into(), ..spec.clone() };
+        assert!(append_config_tab(&path, &other).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), out);
+        // restore puts the old text back
+        restore_config_file(&path, Some(text)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        // a missing file is created, and restoring removes it again
+        let p2 = dir.path().join("new.json");
+        let e = append_config_tab(&p2, &spec).unwrap();
+        assert_eq!(e, ConfigEdit::Written(None));
+        restore_config_file(&p2, None).unwrap();
+        assert!(!p2.exists());
+        // unparsable file: refused, untouched
+        std::fs::write(&path, "{ nope").unwrap();
+        assert!(append_config_tab(&path, &spec).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ nope");
     }
 
     #[test]

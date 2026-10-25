@@ -3,7 +3,7 @@
 //!
 //! # Lock order (deadlock rules)
 //!
-//! App locks: `AppState::ws` (Mutex), `AppState::loaded` (RwLock, read-only in phase 1),
+//! App locks: `AppState::ws` (Mutex), `AppState::loaded` (RwLock, read-only except `create_manager_tab`),
 //! `AppState::prompts` (Mutex), `AppState::effects` (Mutex<Sender>), `AppSink::channels`
 //! (Mutex, reached through `AppState::ui` / the managed `Arc<AppSink>`). PtyManager-internal
 //! locks: per-pane `flush_lock`, the `panes` map, writer/master/killer.
@@ -66,6 +66,11 @@
 //!   taken one at a time, each released before the next; the pipe write and the PTY fallback
 //!   `PtyManager::write` run holding only `pump_lock` (R13: write is allowed off the worker).
 //!   Hook handlers take only `panes` (released) then `inner`/`wake`; they never write pipes.
+//! * `loaded(write)` (Task 8): taken only by the MCP tool `create_manager_tab`, alone — no other
+//!   lock held, none taken inside — around the atomic config.json append and the in-memory
+//!   `config.tabs` push (and their rollback). It is never taken under `ws`; `execute` runs
+//!   after it is released. Team tools (`hire_*`, `dismiss*`) read `ws` briefly (released) and
+//!   change the model only through `execute`.
 //! * Never call `PtyManager::spawn/kill/remove/write/resize/attach_with` while holding `ws`,
 //!   `loaded` or `prompts`: spawn/kill/write can block, and the PTY threads call back into
 //!   the sink (`output` -> prompts, `exited` -> ws).

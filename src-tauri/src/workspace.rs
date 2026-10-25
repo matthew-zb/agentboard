@@ -15,6 +15,60 @@ pub type GroupId = String;
 pub type TabId = String;
 pub type PaneId = String;
 
+/// `slot` of the split holding a Manager tab's team area (Task 8, R15).
+///
+/// Layout representation: the team area is the split with `slot: "team"` — either one from the
+/// template, or made by the first hire by splitting the standing pane to the right
+/// (`horizontal`, sizes `[55, 45]`). Each team is one child of it (a "column"): the lead's leaf
+/// alone, or a vertical split with `slot: "team:<id>"` holding the lead then its members.
+/// Splits never have fewer than two children, so the column split appears with the first
+/// member and collapses (normalize) when only the lead is left, and an auto-made area collapses
+/// back into the standing pane when its last team goes. Team membership itself is `Pane.team`;
+/// the slots only say where new team panes go.
+pub const TEAM_SLOT: &str = "team";
+/// Longest team id.
+pub const TEAM_ID_MAX: usize = 24;
+/// Sizes of a team area made by the first hire: standing pane | teams.
+const TEAM_AREA_SIZES: [f32; 2] = [55.0, 45.0];
+
+/// Team ids: 1–24 characters of `[a-z0-9-]` (they end up in session names and folder names).
+pub fn valid_team_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= TEAM_ID_MAX && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// `slot` of a team's column split: `team:<id>`.
+pub fn team_column_slot(team: &str) -> String {
+    format!("{TEAM_SLOT}:{team}")
+}
+
+/// Member number from a session name `…-m<N>` (0 for leads / anything else).
+fn member_no(p: &Pane) -> usize {
+    if p.role != Some(Role::Member) {
+        return 0;
+    }
+    p.session_name.as_deref().and_then(|s| s.rsplit_once("-m")).and_then(|(_, n)| n.parse().ok()).unwrap_or(0)
+}
+
+/// First split (pre-order) whose `slot` is `slot`.
+fn find_slot_mut<'a>(n: &'a mut LayoutNode<PaneId>, slot: &str) -> Option<&'a mut LayoutNode<PaneId>> {
+    if matches!(n, LayoutNode::Split { slot: Some(s), .. } if s == slot) {
+        return Some(n);
+    }
+    match n {
+        LayoutNode::Split { children, .. } => children.iter_mut().find_map(|c| find_slot_mut(c, slot)),
+        LayoutNode::Leaf(_) => None,
+    }
+}
+
+/// The leaf node holding `id`.
+fn find_leaf_mut<'a>(n: &'a mut LayoutNode<PaneId>, id: &str) -> Option<&'a mut LayoutNode<PaneId>> {
+    match n {
+        LayoutNode::Leaf(x) if x == id => Some(n),
+        LayoutNode::Leaf(_) => None,
+        LayoutNode::Split { children, .. } => children.iter_mut().find_map(|c| find_leaf_mut(c, id)),
+    }
+}
+
 /// Process state of a pane. Internally tagged on `state`:
 /// `{"state":"starting"}` | `{"state":"running"}` | `{"state":"exited","code":3}` |
 /// `{"state":"failed","message":"…"}`.
@@ -95,6 +149,10 @@ pub struct Tab {
     /// `None` for phase-1 tabs (and tabs created / broken off at run time).
     #[serde(default)]
     pub role: Option<Role>,
+    /// Last member number issued per live team of this tab (`<tab>-<team>-m<N>`): numbers are
+    /// never reused while the team exists; the entry goes away with the team (Task 8).
+    #[serde(default)]
+    pub team_seq: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,7 +214,17 @@ pub struct Effects {
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum WsCommand {
     // tabs
-    CreateTab { name: String, dir: String, template: Option<String>, group: Option<GroupId> },
+    /// `group: None` = the focused group, and the new tab becomes the focus (user action).
+    /// `group: Some(g)` (MCP) adds the tab in the background: neither focus nor any group's
+    /// active tab changes (R12). `role`: `None` (plain tab) | `manager` | `handover`.
+    CreateTab {
+        name: String,
+        dir: String,
+        template: Option<String>,
+        group: Option<GroupId>,
+        #[serde(default)]
+        role: Option<Role>,
+    },
     CloseTab { tab: TabId },
     RenameTab { tab: TabId, name: String },
     // panes
@@ -167,6 +235,19 @@ pub enum WsCommand {
     /// `tab: None` targets the group layout.
     SetSizes { tab: Option<TabId>, path: Vec<usize>, sizes: Vec<f32> },
     BreakPaneToTab { pane: PaneId },
+    // teams (phase 2, Task 8)
+    /// Add a `lead` (new team) or `member` pane to team `team` of Manager tab `tab`, in the
+    /// tab's team area (see [`TEAM_SLOT`]). Never changes focus.
+    AddTeamPane {
+        tab: TabId,
+        team: String,
+        role: Role,
+        #[serde(default)]
+        prompt: Option<String>,
+    },
+    /// Kill and remove every pane of team `team` in `tab`; its column (and an emptied team
+    /// area) disappears.
+    RemoveTeam { tab: TabId, team: String },
     // state
     SetFocus { group: GroupId, tab: Option<TabId>, pane: Option<PaneId> },
     SetMaximized { tab: TabId, pane: Option<PaneId> },
@@ -421,6 +502,36 @@ impl Workspace {
                 }
             }
         }
+        // teams: lead/member panes ⇔ a valid team id, a session name, a Manager tab; one lead per
+        // team, and no member without its lead
+        let mut leads: BTreeMap<(&TabId, &String), usize> = BTreeMap::new();
+        let mut member_teams = BTreeSet::new();
+        for (pid, p) in &self.panes {
+            let team_role = matches!(p.role, Some(Role::Lead | Role::Member));
+            match (&p.team, team_role) {
+                (None, false) => {}
+                (Some(team), true) => {
+                    if !valid_team_id(team) || p.session_name.is_none() || p.kind.is_applet() {
+                        return Err(format!("팀 창 '{pid}'의 팀 id·세션 이름"));
+                    }
+                    if self.tabs.get(&p.tab).map(|t| t.role) != Some(Some(Role::Manager)) {
+                        return Err(format!("팀 창 '{pid}'이(가) Manager 탭 밖에 있습니다"));
+                    }
+                    if p.role == Some(Role::Lead) {
+                        *leads.entry((&p.tab, team)).or_default() += 1;
+                    } else {
+                        member_teams.insert((&p.tab, team));
+                    }
+                }
+                _ => return Err(format!("창 '{pid}'의 역할과 팀이 맞지 않습니다")),
+            }
+        }
+        if let Some(((_, team), _)) = leads.iter().find(|(_, n)| **n > 1) {
+            return Err(format!("팀 '{team}'에 리드가 둘 이상입니다"));
+        }
+        if let Some((_, team)) = member_teams.iter().find(|k| !leads.contains_key(*k)) {
+            return Err(format!("팀 '{team}'에 리드가 없습니다"));
+        }
         let mut names = BTreeSet::new();
         for p in self.panes.values() {
             if let Some(n) = &p.session_name {
@@ -464,11 +575,24 @@ impl Workspace {
         use WsCommand::*;
         let mut fx = Effects::default();
         match cmd {
-            CreateTab { name, dir, template, group } => {
+            CreateTab { name, dir, template, group, role } => {
                 self.check_tab_name(&name, None)?;
                 if let Some(m) = check_relative(&dir) {
                     return Err(format!("디렉토리 '{dir}': {m}"));
                 }
+                match role {
+                    None | Some(Role::Manager) => {}
+                    Some(Role::Handover) => {
+                        if !dir.is_empty() {
+                            return Err("handover 탭의 디렉토리는 빈 값이어야 합니다 — 작업공간은 workspaceRoot".into());
+                        }
+                        if self.tabs.values().any(|t| t.role == Some(Role::Handover)) {
+                            return Err("handover 탭은 하나만 둘 수 있습니다".into());
+                        }
+                    }
+                    Some(r) => return Err(format!("'{}' 역할의 탭은 만들 수 없습니다", r.as_str())),
+                }
+                let background = group.is_some();
                 let gid = match group {
                     Some(g) => {
                         self.group(&g)?;
@@ -478,10 +602,13 @@ impl Workspace {
                 };
                 let tn = template.unwrap_or_else(|| loaded.config.default_template.clone());
                 let tpl = loaded.templates.get(&tn).ok_or_else(|| format!("템플릿 '{tn}'을(를) 찾을 수 없습니다"))?;
-                let tid = self.build_tab(&name, &dir, tpl, false, None, loaded);
+                let tid = self.build_tab(&name, &dir, tpl, false, role, loaded);
                 fx.spawn = self.tabs[&tid].layout.leaves().into_iter().map(|p| (p, true)).collect();
                 self.groups.get_mut(&gid).unwrap().tab_ids.push(tid.clone());
-                self.activate_tab(&gid, &tid);
+                // R12: an explicit group (MCP) never moves focus or any group's active tab
+                if !background {
+                    self.activate_tab(&gid, &tid);
+                }
             }
             CloseTab { tab } => {
                 let t = self.tab(&tab)?;
@@ -538,6 +665,9 @@ impl Workspace {
             }
             ClosePane { pane } => {
                 self.check_not_standing(&pane)?;
+                if self.pane(&pane)?.role == Some(Role::Lead) {
+                    return Err("팀 리드 창은 따로 닫을 수 없습니다 — dismiss_team으로 팀을 해산하세요".into());
+                }
                 let tid = self.pane(&pane)?.tab.clone();
                 let t = self.tabs.get_mut(&tid).unwrap();
                 match t.layout.remove_leaf(&pane) {
@@ -592,6 +722,9 @@ impl Workspace {
             }
             BreakPaneToTab { pane } => {
                 self.check_not_standing(&pane)?;
+                if self.pane(&pane)?.team.is_some() {
+                    return Err("팀 창은 다른 탭으로 떼어낼 수 없습니다 — 팀은 Manager 탭 안에서만 일합니다".into());
+                }
                 let tid = self.pane(&pane)?.tab.clone();
                 let pane_name = self.panes[&pane].name.clone();
                 let origin = self.tabs[&tid].clone();
@@ -629,6 +762,7 @@ impl Workspace {
                         sync_input: false,
                         // a broken-off tab is a plain tab; the pane keeps its own role
                         role: None,
+                        team_seq: BTreeMap::new(),
                     },
                 );
                 self.panes.get_mut(&pane).unwrap().tab = nid.clone();
@@ -641,6 +775,11 @@ impl Workspace {
                     self.detach_tab(&tid);
                 }
             }
+            AddTeamPane { tab, team, role, prompt } => {
+                let id = self.add_team_pane(&tab, &team, role, prompt, loaded)?;
+                fx.spawn.push((id, true));
+            }
+            RemoveTeam { tab, team } => fx.kill = self.remove_team(&tab, &team)?,
             SetFocus { group, tab, pane } => {
                 let g = self.group(&group)?;
                 let tid = match (&tab, &pane) {
@@ -755,6 +894,228 @@ impl Workspace {
             }
         }
         Ok(fx)
+    }
+
+    // ───────── teams (phase 2, Task 8) ─────────
+
+    /// Panes of team `team` in tab `tab`: the lead first, then members in hire order.
+    pub fn team_panes(&self, tab: &str, team: &str) -> Vec<&Pane> {
+        let mut v: Vec<&Pane> =
+            self.panes.values().filter(|p| p.tab == tab && p.team.as_deref() == Some(team)).collect();
+        v.sort_by_key(|p| (p.role != Some(Role::Lead), member_no(p), p.id.clone()));
+        v
+    }
+
+    /// The tab's standing agent pane (Dispatcher / Handover / Manager), if any.
+    pub fn standing_pane(&self, tab: &str) -> Option<PaneId> {
+        let t = self.tabs.get(tab)?;
+        t.layout.leaves().into_iter().find(|p| self.panes.get(p).is_some_and(|p| p.role.is_some_and(|r| r.is_standing())))
+    }
+
+    fn session_taken(&self, name: &str) -> bool {
+        self.panes.values().any(|p| p.session_name.as_deref() == Some(name))
+    }
+
+    /// `AddTeamPane`: checks, creates the pane, places it (see [`TEAM_SLOT`]). Returns its id.
+    fn add_team_pane(&mut self, tab: &str, team: &str, role: Role, prompt: Option<String>, loaded: &Loaded) -> Result<PaneId, String> {
+        let t = self.tab(tab)?;
+        if t.role != Some(Role::Manager) {
+            return Err("팀은 Manager 탭에만 둘 수 있습니다".into());
+        }
+        if !valid_team_id(team) {
+            return Err(format!("팀 id '{team}'이(가) 올바르지 않습니다 — 영문 소문자·숫자·'-'로 1~{TEAM_ID_MAX}자"));
+        }
+        let (tab_name, workspace) = (t.name.clone(), t.workspace.clone());
+        let panes = self.team_panes(tab, team);
+        let lead = panes.iter().find(|p| p.role == Some(Role::Lead)).map(|p| p.id.clone());
+        let members = panes.iter().filter(|p| p.role == Some(Role::Member)).count();
+        let last_no = panes.iter().map(|p| member_no(p)).max().unwrap_or(0);
+        let (sname, number) = match role {
+            Role::Lead => {
+                if lead.is_some() {
+                    return Err(format!("팀 '{team}'에는 이미 리드가 있습니다"));
+                }
+                (session_name(&tab_name, Role::Lead, Some(team), 0), None)
+            }
+            Role::Member => {
+                if lead.is_none() {
+                    return Err(format!("팀 '{team}'에 리드가 없습니다 — 먼저 팀 리드를 채용하세요"));
+                }
+                let max = loaded.config.max_per_team();
+                if members >= max {
+                    return Err(format!("팀 '{team}'의 팀원이 상한({max}명)에 찼습니다"));
+                }
+                // never reuse a number while the team exists
+                let mut n = self.tabs[tab].team_seq.get(team).copied().unwrap_or(0).max(last_no) + 1;
+                while self.session_taken(&session_name(&tab_name, Role::Member, Some(team), n)) {
+                    n += 1;
+                }
+                (session_name(&tab_name, Role::Member, Some(team), n), Some(n))
+            }
+            _ => return Err("팀 창의 역할은 lead 또는 member만 가능합니다".into()),
+        };
+        if self.session_taken(&sname) {
+            return Err(format!("세션 이름 '{sname}'이(가) 이미 쓰이고 있습니다"));
+        }
+        let agent = loaded.config.role_config(role).agent.unwrap_or_else(|| loaded.config.default_agent.clone());
+        if !loaded.profiles.contains_key(&agent) {
+            return Err(format!("에이전트 프로필 '{agent}'을(를) 찾을 수 없습니다"));
+        }
+        let id = self.new_pane_id();
+        self.panes.insert(
+            id.clone(),
+            Pane {
+                id: id.clone(),
+                name: sname.clone(),
+                tab: tab.to_string(),
+                agent,
+                args: Vec::new(), // roles.<role>.args are added at spawn time (launcher::plan_spawn)
+                env: BTreeMap::new(),
+                cwd: workspace,
+                prompt,
+                status: PaneStatus::Starting,
+                attention: false,
+                prompt_warning: false,
+                kind: PaneKind::Terminal,
+                role: Some(role),
+                team: Some(team.to_string()),
+                session_name: Some(sname),
+            },
+        );
+        match &lead {
+            None => self.place_team_column(tab, &id),
+            Some(lead) => self.place_member(tab, team, lead, &id)?,
+        }
+        if let Some(n) = number {
+            self.tabs.get_mut(tab).unwrap().team_seq.insert(team.to_string(), n);
+        }
+        Ok(id)
+    }
+
+    /// A new team's column (its lead) goes into the tab's team area: appended to the split with
+    /// `slot: "team"` (non-team children keep their sizes, team columns share the rest equally),
+    /// or — without one — the standing pane is split to the right into a new team area
+    /// `{split: horizontal, sizes: [55, 45], slot: "team", children: [standing, column]}`.
+    fn place_team_column(&mut self, tab: &str, new: &PaneId) {
+        let team_ids: BTreeSet<PaneId> =
+            self.panes.values().filter(|p| p.tab == tab && p.team.is_some() && p.id != *new).map(|p| p.id.clone()).collect();
+        let standing = self.standing_pane(tab);
+        let t = self.tabs.get_mut(tab).unwrap();
+        if let Some(LayoutNode::Split { sizes, children, .. }) = find_slot_mut(&mut t.layout, TEAM_SLOT) {
+            let is_team: Vec<bool> = children.iter().map(|c| c.leaves().iter().any(|p| team_ids.contains(p))).collect();
+            let k = is_team.iter().filter(|b| **b).count();
+            children.push(LayoutNode::Leaf(new.clone()));
+            if k == 0 || sizes.len() != is_team.len() {
+                *sizes = vec![100.0 / children.len() as f32; children.len()];
+            } else {
+                let team_total: f32 = sizes.iter().zip(&is_team).filter(|(_, t)| **t).map(|(s, _)| *s).sum();
+                let each = team_total / (k + 1) as f32;
+                for (s, t) in sizes.iter_mut().zip(&is_team) {
+                    if *t {
+                        *s = each;
+                    }
+                }
+                sizes.push(each);
+            }
+            return;
+        }
+        let target = match standing.as_ref().and_then(|s| find_leaf_mut(&mut t.layout, s)) {
+            Some(leaf) => leaf,
+            None => &mut t.layout,
+        };
+        let old = std::mem::replace(target, LayoutNode::Leaf(String::new()));
+        *target = LayoutNode::Split {
+            dir: Dir::Horizontal,
+            sizes: TEAM_AREA_SIZES.to_vec(),
+            children: vec![old, LayoutNode::Leaf(new.clone())],
+            slot: Some(TEAM_SLOT.to_string()),
+        };
+    }
+
+    /// A member goes to the bottom of its team's column (`slot: "team:<id>"`, vertical); a lead
+    /// still alone gets its column split made here (lead on top).
+    fn place_member(&mut self, tab: &str, team: &str, lead: &PaneId, new: &PaneId) -> Result<(), String> {
+        let slot = team_column_slot(team);
+        let t = self.tabs.get_mut(tab).unwrap();
+        if let Some(LayoutNode::Split { dir: Dir::Vertical, sizes, children, .. }) = find_slot_mut(&mut t.layout, &slot) {
+            children.push(LayoutNode::Leaf(new.clone()));
+            *sizes = vec![100.0 / children.len() as f32; children.len()];
+            return Ok(());
+        }
+        let target = find_leaf_mut(&mut t.layout, lead).ok_or_else(|| format!("팀 '{team}'의 리드 창이 화면 배치에 없습니다"))?;
+        let old = std::mem::replace(target, LayoutNode::Leaf(String::new()));
+        *target = LayoutNode::Split {
+            dir: Dir::Vertical,
+            sizes: vec![50.0, 50.0],
+            children: vec![old, LayoutNode::Leaf(new.clone())],
+            slot: Some(slot),
+        };
+        Ok(())
+    }
+
+    /// `RemoveTeam`: drops the team's column from the team area (its width goes to the other
+    /// team columns; an emptied auto-made area collapses back into the standing pane) and
+    /// removes the panes. Returns the panes to kill.
+    fn remove_team(&mut self, tab: &str, team: &str) -> Result<Vec<PaneId>, String> {
+        self.tab(tab)?;
+        let ids: Vec<PaneId> = self.team_panes(tab, team).iter().map(|p| p.id.clone()).collect();
+        if ids.is_empty() {
+            return Err(format!("팀 '{team}'이(가) 이 탭에 없습니다"));
+        }
+        let gone: BTreeSet<PaneId> = ids.iter().cloned().collect();
+        let others: BTreeSet<PaneId> = self
+            .panes
+            .values()
+            .filter(|p| p.tab == tab && p.team.as_ref().is_some_and(|t| t != team))
+            .map(|p| p.id.clone())
+            .collect();
+        let standing = self.standing_pane(tab);
+        let t = self.tabs.get_mut(tab).unwrap();
+        let mut column_removed = false;
+        if let Some(LayoutNode::Split { sizes, children, .. }) = find_slot_mut(&mut t.layout, TEAM_SLOT) {
+            // the column must hold exactly this team's panes (a user split inside it → per pane)
+            let col = children.iter().position(|c| {
+                let lv = c.leaves();
+                lv.len() == gone.len() && lv.iter().all(|p| gone.contains(p))
+            });
+            if let Some(i) = col {
+                let sized = sizes.len() == children.len();
+                children.remove(i);
+                if sized {
+                    let freed = sizes.remove(i);
+                    let is_team: Vec<bool> = children.iter().map(|c| c.leaves().iter().any(|p| others.contains(p))).collect();
+                    let k = is_team.iter().filter(|b| **b).count();
+                    if k > 0 {
+                        for (s, t) in sizes.iter_mut().zip(&is_team) {
+                            if *t {
+                                *s += freed / k as f32;
+                            }
+                        }
+                    }
+                }
+                column_removed = true;
+            }
+        }
+        if column_removed {
+            t.layout.normalize();
+        } else {
+            for id in &ids {
+                if let Some(None) = t.layout.remove_leaf(id) {
+                    return Err("팀을 해산하면 탭에 창이 남지 않습니다".into());
+                }
+            }
+        }
+        if gone.contains(&t.last_focused_pane_id) {
+            t.last_focused_pane_id = standing.unwrap_or_else(|| t.layout.leaves()[0].clone());
+        }
+        if t.maximized_pane_id.as_ref().is_some_and(|m| gone.contains(m)) {
+            t.maximized_pane_id = None;
+        }
+        t.team_seq.remove(team);
+        for id in &ids {
+            self.panes.remove(id);
+        }
+        Ok(ids)
     }
 
     // ───────── helpers ─────────
@@ -895,6 +1256,7 @@ impl Workspace {
                 maximized_pane_id: None,
                 sync_input: false,
                 role,
+                team_seq: BTreeMap::new(),
             },
         );
         id
@@ -1091,7 +1453,7 @@ mod tests {
         a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-3)
     }
     fn create(name: &str, template: &str) -> WsCommand {
-        WsCommand::CreateTab { name: name.into(), dir: name.into(), template: Some(template.into()), group: None }
+        WsCommand::CreateTab { name: name.into(), dir: name.into(), template: Some(template.into()), group: None, role: None }
     }
 
     #[test]
@@ -1185,7 +1547,7 @@ mod tests {
         assert_eq!(web.workspace, root(&l).join("web"));
         assert_eq!(web.last_focused_pane_id, pane(&ws, "web", "lead"));
         // default template when none given
-        ws.apply(WsCommand::CreateTab { name: "s".into(), dir: "".into(), template: None, group: None }, &l).unwrap();
+        ws.apply(WsCommand::CreateTab { name: "s".into(), dir: "".into(), template: None, group: None, role: None }, &l).unwrap();
         assert_eq!(tab(&ws, "s").template, "solo");
         assert_eq!(tab(&ws, "s").workspace, root(&l));
     }
@@ -1199,8 +1561,8 @@ mod tests {
             create("api", "solo"),
             create("dispatcher", "solo"),
             create("x", "missing-template"),
-            WsCommand::CreateTab { name: "y".into(), dir: "../out".into(), template: None, group: None },
-            WsCommand::CreateTab { name: "z".into(), dir: "z".into(), template: None, group: Some("g99".into()) },
+            WsCommand::CreateTab { name: "y".into(), dir: "../out".into(), template: None, group: None, role: None },
+            WsCommand::CreateTab { name: "z".into(), dir: "z".into(), template: None, group: Some("g99".into()), role: None },
         ] {
             assert!(ws.apply(cmd, &l).is_err());
             assert_eq!(ws, before);
@@ -1731,9 +2093,10 @@ mod tests {
         let control = gid_named(&ws, "control");
         let work = gid_named(&ws, "work");
         let before_focus = ws.focus_location();
-        ws.apply(WsCommand::CreateTab { name: "w2".into(), dir: "w2".into(), template: None, group: Some(work.clone()) }, &l)
+        ws.apply(WsCommand::CreateTab { name: "w2".into(), dir: "w2".into(), template: None, group: Some(work.clone()), role: None }, &l)
             .unwrap();
-        assert_eq!(ws.groups[&work].active_tab_id, tab(&ws, "w2").id);
+        // R12 (Task 8): another group's active tab does not change either
+        assert_eq!(ws.groups[&work].active_tab_id, tab(&ws, "api").id);
         assert_eq!(ws.focus.group_id, control);
         assert_eq!(ws.focus_location(), before_focus);
         assert_eq!(ws.last_location, None);
@@ -1770,7 +2133,7 @@ mod tests {
         ws.groups[g].tab_ids.iter().map(|t| ws.tabs[t].name.clone()).collect()
     }
     fn create_in(name: &str, group: &str) -> WsCommand {
-        WsCommand::CreateTab { name: name.into(), dir: name.into(), template: Some("solo".into()), group: Some(group.into()) }
+        WsCommand::CreateTab { name: name.into(), dir: name.into(), template: Some("solo".into()), group: Some(group.into()), role: None }
     }
 
     #[test]
@@ -2097,6 +2460,8 @@ mod tests {
         ws.apply(create_in("x", &control), &l).unwrap();
         ws.apply(create_in("y", &work), &l).unwrap();
         let (x, api) = (tab(&ws, "x").id.clone(), tab(&ws, "api").id.clone());
+        // an explicit group creates in the background (R12): look at x first
+        ws.apply(WsCommand::SetFocus { group: control.clone(), tab: Some(x.clone()), pane: None }, &l).unwrap();
         ws.apply(WsCommand::SetFocus { group: work.clone(), tab: Some(api.clone()), pane: None }, &l).unwrap();
         assert_eq!(ws.last_location, Some(Location { group_id: control.clone(), tab_id: x.clone() }));
         ws.apply(WsCommand::CloseTab { tab: api }, &l).unwrap();
@@ -2169,5 +2534,359 @@ mod tests {
         let back: Workspace = serde_json::from_value(v.clone()).unwrap();
         assert_eq!(back, ws);
         assert_eq!(serde_json::to_string(&back).unwrap(), serde_json::to_string(&ws).unwrap());
+    }
+
+    // ── phase 2: teams (Task 8) ──
+
+    const SLOT_TPL: &str = r#"{"name":"mgr-slot","layout":{"split":"horizontal","sizes":[60,40],"children":[
+        {"pane":{"name":"manager","focus":true}},
+        {"split":"vertical","slot":"team","children":[{"pane":{"name":"notes","agent":"powershell"}},{"pane":{"name":"log","agent":"powershell"}}]}]}}"#;
+
+    fn add(tab: &str, team: &str, role: Role) -> WsCommand {
+        WsCommand::AddTeamPane { tab: tab.into(), team: team.into(), role, prompt: Some("go".into()) }
+    }
+    fn find_slot<'a>(n: &'a LayoutNode<PaneId>, slot: &str) -> Option<&'a LayoutNode<PaneId>> {
+        match n {
+            LayoutNode::Split { slot: Some(s), .. } if s == slot => Some(n),
+            LayoutNode::Split { children, .. } => children.iter().find_map(|c| find_slot(c, slot)),
+            LayoutNode::Leaf(_) => None,
+        }
+    }
+    fn split_parts(n: &LayoutNode<PaneId>) -> (Dir, Vec<f32>, Vec<LayoutNode<PaneId>>) {
+        match n {
+            LayoutNode::Split { dir, sizes, children, .. } => (*dir, sizes.clone(), children.clone()),
+            LayoutNode::Leaf(_) => panic!("not a split"),
+        }
+    }
+    fn by_session(ws: &Workspace, s: &str) -> PaneId {
+        ws.panes.values().find(|p| p.session_name.as_deref() == Some(s)).unwrap_or_else(|| panic!("no session {s}")).id.clone()
+    }
+    fn leaf(p: &str) -> LayoutNode<PaneId> {
+        LayoutNode::Leaf(p.to_string())
+    }
+    fn valid(ws: &Workspace) {
+        let mut v = ws.clone();
+        assert_eq!(v.normalize_and_validate(), Ok(()));
+    }
+
+    #[test]
+    fn hire_lead_then_members_into_team_slot_without_focus_change() {
+        let (l, mut ws) = role_ws();
+        let b = tab(&ws, "billing").id.clone();
+        let mgr = pane(&ws, "billing", "manager");
+        let focus = ws.focus_location();
+        let last_loc = ws.last_location.clone();
+        let active: Vec<_> = ws.groups.values().map(|g| g.active_tab_id.clone()).collect();
+        let lf = ws.tabs[&b].last_focused_pane_id.clone();
+
+        let fx = ws.apply(add(&b, "batch", Role::Lead), &l).unwrap();
+        let lead = by_session(&ws, "billing-batch-lead");
+        assert_eq!(fx, Effects { spawn: vec![(lead.clone(), true)], kill: vec![] });
+        let p = &ws.panes[&lead];
+        assert_eq!((p.role, p.team.as_deref(), p.name.as_str()), (Some(Role::Lead), Some("batch"), "billing-batch-lead"));
+        assert_eq!((p.tab.clone(), p.cwd.clone(), p.kind.clone()), (b.clone(), root(&l).join("billing"), PaneKind::Terminal));
+        assert_eq!((p.agent.as_str(), p.prompt.as_deref()), ("claude", Some("go")));
+        // no template slot → the Manager pane is split to the right into a team area
+        let (dir, sz, ch) = split_parts(find_slot(&ws.tabs[&b].layout, TEAM_SLOT).expect("team area"));
+        assert_eq!((dir, ch), (Dir::Horizontal, vec![leaf(&mgr), leaf(&lead)]));
+        assert!(near(&sz, &[55.0, 45.0]), "{sz:?}");
+
+        // members stack under their lead in a vertical `team:batch` column
+        ws.apply(add(&b, "batch", Role::Member), &l).unwrap();
+        ws.apply(add(&b, "batch", Role::Member), &l).unwrap();
+        let (m1, m2) = (by_session(&ws, "billing-batch-m1"), by_session(&ws, "billing-batch-m2"));
+        assert_eq!(ws.panes[&m1].name, "billing-batch-m1");
+        let (dir, _, ch) = split_parts(find_slot(&ws.tabs[&b].layout, "team:batch").expect("team column"));
+        assert_eq!((dir, ch), (Dir::Vertical, vec![leaf(&lead), leaf(&m1), leaf(&m2)]));
+        let (_, _, area) = split_parts(find_slot(&ws.tabs[&b].layout, TEAM_SLOT).unwrap());
+        assert_eq!(area.len(), 2, "still one column for the team");
+
+        // focus, last location, active tabs and the tab's focused pane never moved
+        assert_eq!(ws.focus_location(), focus);
+        assert_eq!(ws.last_location, last_loc);
+        assert_eq!(ws.groups.values().map(|g| g.active_tab_id.clone()).collect::<Vec<_>>(), active);
+        assert_eq!(ws.tabs[&b].last_focused_pane_id, lf);
+
+        // a dismissed member's number is never reused while the team exists
+        ws.apply(WsCommand::ClosePane { pane: m2.clone() }, &l).unwrap();
+        ws.apply(add(&b, "batch", Role::Member), &l).unwrap();
+        assert!(ws.panes.values().any(|p| p.session_name.as_deref() == Some("billing-batch-m3")));
+        assert!(!ws.panes.values().any(|p| p.session_name.as_deref() == Some("billing-batch-m2")));
+        valid(&ws);
+        // the result survives a persist round-trip
+        let back: Workspace = serde_json::from_value(serde_json::to_value(&ws).unwrap()).unwrap();
+        assert_eq!(back, ws);
+
+        // a template `slot: "team"` split receives the team columns itself
+        let l = loaded_files(
+            r#"{"tabs":[{"name":"ops","role":"manager","dir":"ops","template":"mgr-slot"}]}"#,
+            &[("mgr-slot.json", SLOT_TPL)],
+        );
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        let mut ws = Workspace::from_config(&l);
+        let o = tab(&ws, "ops").id.clone();
+        let (notes, log) = (pane(&ws, "ops", "notes"), pane(&ws, "ops", "log"));
+        ws.apply(add(&o, "x", Role::Lead), &l).unwrap();
+        let lx = by_session(&ws, "ops-x-lead");
+        let (dir, _, ch) = split_parts(find_slot(&ws.tabs[&o].layout, TEAM_SLOT).unwrap());
+        assert_eq!((dir, ch), (Dir::Vertical, vec![leaf(&notes), leaf(&log), leaf(&lx)]));
+        assert_eq!(ws.tabs[&o].layout.leaves()[0], pane(&ws, "ops", "manager"), "manager pane not split");
+        // dismissing the last team keeps the template's own slot split
+        ws.apply(WsCommand::RemoveTeam { tab: o.clone(), team: "x".into() }, &l).unwrap();
+        let (_, _, ch) = split_parts(find_slot(&ws.tabs[&o].layout, TEAM_SLOT).unwrap());
+        assert_eq!(ch, vec![leaf(&notes), leaf(&log)]);
+        valid(&ws);
+    }
+
+    #[test]
+    fn multiple_teams_per_tab() {
+        let (l, mut ws) = role_ws();
+        let b = tab(&ws, "billing").id.clone();
+        let mgr = pane(&ws, "billing", "manager");
+        for t in ["a", "b", "c-2"] {
+            ws.apply(add(&b, t, Role::Lead), &l).unwrap();
+        }
+        ws.apply(add(&b, "a", Role::Member), &l).unwrap();
+        ws.apply(add(&b, "c-2", Role::Member), &l).unwrap();
+        let (la, lb, lc) = (by_session(&ws, "billing-a-lead"), by_session(&ws, "billing-b-lead"), by_session(&ws, "billing-c-2-lead"));
+        let (dir, sz, ch) = split_parts(find_slot(&ws.tabs[&b].layout, TEAM_SLOT).unwrap());
+        assert_eq!(dir, Dir::Horizontal);
+        assert_eq!(ch.len(), 4, "manager + one column per team");
+        assert_eq!(ch[0], leaf(&mgr));
+        assert_eq!(ch[2], leaf(&lb));
+        assert_eq!(split_parts(&ch[1]).2, vec![leaf(&la), leaf(&by_session(&ws, "billing-a-m1"))]);
+        assert_eq!(split_parts(&ch[3]).2, vec![leaf(&lc), leaf(&by_session(&ws, "billing-c-2-m1"))]);
+        // the manager keeps its 55 %, the teams share the rest
+        assert!(near(&sz, &[55.0, 15.0, 15.0, 15.0]), "{sz:?}");
+        // each team numbers its members on its own
+        assert!(ws.panes.values().filter(|p| p.role == Some(Role::Member)).all(|p| p.name.ends_with("-m1")));
+        valid(&ws);
+
+        // team ids: [a-z0-9-]{1,24}, unique per tab (a second lead for a team is refused)
+        let before = ws.clone();
+        let long = "x".repeat(25);
+        for team in ["A", "", "a_b", "../x", long.as_str(), "a"] {
+            assert!(ws.apply(add(&b, team, Role::Lead), &l).is_err(), "{team:?}");
+            assert_eq!(ws, before);
+        }
+        assert!(ws.apply(add(&b, &"y".repeat(24), Role::Lead), &l).is_ok());
+        // teams live in Manager tabs only
+        for t in ["dispatcher", "handover"] {
+            let id = tab(&ws, t).id.clone();
+            let err = ws.apply(add(&id, "a", Role::Lead), &l).unwrap_err();
+            assert!(err.contains("Manager"), "{err}");
+        }
+        // another Manager tab (created at run time with the role) may reuse a team id
+        ws.apply(
+            WsCommand::CreateTab { name: "ops".into(), dir: "ops".into(), template: Some("manager".into()), group: None, role: Some(Role::Manager) },
+            &l,
+        )
+        .unwrap();
+        let o = tab(&ws, "ops").id.clone();
+        assert_eq!(ws.tabs[&o].role, Some(Role::Manager));
+        assert_eq!(ws.panes[&pane(&ws, "ops", "manager")].session_name.as_deref(), Some("ops"));
+        ws.apply(add(&o, "a", Role::Lead), &l).unwrap();
+        assert!(ws.panes.values().any(|p| p.session_name.as_deref() == Some("ops-a-lead")));
+        valid(&ws);
+    }
+
+    #[test]
+    fn member_cap_and_lead_required() {
+        let l = loaded_files(
+            r#"{"tabs":[{"name":"billing","role":"manager","dir":"billing","template":"manager"}],
+                "roles":{"member":{"maxPerTeam":2,"agent":"powershell"}}}"#,
+            &[("manager.json", MANAGER_TPL)],
+        );
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        let mut ws = Workspace::from_config(&l);
+        let b = tab(&ws, "billing").id.clone();
+        // a member needs its team's lead first
+        let before = ws.clone();
+        let err = ws.apply(add(&b, "t", Role::Member), &l).unwrap_err();
+        assert!(err.contains("리드"), "{err}");
+        assert_eq!(ws, before);
+        ws.apply(add(&b, "t", Role::Lead), &l).unwrap();
+        ws.apply(add(&b, "t", Role::Member), &l).unwrap();
+        ws.apply(add(&b, "t", Role::Member), &l).unwrap();
+        let before = ws.clone();
+        let err = ws.apply(add(&b, "t", Role::Member), &l).unwrap_err();
+        assert!(err.contains("상한") && err.contains('2'), "{err}");
+        assert_eq!(ws, before);
+        // roles.<role>.agent picks the profile; the lead falls back to defaultAgent
+        assert_eq!(ws.panes[&by_session(&ws, "billing-t-m1")].agent, "powershell");
+        assert_eq!(ws.panes[&by_session(&ws, "billing-t-lead")].agent, "claude");
+        // a freed seat can be filled again, with a new number
+        ws.apply(WsCommand::ClosePane { pane: by_session(&ws, "billing-t-m1") }, &l).unwrap();
+        ws.apply(add(&b, "t", Role::Member), &l).unwrap();
+        by_session(&ws, "billing-t-m3");
+        // only lead / member panes are team panes
+        for r in [Role::Manager, Role::Dispatcher, Role::Handover] {
+            assert!(ws.apply(add(&b, "t", r), &l).is_err());
+        }
+        // the cap is per team
+        ws.apply(add(&b, "u", Role::Lead), &l).unwrap();
+        ws.apply(add(&b, "u", Role::Member), &l).unwrap();
+        ws.apply(add(&b, "u", Role::Member), &l).unwrap();
+        valid(&ws);
+    }
+
+    #[test]
+    fn remove_team_kills_all_team_panes() {
+        let (l, mut ws) = role_ws();
+        let b = tab(&ws, "billing").id.clone();
+        let original = ws.tabs[&b].layout.clone();
+        let mgr = pane(&ws, "billing", "manager");
+        for (t, r) in [("a", Role::Lead), ("a", Role::Member), ("a", Role::Member), ("b", Role::Lead), ("b", Role::Member)] {
+            ws.apply(add(&b, t, r), &l).unwrap();
+        }
+        let a_ids: BTreeSet<PaneId> = ws.panes.values().filter(|p| p.team.as_deref() == Some("a")).map(|p| p.id.clone()).collect();
+        assert_eq!(a_ids.len(), 3);
+        // the user looks at a member of team a, maximized
+        let g = group_of(&ws, &b);
+        let a_m1 = by_session(&ws, "billing-a-m1");
+        ws.apply(WsCommand::SetFocus { group: g.clone(), tab: Some(b.clone()), pane: Some(a_m1.clone()) }, &l).unwrap();
+        ws.apply(WsCommand::SetMaximized { tab: b.clone(), pane: Some(a_m1.clone()) }, &l).unwrap();
+
+        let fx = ws.apply(WsCommand::RemoveTeam { tab: b.clone(), team: "a".into() }, &l).unwrap();
+        assert!(fx.spawn.is_empty());
+        assert_eq!(fx.kill.iter().cloned().collect::<BTreeSet<_>>(), a_ids);
+        assert!(a_ids.iter().all(|p| !ws.panes.contains_key(p) && !ws.tabs[&b].layout.contains(p)));
+        assert!(!ws.tabs[&b].team_seq.contains_key("a"));
+        assert_eq!(ws.tabs[&b].last_focused_pane_id, mgr, "focus falls back to the Manager pane");
+        assert_eq!(ws.tabs[&b].maximized_pane_id, None);
+        // the remaining team gets the freed width back
+        let (_, sz, ch) = split_parts(find_slot(&ws.tabs[&b].layout, TEAM_SLOT).unwrap());
+        assert_eq!(ch.len(), 2);
+        assert!(near(&sz, &[55.0, 45.0]), "{sz:?}");
+        valid(&ws);
+
+        // unknown team → error, nothing changes
+        let before = ws.clone();
+        assert!(ws.apply(WsCommand::RemoveTeam { tab: b.clone(), team: "a".into() }, &l).is_err());
+        assert!(ws.apply(WsCommand::RemoveTeam { tab: "t99".into(), team: "b".into() }, &l).is_err());
+        assert_eq!(ws, before);
+
+        // the last team leaves no team area behind: the layout is back to the template's
+        let fx = ws.apply(WsCommand::RemoveTeam { tab: b.clone(), team: "b".into() }, &l).unwrap();
+        assert_eq!(fx.kill.len(), 2);
+        assert!(find_slot(&ws.tabs[&b].layout, TEAM_SLOT).is_none());
+        assert_eq!(ws.tabs[&b].layout, original);
+        assert!(ws.panes.values().all(|p| p.team.is_none()));
+        valid(&ws);
+        // a new team with an old id starts numbering again
+        ws.apply(add(&b, "a", Role::Lead), &l).unwrap();
+        ws.apply(add(&b, "a", Role::Member), &l).unwrap();
+        by_session(&ws, "billing-a-m1");
+    }
+
+    #[test]
+    fn team_panes_cannot_break_off_and_lead_cannot_close() {
+        let (l, mut ws) = role_ws();
+        let b = tab(&ws, "billing").id.clone();
+        ws.apply(add(&b, "a", Role::Lead), &l).unwrap();
+        ws.apply(add(&b, "a", Role::Member), &l).unwrap();
+        let (lead, m1) = (by_session(&ws, "billing-a-lead"), by_session(&ws, "billing-a-m1"));
+        let before = ws.clone();
+        for p in [&lead, &m1] {
+            let err = ws.apply(WsCommand::BreakPaneToTab { pane: p.clone() }, &l).unwrap_err();
+            assert!(err.contains("팀"), "{err}");
+        }
+        let err = ws.apply(WsCommand::ClosePane { pane: lead.clone() }, &l).unwrap_err();
+        assert!(err.contains("dismiss_team"), "{err}");
+        assert_eq!(ws, before);
+        // closing a member = dismissing it
+        let fx = ws.apply(WsCommand::ClosePane { pane: m1.clone() }, &l).unwrap();
+        assert_eq!(fx.kill, vec![m1]);
+        assert!(find_slot(&ws.tabs[&b].layout, "team:a").is_none(), "a lone lead needs no column split");
+        valid(&ws);
+        // closing the Manager tab takes its teams along
+        let fx = ws.apply(WsCommand::CloseTab { tab: b }, &l).unwrap();
+        assert!(fx.kill.contains(&lead));
+        assert!(ws.panes.values().all(|p| p.team.is_none()));
+    }
+
+    #[test]
+    fn validate_rejects_broken_team_invariants() {
+        let (l, mut good) = role_ws();
+        let b = tab(&good, "billing").id.clone();
+        good.apply(add(&b, "a", Role::Lead), &l).unwrap();
+        good.apply(add(&b, "a", Role::Member), &l).unwrap();
+        valid(&good);
+        type M = (&'static str, Box<dyn Fn(&mut Workspace)>);
+        let cases: Vec<M> = vec![
+            ("member without a lead", Box::new(|w| {
+                let id = by_session(w, "billing-a-lead");
+                w.panes.get_mut(&id).unwrap().role = Some(Role::Member);
+            })),
+            ("two leads", Box::new(|w| {
+                let id = by_session(w, "billing-a-m1");
+                w.panes.get_mut(&id).unwrap().role = Some(Role::Lead);
+            })),
+            ("member without a team", Box::new(|w| {
+                let id = by_session(w, "billing-a-m1");
+                w.panes.get_mut(&id).unwrap().team = None;
+            })),
+            ("team on a plain pane", Box::new(|w| {
+                let id = pane(w, "billing", "shell");
+                w.panes.get_mut(&id).unwrap().team = Some("a".into());
+            })),
+            ("bad team id", Box::new(|w| {
+                for p in w.panes.values_mut().filter(|p| p.team.is_some()) {
+                    p.team = Some("A/..".into());
+                }
+            })),
+            ("team pane without a session name", Box::new(|w| {
+                let id = by_session(w, "billing-a-m1");
+                w.panes.get_mut(&id).unwrap().session_name = None;
+            })),
+            ("team in a non-Manager tab", Box::new(|w| {
+                let id = tab(w, "billing").id.clone();
+                w.tabs.get_mut(&id).unwrap().role = None;
+                let m = pane(w, "billing", "manager");
+                w.panes.get_mut(&m).unwrap().role = None;
+                w.panes.get_mut(&m).unwrap().session_name = None;
+            })),
+        ];
+        for (name, f) in cases {
+            let mut bad = good.clone();
+            f(&mut bad);
+            assert!(bad.normalize_and_validate().is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn create_tab_role_and_background_group() {
+        let (l, mut ws) = role_ws();
+        let mk = |name: &str, dir: &str, role| WsCommand::CreateTab {
+            name: name.into(),
+            dir: dir.into(),
+            template: None,
+            group: None,
+            role,
+        };
+        let before = ws.clone();
+        for (cmd, why) in [
+            (mk("x", "x", Some(Role::Dispatcher)), "dispatcher"),
+            (mk("x", "x", Some(Role::Lead)), "lead"),
+            (mk("x", "x", Some(Role::Member)), "member"),
+            (mk("h2", "", Some(Role::Handover)), "second handover"),
+        ] {
+            assert!(ws.apply(cmd, &l).is_err(), "{why}");
+            assert_eq!(ws, before);
+        }
+        ws.apply(mk("m", "m", Some(Role::Manager)), &l).unwrap();
+        let m = tab(&ws, "m");
+        assert_eq!(m.role, Some(Role::Manager));
+        let standing: Vec<_> = m.layout.leaves().into_iter().filter(|p| ws.panes[p].role == Some(Role::Manager)).collect();
+        assert_eq!(standing.len(), 1);
+        assert_eq!(ws.panes[&standing[0]].session_name.as_deref(), Some("m"));
+        valid(&ws);
+        // an explicit group — even the focused one — gets the tab in the background
+        let g = ws.focus.group_id.clone();
+        let loc = ws.focus_location();
+        ws.apply(WsCommand::CreateTab { name: "bg".into(), dir: "bg".into(), template: None, group: Some(g.clone()), role: None }, &l)
+            .unwrap();
+        assert_eq!(ws.focus_location(), loc);
+        assert_eq!(ws.groups[&g].tab_ids.last(), Some(&tab(&ws, "bg").id));
     }
 }
