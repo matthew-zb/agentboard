@@ -114,7 +114,7 @@ spikes/phase2/    # Task 1 버리는 스파이크 코드 (커밋은 하되 빌�
 **Interfaces:**
 - Produces:
   - `pub enum Role { Dispatcher, Handover, Manager, Lead, Member }` (serde lowercase)
-  - `pub struct RoleConfig { pub system_prompt_file: Option<String>, pub agent: Option<String>, pub args: Vec<String>, pub max_per_team: Option<usize> }`, `Config.roles: BTreeMap<Role, RoleConfig>`, `Config.nightly_refresh: Option<String>`("HH:MM" 검증), `nightly_timeout_min: u32`(20), `nightly_quiet_min: u32`(10), `handover_index: Option<String>`(기본 `<handover dir>/INDEX.md`), `TabSpec.role: Option<Role>`(manager|handover만 허용).
+  - `pub struct RoleConfig { pub system_prompt_file: Option<String>, pub agent: Option<String>, pub args: Vec<String>, pub max_per_team: Option<usize> }`, `Config.roles: BTreeMap<Role, RoleConfig>`, `Config.nightly_refresh: Option<String>`("HH:MM" 검증), `nightly_timeout_min: u32`(20), `nightly_quiet_min: u32`(10), `handover_index: Option<String>`(workspaceRoot 기준, 기본 `HANDOVER.md`), `TabSpec.role: Option<Role>`(manager|handover만 허용). **handover 탭은 작업공간이 루트**: role이 handover인 탭은 `dir`이 빈 값(`""`)이어야 하며 workspace = workspaceRoot(스펙 §8, 사용자 결정). 다른 탭의 빈 `dir`은 기존 규칙대로 처리. handover 탭은 최대 1개(검증 오류).
   - `pub fn session_name(tab: &str, role: Role, team: Option<&str>, n: usize) -> String` — 상시 = 탭 이름, lead = `<tab>-<team>-lead`, member = `<tab>-<team>-m<n>`.
   - `Pane` 추가 필드: `kind: PaneKind`(`Terminal` | `Applet { kind: String }`), `role: Option<Role>`, `team: Option<String>`, `session_name: Option<String>`. `Tab.role: Option<Role>`. 모두 `#[serde(default)]`(1단계 workspace.json 호환).
   - 템플릿 노드 `{"applet":{"name":"inbox","kind":"inbox"}}` 파싱(PaneSpec에 `applet: Option<String>`), 검증: applet은 agent·cwd·prompt 불가.
@@ -125,6 +125,7 @@ spikes/phase2/    # Task 1 버리는 스파이크 코드 (커밋은 하되 빌�
 #[test] fn parses_roles_and_nightly_config() {}
 #[test] fn rejects_bad_nightly_time_and_dispatcher_role_in_tabs() {}
 #[test] fn applet_node_parses_and_rejects_agent_fields() {}
+#[test] fn handover_tab_workspace_is_root_and_unique() {}
 #[test] fn session_name_rules() { assert_eq!(session_name("billing", Role::Lead, Some("batch"), 0), "billing-batch-lead"); /* member m1 등 */ }
 #[test] fn phase1_workspace_json_still_loads() { /* 1단계 포맷 fixture → 새 필드 기본값 */ }
 #[test] fn applet_pane_is_never_spawned() {}

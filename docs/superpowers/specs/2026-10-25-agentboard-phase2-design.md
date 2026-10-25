@@ -119,7 +119,8 @@ dispatcher 탭을 분할해 오른쪽에 둔다. 터미널이 아닌 **앱 화�
 ## 8. handover 업무 인덱스 문서 [사용자 결정]
 
 - **포인터만** 담는다. 업무마다 한 줄: 업무 이름, 작업 계획 파일 경로, 진행 내역 파일 경로, 마지막 갱신 시각. 요약·대화 내용 금지.
-- 관리 주체는 handover 에이전트(역할 지시). 앱은 경로만 설정으로 안다(`config.json`의 `handoverIndex`, 기본 `<handover 작업폴더>/INDEX.md` **[설계자 판단]**).
+- 관리 주체는 handover 에이전트(역할 지시). 앱은 경로만 설정으로 안다(`config.json`의 `handoverIndex`, workspaceRoot 기준 상대경로, 기본 `HANDOVER.md` **[설계자 판단]**).
+- **handover의 작업공간은 dispatcher와 같이 루트(`workspaceRoot`)다 [사용자 결정]**. config에서 handover 탭은 `dir: ""`(빈 값 = 루트)로 둔다. 각 Manager의 작업 폴더를 모두 볼 수 있는 위치다.
 
 ## 9. 시작과 자동 실행
 
@@ -138,12 +139,12 @@ dispatcher 탭을 분할해 오른쪽에 둔다. 터미널이 아닌 **앱 화�
 {
   "tabs": [
     { "name": "dispatcher", "role": "dispatcher", "template": "dispatcher-inbox" },
-    { "name": "handover",   "role": "handover",   "dir": "handover", "template": "handover" },
+    { "name": "handover",   "role": "handover",   "dir": "",         "template": "handover" },
     { "name": "billing",    "role": "manager",    "dir": "billing",  "template": "manager" }
   ],
   "nightlyRefresh": "03:00",
   "nightlyTimeoutMin": 20,
-  "handoverIndex": "handover/INDEX.md",
+  "handoverIndex": "HANDOVER.md",
   "roles": {
     "dispatcher": { "systemPromptFile": "roles/dispatcher.md" },
     "handover":   { "systemPromptFile": "roles/handover.md" },
