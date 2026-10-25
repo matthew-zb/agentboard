@@ -524,16 +524,26 @@ async fn doc_list_md(app: AppHandle, query: Option<String>) -> Result<Vec<String
 }
 
 /// Watch the document a document pane shows (replaces its previous one). The watcher thread
-/// polls mtimes every second and emits `doc-changed {paneId}`.
+/// polls mtimes every second and emits `doc-changed {paneId}`. Runs on a blocking thread
+/// (canonicalize can be slow on a network share — review #12).
 #[tauri::command]
-fn doc_watch(state: State<'_, AppState>, pane_id: String, path: String) -> Result<(), String> {
+async fn doc_watch(app: AppHandle, pane_id: String, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        doc_watch_blocking(&state, pane_id, path)
+    })
+    .await
+    .map_err(|e| format!("문서 감시 작업이 중단되었습니다 — {e}"))?
+}
+
+fn doc_watch_blocking(state: &AppState, pane_id: String, path: String) -> Result<(), String> {
     // ws taken and released; then loaded(read), released; then the watch map (leaf)
     let is_doc = state.ws.lock().unwrap().pane_by_id(&pane_id).is_some_and(|p| p.kind.is_doc());
     if !is_doc {
         return Err(format!("문서 창이 아닙니다: {pane_id}"));
     }
     // a document missing right now is still watched (inside the root), so it reloads once created
-    let abs = docs::resolve_watch_path(&workspace_root(&state), &path)?;
+    let abs = docs::resolve_watch_path(&workspace_root(state), &path)?;
     let mtime = docs::mtime_of(&abs);
     state.docs.watch(&pane_id, abs, mtime);
     // the pane may have closed (and been unwatched by run_effects) since the check above:
@@ -574,12 +584,18 @@ fn doc_open_url(url: String) -> Result<(), String> {
 
 /// Files of the inbox item's issue folder (`input/`, `output/`), for the inbox detail. The
 /// folder is re-derived and checked with `issues::resolve` (stored paths are not trusted).
+/// Runs on a blocking thread (canonicalize + read_dir — review #12).
 #[tauri::command]
-fn inbox_issue_files(state: State<'_, AppState>, id: String) -> Result<docs::IssueFiles, String> {
-    let item = state.inbox.get(&id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))?;
-    let Some(issue) = item.issue else { return Ok(docs::IssueFiles::default()) };
-    let workspace = mcp_tools::owner_workspace(&state, &item.owner_name)?;
-    docs::issue_files(&issues::resolve(&workspace, &issue)?)
+async fn inbox_issue_files(app: AppHandle, id: String) -> Result<docs::IssueFiles, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        let item = state.inbox.get(&id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))?;
+        let Some(issue) = item.issue else { return Ok(docs::IssueFiles::default()) };
+        let workspace = mcp_tools::owner_workspace(&state, &item.owner_name)?;
+        docs::issue_files(&issues::resolve(&workspace, &issue)?)
+    })
+    .await
+    .map_err(|e| format!("이슈 파일 목록 작업이 중단되었습니다 — {e}"))?
 }
 
 /// The document watcher thread: one `poll` per second; changed panes get `doc-changed`.
