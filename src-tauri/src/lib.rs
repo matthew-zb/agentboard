@@ -190,6 +190,12 @@ fn list_templates(state: State<'_, AppState>) -> Vec<String> {
     state.loaded.read().unwrap().templates.keys().cloned().collect()
 }
 
+/// `config.json` defaultTemplate (the new-tab wizard lists it first).
+#[tauri::command]
+fn default_template(state: State<'_, AppState>) -> String {
+    state.loaded.read().unwrap().config.default_template.clone()
+}
+
 #[tauri::command]
 fn missing_dirs(state: State<'_, AppState>) -> Vec<(TabId, String)> {
     launcher::missing_dirs(&state.ws.lock().unwrap())
@@ -211,6 +217,7 @@ pub fn run() {
             list_workspace_dirs,
             create_workspace_dir,
             list_templates,
+            default_template,
             missing_dirs,
         ])
         .setup(|app| {

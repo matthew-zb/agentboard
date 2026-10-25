@@ -20,17 +20,35 @@ import {
   focusedPaneId,
   tabGroups,
   statusParts,
+  visibleGroupIds,
+  toggleSidebar,
 } from './groups.js';
 import { buildKeymap, installKeyRouter } from './keys.js';
-import { planCommand, registerCommand, runCommand, CORE_IDS } from './commands.js';
+import { planCommand, registerCommand, runCommand, hasCommand, CORE_IDS } from './commands.js';
 import { applyFocus, requestFocus, settleFocus, flash, focusLocation } from './focus.js';
+import { leafIds } from './layout.js';
+import {
+  configureOverlays,
+  overlayOpen,
+  closeOverlays,
+  flowGuard,
+  pickNumber,
+  palette,
+  prompt,
+  confirm,
+  showErrors,
+  toast,
+  newTabWizard,
+} from './overlays.js';
+import { pickCommands, paletteItems, missingDirsFlow } from './overlay-logic.js';
 
 const $ = (id) => document.getElementById(id);
 
 let current = null; // last rendered Snapshot
 let builtSig = null; // layoutSignature of the split DOM currently mounted
 let configErrorLines = [];
-let msgTimer = null;
+let bindings = {}; // id → key string (palette hints)
+let renderedLoc = null; // focusLocation of the last render (overlays close when it changes)
 
 /** Send a WsCommand; render its snapshot (null = a newer one was already rendered). */
 function sendCmd(cmd) {
@@ -48,13 +66,10 @@ function sendCmd(cmd) {
 
 const quiet = (p) => p.catch(() => {});
 
+/** Every command / IPC error is shown as a 3s toast above the status bar. */
 function showError(err) {
   console.error('[agentboard]', err);
-  const el = document.querySelector('#status .status-msg');
-  if (!el) return;
-  el.textContent = String(err);
-  clearTimeout(msgTimer);
-  msgTimer = setTimeout(() => (el.textContent = ''), 6000);
+  toast(err);
 }
 
 function setFocus(group, tab, pane) {
@@ -65,12 +80,13 @@ function setFocus(group, tab, pane) {
  * Run WsCommands in order (stops at the first error). A SetFocus is tracked as a pending user
  * focus request so a background snapshot cannot pull DOM focus back meanwhile. RestartPane goes
  * through pane.js (re-attach marking). Flashes the focused pane when the tab/group changed.
+ * Resolves true when every command succeeded (errors were already toasted).
  */
 async function execute(cmds) {
   const before = current && focusLocation(current.workspace);
   for (const cmd of cmds) {
     if (cmd.type === 'restartPane') {
-      await restartPane(cmd.pane);
+      await restartPane(cmd.pane); // never rejects; errors are toasted by sendCmd
       continue;
     }
     const isFocus = cmd.type === 'setFocus';
@@ -79,7 +95,7 @@ async function execute(cmds) {
       await sendCmd(cmd);
     } catch (_) {
       if (isFocus) settleFocus(current);
-      return; // sendCmd already showed the error
+      return false; // sendCmd already showed the error
     }
     if (isFocus) settleFocus(current);
   }
@@ -87,6 +103,7 @@ async function execute(cmds) {
   if (ws && focusLocation(ws) !== before) {
     requestAnimationFrame(() => flash(focusedPaneId(current.workspace)));
   }
+  return true;
 }
 
 // Key commands run one after another, each planned against the snapshot the previous one
@@ -122,6 +139,102 @@ for (const id of CORE_IDS) {
   );
 }
 
+// ---------------------------------------------------------------- overlays (Task 13)
+
+/** Visible `.pane` / `.group` elements of `ids`, in that order, as picker targets. */
+function domTargets(ids, kind) {
+  return ids
+    .map((id) => ({ id, el: document.querySelector(`#groups .${kind}[data-${kind}="${CSS.escape(id)}"]`) }))
+    .filter((t) => t.el && !t.el.closest('#parking'));
+}
+
+/**
+ * Number pickers: 'pane' (pane.pick → SetFocus), 'moveTo' (tab.moveTo: number/hjkl → MoveTab;
+ * `\` / `-` → SplitGroupWith of the focused group, like group.splitRight/Down), 'merge'
+ * (group.mergeInto → MergeGroup into the picked group).
+ */
+async function pick(kind) {
+  if (!current || overlayOpen()) return;
+  const ws = current.workspace;
+  const targets = kind === 'pane' ? domTargets(visiblePaneIds(ws), 'pane') : domTargets(visibleGroupIds(ws), 'group');
+  if (!targets.length) return;
+  const res = await pickNumber(targets, { allowHjkl: true, extraKeys: kind === 'moveTo' ? ['\\', '-'] : [] });
+  if (!res) return;
+  enqueue(() => {
+    const cmds = current && pickCommands(kind, current.workspace, res, geometry());
+    return cmds && cmds.length ? execute(cmds) : undefined;
+  });
+}
+
+function openPalette() {
+  if (!current || overlayOpen()) return;
+  const items = paletteItems(current.workspace, { bindings, has: hasCommand });
+  return palette(items.map((it) => ({ label: it.label, hint: it.hint, run: () => runPaletteAction(it.action) })));
+}
+
+function runPaletteAction(a) {
+  switch (a.type) {
+    case 'command':
+      return runCommand(a.id, { id: a.id, event: null, snapshot: current });
+    case 'ws':
+      return enqueue(() => execute(a.cmds));
+    case 'rename':
+      return renameTab(a.tab);
+    case 'errors':
+      return openErrors();
+    case 'sidebar':
+      toggleSidebar();
+      return undefined;
+    default:
+      return undefined;
+  }
+}
+
+async function renameTab(tabId) {
+  const tab = current && current.workspace.tabs[tabId];
+  if (!tab) return;
+  const name = await prompt(`탭 이름 바꾸기: ${tab.name}`, tab.name);
+  if (name == null || name.trim() === tab.name) return;
+  enqueue(() => execute([{ type: 'renameTab', tab: tabId, name: name.trim() }]));
+}
+
+function openErrors() {
+  return api.configErrors().then((lines) => {
+    configErrorLines = lines;
+    return showErrors(lines);
+  }, showError);
+}
+
+registerCommand('pane.pick', () => pick('pane'));
+registerCommand('tab.moveTo', () => pick('moveTo'));
+registerCommand('group.mergeInto', () => pick('merge'));
+registerCommand('tab.new', () => {
+  if (!overlayOpen()) newTabWizard().catch(showError);
+});
+registerCommand('app.palette', () => openPalette());
+registerCommand('pane.breakToTab', () =>
+  enqueue(() => {
+    const pane = current && focusedPaneId(current.workspace);
+    return pane ? execute([{ type: 'breakPaneToTab', pane }]) : undefined;
+  }),
+);
+
+/** Spec §4.2: ask (one folder at a time) to create each missing workspace folder. */
+function checkMissingDirs() {
+  return missingDirsFlow({
+    alive: flowGuard(),
+    missingDirs: () => api.missingDirs(),
+    confirm,
+    createDir: (name) => api.createDir(name),
+    panesOf: (tabId) => {
+      const t = current && current.workspace.tabs[tabId];
+      return t ? leafIds(t.layout) : [];
+    },
+    restart: (ids) => execute(ids.map((pane) => ({ type: 'restartPane', pane }))),
+    toast,
+  }).catch(showError);
+}
+
 // passthroughKeys per pane (profile-defined, fixed for the pane's life): fetched once.
 const passthroughCache = new Map();
 function getPassthrough(paneId) {
@@ -144,6 +257,11 @@ export function render(snap) {
   if (current && snap.version < current.version) return;
   current = snap;
   const ws = snap.workspace;
+
+  // Spec §6.4: a tab/group switch (key, mouse, palette) closes any open overlay.
+  const loc = focusLocation(ws);
+  if (renderedLoc !== null && loc !== renderedLoc) closeOverlays();
+  renderedLoc = loc;
 
   for (const id of staleIds(knownPaneIds(), ws.panes)) {
     disposePane(id);
@@ -176,7 +294,7 @@ export function render(snap) {
 
   requestAnimationFrame(() => {
     for (const id of visible) fitPane(id);
-    applyFocus(current);
+    if (!overlayOpen()) applyFocus(current); // an open overlay keeps DOM focus
   });
 }
 
@@ -194,7 +312,12 @@ function renderStatus(snap) {
   if (s.sync) flags.appendChild(flag('[SYNC]', 'sync', '입력 동기화: 이 탭의 모든 실행 중 창에 입력이 전달됩니다'));
   if (s.errors > 0) {
     if (configErrorLines.length !== s.errors) refreshConfigErrors();
-    flags.appendChild(flag(`[설정 오류 ${s.errors}]`, 'errors', configErrorLines.join('\n') || '설정 오류'));
+    const f = flag(`[설정 오류 ${s.errors}]`, 'errors', configErrorLines.join('\n') || '설정 오류');
+    f.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      if (!overlayOpen()) openErrors();
+    });
+    flags.appendChild(f);
   }
 }
 
@@ -229,6 +352,11 @@ const router = installKeyRouter({
   run: (id, event) => runCommand(id, { id, event, snapshot: current }),
 });
 
+configureOverlays({
+  setModal: (fn) => router.setModal(fn),
+  restoreFocus: () => applyFocus(current),
+  createTab: (cmd) => execute([cmd]),
+});
 configurePanes({
   send: sendCmd,
   onFocus: setFocus,
@@ -236,8 +364,17 @@ configurePanes({
   keyFilter: (paneId, ev) => router.termKeyFilter(paneId, ev),
 });
 api.onWorkspaceChanged(render);
-api.snapshot().then(render, showError);
-api.keybindings().then((b) => router.setKeymap(buildKeymap(b)), showError);
+api
+  .snapshot()
+  .then(render)
+  .then(checkMissingDirs, showError);
+api.keybindings().then((b) => {
+  bindings = b || {};
+  router.setKeymap(buildKeymap(bindings));
+}, showError);
 refreshConfigErrors();
-// Re-activating the app window returns DOM focus to the current pane (spec §6.4).
-window.addEventListener('focus', () => applyFocus(current));
+// Re-activating the app window returns DOM focus to the current pane (spec §6.4); an open
+// overlay keeps it.
+window.addEventListener('focus', () => {
+  if (!overlayOpen()) applyFocus(current);
+});

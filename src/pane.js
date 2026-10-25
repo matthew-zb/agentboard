@@ -274,16 +274,17 @@ function button(cls, text, title, onClick) {
 }
 
 function run(cmd) {
-  return Promise.resolve(hooks.send(cmd)).catch((err) => hooks.report(err));
+  // hooks.send (app sendCmd) already reports a rejected command (toast); don't report it twice.
+  return Promise.resolve(hooks.send(cmd)).catch(() => {});
 }
 
 /** Send RestartPane; the next `running` status re-attaches to the new process. */
 export function restartPane(paneId) {
   const e = entries.get(paneId);
   if (e) e.restartMarked = true;
-  return Promise.resolve(hooks.send({ type: 'restartPane', pane: paneId })).catch((err) => {
+  // hooks.send (app sendCmd) already reports the error; reporting again would toast it twice.
+  return Promise.resolve(hooks.send({ type: 'restartPane', pane: paneId })).catch(() => {
     if (e) e.restartMarked = false;
-    hooks.report(err);
   });
 }
 

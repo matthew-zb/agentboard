@@ -109,6 +109,11 @@ export function listTemplates() {
   return invoke('list_templates');
 }
 
+/** `config.json` defaultTemplate name. */
+export function defaultTemplate() {
+  return invoke('default_template');
+}
+
 /** `[[tabId, dir], ...]` for tabs whose working folder does not exist. */
 export function missingDirs() {
   return invoke('missing_dirs');

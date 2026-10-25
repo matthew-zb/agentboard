@@ -158,9 +158,13 @@ export function installKeyRouter(opts) {
   };
 
   const onKeyDown = (e) => {
-    if (modal && modal(e)) {
-      e.preventDefault();
-      e.stopPropagation();
+    if (modal) {
+      // An overlay owns the keyboard: no app shortcut fires underneath. Keys the overlay does not
+      // consume (false) keep their default action, e.g. typing into the overlay's text input.
+      if (modal(e)) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
       return;
     }
     const id = appId(e, paneOf(e));
@@ -186,7 +190,10 @@ export function installKeyRouter(opts) {
     setKeymap(km) {
       keymap = km || new Map();
     },
-    /** While set, `fn(e)` sees every keydown first; returning true consumes it (overlays). */
+    /**
+     * While set (overlays), `fn(e)` gets every keydown and no app command runs. Returning true
+     * consumes the key (preventDefault + stopPropagation); false leaves its default action.
+     */
     setModal(fn) {
       modal = fn || null;
     },

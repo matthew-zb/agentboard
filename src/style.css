@@ -76,10 +76,9 @@ body.dragging-v, body.dragging-v * { cursor: row-resize !important; user-select:
 /* ---- status bar ---- */
 #status { flex: 0 0 22px; display: flex; align-items: center; gap: 12px; padding: 0 10px; background: var(--chrome); border-top: 1px solid var(--line); font-size: 12px; white-space: nowrap; overflow: hidden; }
 .status-path { color: var(--text); }
-.status-msg { flex: 1; color: var(--bad); overflow: hidden; text-overflow: ellipsis; }
 .status-flags { display: flex; gap: 8px; }
 .flag.sync { color: var(--accent); font-weight: 600; }
-.flag.errors { color: var(--warn); cursor: help; }
+.flag.errors { color: var(--warn); cursor: pointer; }
 
 /* ---- sidebar ---- */
 #sidebar { flex: 0 0 220px; overflow: auto; background: var(--chrome); border-right: 1px solid var(--line); font-size: 12px; user-select: none; }
@@ -91,3 +90,34 @@ body.dragging-v, body.dragging-v * { cursor: row-resize !important; user-select:
 .tree-tab, .tree-pane { cursor: pointer; }
 .tree-tab.mark { color: var(--text); font-weight: 600; }
 .tree-tab:hover, .tree-pane:hover { background: var(--chrome-2); }
+
+/* ---- overlays (Task 13) ---- */
+.ov-backdrop { position: fixed; inset: 0; z-index: 50; display: flex; justify-content: center; align-items: flex-start; padding-top: 12vh; background: rgba(0, 0, 0, 0.35); }
+.ov-box { width: min(600px, 90vw); max-height: 64vh; display: flex; flex-direction: column; background: var(--chrome); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 10px 32px rgba(0, 0, 0, 0.55); outline: none; overflow: hidden; }
+.ov-title { padding: 8px 12px 0; color: var(--muted); font-size: 12px; }
+.ov-input { margin: 8px; padding: 6px 8px; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 3px; outline: none; font: inherit; }
+.ov-input:focus { border-color: var(--accent); }
+.ov-list, .ov-error-list { list-style: none; margin: 0; padding: 0 0 6px; overflow: auto; }
+.ov-item { display: flex; gap: 12px; padding: 4px 12px; cursor: pointer; white-space: nowrap; }
+.ov-item .ov-label { overflow: hidden; text-overflow: ellipsis; }
+.ov-item .ov-hint { margin-left: auto; color: var(--muted); font-size: 12px; }
+.ov-item.sel { background: var(--chrome-2); box-shadow: inset 2px 0 0 var(--accent); }
+.ov-item.create .ov-label { color: var(--ok); }
+.ov-empty { padding: 4px 12px; color: var(--muted); }
+.ov-message { padding: 18px 16px 12px; line-height: 1.5; }
+.ov-buttons { display: flex; justify-content: flex-end; gap: 8px; padding: 0 12px 12px; }
+.ov-btn { padding: 4px 14px; background: var(--chrome-2); color: var(--text); border: 1px solid var(--line); border-radius: 3px; font: inherit; cursor: pointer; }
+.ov-btn.primary { border-color: var(--accent); }
+.ov-errors { width: min(900px, 94vw); }
+.ov-errors .ov-title { padding-bottom: 8px; }
+.ov-error { padding: 3px 12px; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; color: var(--warn); white-space: pre-wrap; word-break: break-all; user-select: text; }
+
+/* number picker */
+.pick-layer { position: fixed; inset: 0; z-index: 50; pointer-events: none; outline: none; }
+.pick-target { position: absolute; box-sizing: border-box; border: 2px dashed var(--accent); background: rgba(78, 161, 255, 0.08); display: flex; align-items: center; justify-content: center; }
+.pick-label { min-width: 72px; padding: 0 22px; text-align: center; font-size: 56px; font-weight: 700; line-height: 1.35; color: #fff; background: rgba(30, 90, 170, 0.92); border-radius: 10px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5); }
+.pick-help { position: absolute; left: 50%; bottom: 34px; transform: translateX(-50%); padding: 4px 12px; background: var(--chrome-2); border: 1px solid var(--line); border-radius: 4px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+
+/* toasts: above the status bar */
+#toasts { position: fixed; right: 12px; bottom: 30px; z-index: 60; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; max-width: min(640px, 80vw); pointer-events: none; }
+.toast { padding: 6px 10px; background: var(--chrome-2); color: var(--text); border: 1px solid var(--bad); border-left-width: 3px; border-radius: 4px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45); white-space: pre-wrap; }
