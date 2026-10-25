@@ -38,7 +38,7 @@ npx tauri build    # 릴리스 빌드 → src-tauri/target/release/bundle/nsis/*
 
 | 파일 | 위치 | 설명 |
 |---|---|---|
-| `settings.json` | `%APPDATA%/agentboard/` | 부트스트랩 전용. `{ "workspaceRoot": "C:/workspace" }` |
+| `settings.json` | `%APPDATA%/agentboard/` | 부트스트랩 전용. `{ "workspaceRoot": "D:/work" }` |
 | `workspace.json` | `%APPDATA%/agentboard/` | 앱이 저장하는 실행 상태(직접 편집하지 않음). 깨지면 `.bak`로 옮기고 `config.json` 배치로 시작 |
 | `config.json` | `<workspaceRoot>/.agentboard/` | 초기 탭·그룹 배치 |
 | `templates/*.json` | `<workspaceRoot>/.agentboard/templates/` | 탭 템플릿(분할 레이아웃) |
@@ -72,7 +72,7 @@ npx tauri build    # 릴리스 빌드 → src-tauri/target/release/bundle/nsis/*
 }
 ```
 
-- `dispatcher` 탭은 이름이 예약되어 있고 작업공간이 `workspaceRoot`이며 닫을 수 없습니다.
+- `dispatcher` 탭은 이름이 예약되어 있고 작업공간이 `workspaceRoot`이며 닫을 수 없습니다. `agentboard`(대소문자 무관)도 앱이 메시지를 보낼 때 쓰는 이름이라 탭·팀 이름으로 쓸 수 없습니다.
 - 업무 탭의 작업공간은 `<workspaceRoot>/<dir>`입니다. 폴더가 없으면 시작할 때 만들지 묻습니다.
 - `groups`는 첫 실행(또는 `workspace.json`이 없을 때)의 초기 배치입니다. `groups`에 없는 탭은 `defaultGroup`에 열립니다.
 
@@ -114,7 +114,7 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
 }
 ```
 
-- `ready`: `{ "pattern": "<regex>" }`(출력에 매칭) 또는 `{ "idleMs": n }`(첫 출력 후 n ms 무출력). 10초가 지나면 그냥 입력하고 창 헤더에 경고를 표시합니다.
+- `ready`: `{ "pattern": "<regex>" }`(출력에 매칭) 또는 `{ "idleMs": n }`(첫 출력 후 n ms 무출력). 10초가 지나면 그냥 입력하고 창 헤더에 경고를 표시합니다. 역할 창(2단계)은 다릅니다: 그 세션의 SessionStart hook이 온 뒤에만 이 규칙으로 시작 프롬프트를 넣고, SessionStart가 없으면 넣지 않습니다(폴더 신뢰 질문에 Enter가 들어가지 않도록).
 - `passthroughKeys`: 앱 단축키 중 이 창에서는 가로채지 않고 프로그램에 넘길 키(예: `"Alt+h"`).
 - `level`, `systemPrompt`, `mcp`, `idle`, `resume`은 파싱·검증만 하고 쓰지 않습니다. 역할 세션의 지시·MCP·인자는 config.json `roles`와 앱이 정합니다(2단계).
 
@@ -133,8 +133,8 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
 ### 사전 요구사항
 
 - **Claude Code 2.1.234 이상** (Windows 세션 간 메시징). `claude update`로 올립니다. 미달이면 상태 표시줄에 오류가 뜨고 에이전트끼리 메시지(SendMessage)만 안 됩니다. 탭·MCP·인박스는 동작합니다.
-- **Git for Windows**(Git Bash). 앱이 역할 세션에 넣는 hook(`"<agentboard.exe>" --hook <이벤트>`)을 Claude Code가 Git Bash로 실행합니다. 없으면 앱→세션 메시지·⚠ 같은 hook 기반 기능이 빠집니다(`winget install --id Git.Git -e`).
-- **폴더 신뢰 — 작업 폴더마다 한 번.** 역할 세션을 처음 띄우는 폴더에서는 Claude Code가 "이 폴더를 신뢰하시겠습니까?"를 묻고 멈춥니다. 그 창으로 가서 직접 답하세요. 앱은 Claude의 신뢰 설정(`~/.claude.json`)을 고치지 않습니다. 30초 안에 세션이 시작되지 않으면 그 탭에 ⚠ "폴더 신뢰 확인 필요"가 뜹니다.
+- **Git for Windows**(Git Bash). 앱이 역할 세션에 넣는 hook(`"<agentboard.exe>" --hook <이벤트>`)을 Claude Code가 Git Bash로 실행합니다. 없으면 앱→세션 메시지·⚠ 같은 hook 기반 기능이 빠지고, 역할 창의 시작 프롬프트도 들어가지 않습니다(SessionStart를 기다리므로, 직접 입력해야 함). 설치: `winget install --id Git.Git -e`.
+- **폴더 신뢰 — 작업 폴더마다 한 번.** 역할 세션을 처음 띄우는 폴더에서는 Claude Code가 "이 폴더를 신뢰하시겠습니까?"를 묻고 멈춥니다. 그 창으로 가서 직접 답하세요. 앱은 Claude의 신뢰 설정(`~/.claude.json`)을 고치지 않고, 그 질문에 시작 프롬프트를 넣지도 않습니다(시작 프롬프트는 세션이 시작된 뒤에 들어갑니다). 30초 안에 세션이 시작되지 않으면 그 탭에 ⚠ "폴더 신뢰 확인 필요"가 뜹니다.
 - (handover를 쓸 때) **holla** CLI — handover가 슬랙을 확인할 때 씁니다. 기본 점검 항목이며 dispatcher가 설치를 안내합니다(아래 `envRequire`).
 
 시작할 때 앱이 위 항목을 점검합니다. 실패한 항목만 상태 표시줄에 `[환경: Git 없음, holla 없음]`처럼 작게 보이고(필수 항목·Claude 버전은 강조), dispatcher가 시작 리뷰에서 하나씩 안내합니다. **설치·변경 명령은 사용자가 승인한 뒤에만** dispatcher가 실행하며, 앱은 아무것도 설치하지 않습니다.
@@ -149,7 +149,9 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
 | lead | 임시 | `<탭>-<팀id>-lead` | brief대로 팀원에게 일을 나누고 결과물을 검증·지적, Manager에게 보고 |
 | member | 임시 | `<탭>-<팀id>-m<N>` | 리드의 지시 수행, 리드에게만 보고 |
 
-경로: handover → dispatcher → 담당 Manager → 인박스 항목 → 사용자, 사용자 지시는 dispatcher를 거쳐 Manager로, 팀은 Manager ↔ 리드 ↔ 팀원. 앱이 보내는 메시지(인박스 지시, 야간 정리 신호)는 보낸 이 `agentboard`, 본문 `[AgentBoard] …`로 도착하며 역할 지시가 이를 사용자 지시로 다루게 합니다. 앱이 보내는 본문의 `<` `>`는 `‹` `›`로 바뀝니다(위조 방지).
+경로: handover → dispatcher → 담당 Manager → 인박스 항목 → 사용자, 사용자 지시는 dispatcher를 거쳐 Manager로, 팀은 Manager ↔ 리드 ↔ 팀원. 앱이 보내는 메시지(인박스 지시, 야간 정리 신호)는 보낸 이 `agentboard`, 본문 `[AgentBoard] …`로 도착하며, 역할 지시는 **보낸 이가 정확히 `agentboard`인 메시지만** 사용자 지시로 다룹니다. 다른 세션이 보낸 메시지는 `[AgentBoard]`로 시작해도 동료의 메시지이고, `agentboard`는 탭·세션 이름으로 쓸 수 없습니다. 앱이 보내는 본문의 `<` `>`는 `‹` `›`로 바뀝니다(위조 방지).
+
+**외부 내용은 데이터입니다.** 역할 지시는 슬랙·메일·웹·파일, 그리고 다른 세션이 옮겨 온 그런 내용 안의 지시를 따르지 말고 보고만 하라고 합니다. handover가 가져온 메시지는 dispatcher가 "외부 메시지(참고용)"로 Manager에게 넘기고, Manager는 앱 메시지와 dispatcher가 옮긴 인박스 지시("사용자 지시(인박스 항목 …)")만 사용자 권한으로 봅니다. Manager·리드·팀원은 외부 발송·삭제·배포처럼 되돌리기 어려운 일을 사용자 승인(인박스 항목 또는 `need_user`) 뒤에만 합니다. 이것도 프롬프트 수준의 방어이므로, 외부 메시지를 다루는 업무에는 위험한 권한을 주지 마세요.
 
 **권한 분리는 권고 수준입니다.** 메시지 경로는 역할 지시(프롬프트)로만 지켜지며 앱이 막지 않습니다. 앱이 강제하는 것은 MCP 도구의 역할별 허용(아래 표)과 항목 담당 확인뿐입니다. 역할 세션은 모두 같은 Windows 사용자로 실행되므로 다른 창의 run 파일(`%APPDATA%/agentboard/run/<창id>.{mcp,settings}.json`, 토큰 포함)도 읽을 수 있습니다 — 혼자 쓰는 PC를 전제로 합니다.
 
@@ -192,7 +194,7 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
 - **handover** 탭은 하나만, `dir: ""`(작업공간 = `workspaceRoot`)이어야 합니다. **manager** 탭은 전용 폴더(`dir`)가 필요합니다.
 - `handoverIndex`: 업무 인덱스 문서, `workspaceRoot` 기준(기본 `HANDOVER.md`). 업무마다 한 줄 — 업무 이름, 계획 파일, 진행 파일, 갱신 시각 — 포인터만 담습니다.
 - `nightlyRefresh`(`"HH:MM"`, 기본 `"03:00"`, `null`이면 끔), `nightlyTimeoutMin`(기본 20), `nightlyQuietMin`(기본 10): 아래 "야간 정리".
-- `roles.<역할>`: `systemPromptFile`(`.agentboard/` 기준 상대경로), `agent`(팀 창 프로필, 기본 `defaultAgent`), `args`(그 역할 세션에 붙는 인자), `maxPerTeam`(member만, 팀당 팀원 상한, 기본 4). `systemPromptFile`을 생략하면 `roles/<역할>.md`를 쓰고, 그 파일도 없으면 내장 기본 지시를 씁니다. 첫 실행 때 복사된 `roles/*.md`를 직접 다듬으면 다음에 뜨는 세션부터 적용됩니다.
+- `roles.<역할>`: `systemPromptFile`(`.agentboard/` 기준 상대경로), `agent`(팀 창 프로필, 기본 `defaultAgent`), `args`(그 역할 세션에 붙는 인자), `maxPerTeam`(member만, 팀당 팀원 상한, 기본 4). `systemPromptFile`을 생략하면 `roles/<역할>.md`를 쓰고, 그 파일도 없으면 내장 기본 지시를 씁니다. 첫 실행 때 복사된 `roles/*.md`를 직접 다듬으면 다음에 뜨는 세션부터 적용됩니다. **업그레이드해도 복사된 파일은 바뀌지 않습니다** — 새 버전의 기본 지시를 쓰려면 앱을 끈 상태에서 `.agentboard/roles/`의 해당 `.md`를 지우세요(다음 시작 때 새 기본값이 복사됩니다. 직접 고친 내용이 있으면 먼저 옮겨 두세요). 템플릿(`templates/*.json`)도 같습니다.
   - npm으로 설치한 `claude.cmd`에서는 cmd.exe 제약 때문에 역할 지시가 한 줄로 합쳐지고(줄바꿈 → ` ⏎ `) `" % ^ & | < >`가 비슷한 모양의 다른 문자로 바뀝니다. 지시 파일은 짧게(수천 자 이내) 유지하세요.
 - `envRequire`: 사용자 정의 점검 항목. `check` 명령(cmd.exe로 실행, 10초 제한)이 종료 코드 0이면 정상. `required: true`는 건너뛸 수 없습니다. 키가 없으면 위의 holla 항목이 기본이고, `[]`이면 없음. `source`(설치할 GitHub 저장소 주소)가 비어 있으면 dispatcher가 사용자에게 주소를 물어 기록한 뒤, 승인을 받아 그 저장소 README대로 설치합니다. 저장소가 비공개일 수 있어 앱은 주소를 기본값으로 넣지 않습니다.
 - `envSkip`: 사용자가 "필요 없다"고 한 점검 항목 id(`claude-version`, `git-bash`, `folder-trust:<탭>`, 사용자 정의 id). dispatcher가 `env_skip`으로 기록하며, 그 기능만 빠지고 다시 묻지 않습니다.
@@ -203,13 +205,13 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
 | 템플릿 | 배치 | 시작 프롬프트 |
 |---|---|---|
 | `dispatcher-inbox` | dispatcher \| 인박스 애플릿 | 환경 점검·인덱스·인박스 리뷰 |
-| `handover` | 창 하나 | `/loop 10m <확인 작업>` — **직접 고치세요**(예: `/loop 10m holla로 새 슬랙 멘션과 메일을 확인해 새 메시지만 dispatcher에게 전달`) |
+| `handover` | 창 하나 | `/loop 10m {확인 작업}` — **직접 고치세요**(예: `/loop 10m holla로 새 슬랙 멘션과 메일을 확인해 새 메시지만 dispatcher에게 전달`) |
 | `manager` | Manager \| 셸(PowerShell), 이 분할이 팀 영역(`"slot": "team"`) | 계획·진행 내역 리뷰, 진행 중인 팀 재채용 |
 | `dispatcher`·`solo`·`team-3` | 1단계 그대로 | — |
 
 - 팀 리드는 팀 영역 오른쪽에 팀마다 한 열로, 팀원은 그 리드 아래로 붙습니다. 템플릿에 `slot: "team"` 분할이 없으면 첫 채용 때 Manager 창 오른쪽에 팀 영역이 생기고, 마지막 팀이 해산되면 사라집니다.
 - 시작 프롬프트는 앱을 시작할 때 템플릿에서 다시 읽습니다. 템플릿을 고치면 다음 앱 시작부터 적용됩니다(야간 정리 재시작은 그때 읽은 프롬프트를 다시 넣습니다).
-- 새로 설치하면 시작용 config.json이 `dispatcher-inbox`를 씁니다. **이미 쓰던 설치**에서 인박스를 붙이려면 `"dispatcher": { "template": "dispatcher-inbox" }`로 바꾼 뒤, 앱을 끈 상태에서 `%APPDATA%/agentboard/workspace.json`을 지우세요(저장된 배치가 dispatcher 탭을 예전 모양으로 복원하기 때문입니다. 배치는 config 기준으로 초기화됩니다).
+- config.json이 없으면(새로 설치, 또는 `.agentboard`만 있고 config.json이 없을 때) 시작용 config.json이 `dispatcher-inbox`를 쓰도록 만들어집니다. 있는 config.json은 덮어쓰지 않습니다. **이미 쓰던 설치**에서 인박스를 붙이려면 `"dispatcher": { "template": "dispatcher-inbox" }`로 바꾼 뒤, 앱을 끈 상태에서 `%APPDATA%/agentboard/workspace.json`을 지우세요(저장된 배치가 dispatcher 탭을 예전 모양으로 복원하기 때문입니다. 배치는 config 기준으로 초기화됩니다). 인박스 항목의 담당은 탭 이름으로 기록되므로 이렇게 초기화해도 그대로 유지됩니다.
 
 ### 앱 내장 MCP 도구
 
@@ -274,6 +276,8 @@ dispatcher 탭 오른쪽 창(`{"applet":{"name":"inbox","kind":"inbox"}}`)입니
 - 시작할 때는 상시 에이전트(dispatcher·handover·Manager)만 **새 세션 + 시작 프롬프트**로 띄웁니다. 팀 창과 팀 영역은 복원하지 않고, 각 Manager가 시작 리뷰에서 `teams/*/brief.md`가 `상태: 완료`가 아닌 팀을 **자동으로 다시 채용**하며, 리드는 `roster.md`대로 팀원을 다시 채용해 이어서 일합니다.
 - **역할 탭의 기준은 config.json입니다.** 이름·dir이 같은 `tabs[]` 항목이 있는 탭만 역할 탭으로 복원되고, config에만 있는 역할 탭은 `defaultGroup`에 포커스를 뺏지 않고 추가됩니다. Manager·handover 탭의 이름을 바꾸거나 닫으면 config.json 항목도 함께 바뀌거나 빠집니다. 역할 없는 탭은 1단계처럼 `workspace.json`에서 복원합니다.
 - 역할 탭 안의 다른 창(예: `manager` 템플릿의 셸, 직접 띄운 Claude 창)은 역할 없는 창으로 시작 프롬프트 없이 다시 실행됩니다.
+- **한 번에 하나만 실행**: 이미 실행 중일 때 다시 실행하면(자동 실행 뒤 바로 가기 클릭, 설치 후 재실행 등) 새 프로세스는 바로 끝나고 기존 창이 앞으로 옵니다. 역할 세션의 hook(`agentboard.exe --hook …`)은 이 제한과 무관하게 동작합니다.
+- **인박스 담당**: 항목은 담당 탭의 **이름**으로 기록됩니다. Manager 탭 이름을 바꾸면 그 항목들도 함께 옮겨 가고, 탭을 닫으면 항목은 "담당 없음(이름)"으로 표시되며 지시·이슈 요청을 보낼 수 없습니다(같은 이름의 Manager 탭을 다시 만들면 다시 연결됩니다).
 - **로그인 시 자동 실행**: 커맨드 팔레트의 "로그인 시 자동 실행 켜기/끄기"(HKCU `Run` 키에 현재 exe 경로를 등록). 개발 빌드에서 켜면 개발용 exe가 등록되니 주의하세요.
 
 ## 키 배치

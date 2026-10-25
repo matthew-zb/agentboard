@@ -240,7 +240,7 @@ export const SANITIZE_CONFIG = Object.freeze({
 });
 
 /**
- * Second pass over the rendered body after KaTeX (defence in depth: KaTeX 0.16.9 output is
+ * Second pass over the rendered body after KaTeX (defence in depth: KaTeX 0.18.11 output is
  * re-sanitized). Allows KaTeX's MathML, SVG (stretchy symbols) and inline `style` — the first
  * pass already removed every svg/math element and style attribute the document itself had.
  */
