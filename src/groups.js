@@ -136,7 +136,7 @@ export function renderGroupChrome(rootEl, ws, ctx) {
     el.classList.toggle('focused', focused);
     el.classList.toggle('dim', !focused);
     const tabs = g.tabIds.map((t) => ws.tabs[t]).filter(Boolean);
-    const bar = renderTabBar(g, tabs, focused, { panes: ws.panes, onSelect: (tid) => ctx.onSelectTab(g.id, tid) });
+    const bar = renderTabBar(g, tabs, focused, { panes: ws.panes, onSelect: (tid) => ctx.onSelectTab(g.id, tid), onRefocus: ctx.onRefocus });
     el.querySelector('.tabbar-slot').replaceChildren(bar);
   }
 }

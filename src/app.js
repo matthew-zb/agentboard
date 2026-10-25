@@ -38,6 +38,7 @@ import {
   shouldFlagBell,
 } from './focus.js';
 import { leafIds } from './layout.js';
+import { installDnd } from './dnd.js';
 import {
   configureOverlays,
   overlayOpen,
@@ -350,7 +351,12 @@ export function render(snap) {
   const visible = new Set(visiblePaneIds(ws));
   for (const id of knownPaneIds()) setPaneVisible(id, visible.has(id));
 
-  renderGroupChrome(groupsEl, ws, { onSelectTab: (group, tab) => selectTab(ws, group, tab) });
+  renderGroupChrome(groupsEl, ws, {
+    onSelectTab: (group, tab) => selectTab(ws, group, tab),
+    onRefocus: () => {
+      if (!overlayOpen()) applyFocus(current);
+    },
+  });
   renderStatus(snap);
   renderSidebar($('sidebar'), ws, { onSelect: (g, t, p) => setFocus(g, t, p) });
 
@@ -435,6 +441,14 @@ configurePanes({
   report: showError,
   keyFilter: (paneId, ev) => router.termKeyFilter(paneId, ev),
   onBell,
+});
+// Tab drag & drop (spec 6.6). Errors from MoveTab/SplitGroupWith are toasted by sendCmd.
+installDnd($('groups'), {
+  getWs: () => (current ? current.workspace : null),
+  send: (cmd) => quiet(execute([cmd])),
+  refocus: () => {
+    if (!overlayOpen()) applyFocus(current);
+  },
 });
 api.onWorkspaceChanged(render);
 api

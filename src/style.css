@@ -131,3 +131,18 @@ body.dragging-v, body.dragging-v * { cursor: row-resize !important; user-select:
   font-size: 11px;
   white-space: nowrap;
 }
+
+/* Tab drag & drop (dnd.js). The overlay covers a group's body (below the 28px tab bar) while a
+   tab is dragged so xterm never swallows the drag events. */
+.group { position: relative; }
+.drop-overlay { position: absolute; left: 0; right: 0; bottom: 0; top: 29px; z-index: 40; background: rgba(0, 0, 0, 0.12); }
+.drop-preview { position: absolute; background: rgba(78, 161, 255, 0.28); border: 2px solid var(--accent); box-sizing: border-box; pointer-events: none; }
+.drop-preview.hidden { display: none; }
+.drop-preview.zone-center { inset: 0; }
+.drop-preview.zone-left { left: 0; top: 0; bottom: 0; width: 50%; }
+.drop-preview.zone-right { right: 0; top: 0; bottom: 0; width: 50%; }
+.drop-preview.zone-top { left: 0; right: 0; top: 0; height: 50%; }
+.drop-preview.zone-bottom { left: 0; right: 0; bottom: 0; height: 50%; }
+.tab.drop-before { box-shadow: inset 3px 0 0 var(--accent); }
+.tab.drop-after { box-shadow: inset -3px 0 0 var(--accent); }
+.tabbar.drop-end { box-shadow: inset -3px 0 0 var(--accent); }

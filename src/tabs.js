@@ -1,4 +1,4 @@
-// Tab bar rendering (one per group). Drag-and-drop arrives in a later task.
+// Tab bar rendering (one per group). Drag-and-drop itself lives in dnd.js (delegated on #groups).
 // No top-level DOM access: the pure helpers are unit-tested in Node.
 import { leafIds } from './layout.js';
 
@@ -13,10 +13,11 @@ export function tabHasAttention(tab, panes) {
 /**
  * Tab bar for `group`. `tabs` are the group's Tab objects in order. `focused` = this is the
  * focused group; otherwise the bar gets `.dim`.
- * opts: `panes` (Workspace.panes, for the attention badge), `onSelect(tabId)` (tab click).
+ * opts: `panes` (Workspace.panes, for the attention badge), `onSelect(tabId)` (tab click),
+ * `onRefocus()` (after a click: DOM focus back to the pane).
  */
 export function renderTabBar(group, tabs, focused, opts = {}) {
-  const { panes = {}, onSelect } = opts;
+  const { panes = {}, onSelect, onRefocus } = opts;
   const bar = document.createElement('div');
   bar.className = focused ? 'tabbar focused' : 'tabbar dim';
   bar.dataset.group = group.id;
@@ -51,10 +52,14 @@ export function renderTabBar(group, tabs, focused, opts = {}) {
       el.appendChild(badge);
     }
     el.title = tab.dir ? `${tab.name} — ${tab.dir}` : tab.name;
-    el.addEventListener('mousedown', (e) => {
+    // draggable: a mousedown preventDefault would suppress the drag, and a command sent on
+    // mousedown would re-render (and detach) the tab before dragstart. So select on click; the
+    // terminal loses DOM focus on mousedown and gets it back right after.
+    el.draggable = true;
+    el.addEventListener('click', (e) => {
       if (e.button !== 0) return;
-      e.preventDefault(); // keep DOM focus in the terminal; render re-applies it
       if (onSelect) onSelect(tab.id);
+      if (onRefocus) onRefocus();
     });
     bar.appendChild(el);
   }

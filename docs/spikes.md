@@ -294,3 +294,30 @@ Claude Code에서 `/config` → 알림 채널(notification channel)을 terminal 
 - [ ] 사용자 확인 필요 — 앱 창이 다른 앱 뒤에 있을 때 벨 → ⚠ 표시, 창을 다시 활성화하면 ⚠ 해제.
 
 결과: (미기록)
+
+## Task 16 — 마우스 드래그앤드롭 + 스파이크 S6 (사용자 확인 필요)
+
+구현자는 앱 창을 직접 조작할 수 없으므로(R8) 아래는 모두 **사용자 확인 필요**다. `npx tauri dev`는 시작 오류 없이 떴다. `tauri.conf.json`에 `dragDropEnabled: false`가 설정되어 있음을 확인했다(WebView2에서 HTML5 DnD를 쓰기 위한 조건).
+
+구현 요약 (`src/dnd.js`, `#groups`에 이벤트 위임):
+- 탭은 `draggable`. `dragstart` 다음 프레임에 각 그룹 본문(탭 바 아래) 위에 `.drop-overlay`를 깔고, 드래그 중 `dropZone`(가장자리 25%)에 따라 미리보기 사각형(`.drop-preview`)을 그린다.
+- 탭 바 위에 놓기 → `MoveTab{index}` (대상 탭 중앙 기준 앞/뒤, 같은 그룹 안에서는 "제거 후 최종 위치"로 변환, 제자리면 명령 안 보냄). 빈 영역 → 끝.
+- 그룹 본문 center → `MoveTab{index: 끝}`. 가장자리 → `SplitGroupWith{dir, before}` (left/right = horizontal, top/bottom = vertical, left/top = before).
+- 오버레이는 dragend / drop / Esc / 창 blur / 드래그 후 첫 mousemove·mouseup 때 모두 제거된다.
+- 탭 선택은 mousedown 대신 click에서 처리한다(mousedown의 preventDefault는 드래그 시작을 막고, mousedown에서 보낸 명령이 탭 DOM을 다시 그려 드래그를 끊을 수 있다). click 직후 터미널로 DOM 포커스를 되돌린다. 더블클릭에는 동작이 없다.
+
+### S6 — 터미널 위에서 드래그 이벤트가 오버레이로 들어오는가
+- [ ] 사용자 확인 필요 — 탭을 잡고 다른 그룹의 터미널 영역 위로 끌면 파란 미리보기 사각형이 나타난다(xterm이 이벤트를 삼키지 않음).
+- [ ] 사용자 확인 필요 — 드래그 중 Esc / 창 밖에서 놓기 / Alt+Tab 후 `.drop-overlay`가 남지 않는다.
+- [ ] 사용자 확인 필요 — 드래그가 아예 시작되지 않거나 오버레이가 이벤트를 받지 못하면(WebView2 문제) **대체안**: 탭에서 `mousedown`/`mousemove`/`mouseup`으로 직접 구현한다. 4px 이상 움직이면 드래그 시작, 고스트 요소를 따라다니게 하고, `document.elementFromPoint`로 오버레이/탭 바를 찾아 같은 `dropZone`/`tabBarDrop`/`bodyDrop`을 호출한다. 결과를 아래에 기록한다.
+
+### Step 5 — 4가지 드롭 + 클릭
+- [ ] 사용자 확인 필요 — 같은 그룹 탭 바 안에서 순서 변경(왼쪽/오른쪽 이동, 제자리에 놓으면 아무 일도 없음).
+- [ ] 사용자 확인 필요 — 다른 그룹 탭 바 위(탭의 앞/뒤, 빈 영역=끝)로 이동.
+- [ ] 사용자 확인 필요 — 다른 그룹 본문 중앙에 놓으면 그 그룹 탭 끝에 추가된다.
+- [ ] 사용자 확인 필요 — 그룹 본문 가장자리(왼/오/위/아래)에 놓으면 그 방향으로 새 그룹이 생긴다. 탭이 하나뿐인 자기 그룹의 가장자리에 놓으면 한글 오류 토스트.
+- [ ] 사용자 확인 필요 — 놓은 뒤 포커스가 옮긴 탭의 마지막 창으로 가고 바로 타이핑된다.
+- [ ] 사용자 확인 필요 — Dispatcher 탭도 끌어서 옮길 수 있다.
+- [ ] 사용자 확인 필요 — 탭 클릭이 정상(활성 탭 전환, 터미널 포커스 유지)이고, 더블클릭해도 아무 일도 일어나지 않는다.
+
+결과: (미기록)
