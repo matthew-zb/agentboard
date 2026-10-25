@@ -20,6 +20,8 @@ import {
   stripCssUrls,
   LINK_SELECTOR,
   imgAltText,
+  mermaidId,
+  rewriteMermaidRefs,
 } from '../../src/docview-logic.js';
 import { docChoices, paletteItems } from '../../src/overlay-logic.js';
 
@@ -322,4 +324,36 @@ test('prefilter is linear on unclosed tags', () => {
   assert.doesNotMatch(out, /<style/i);
   assert.equal(prefilterHtml('<p>a</p><script>x</script><p>b</p>'), '<p>a</p><p>b</p>');
   assert.equal(prefilterHtml('a<script>never closed <p>b</p>'), 'a');
+});
+
+test('mermaid ids: only the render id namespace, references follow the rename', () => {
+  const rid = 'mermaid-svg-3';
+  assert.equal(mermaidId(rid, 'mermaid-svg-3'), 'mermaid-svg-3');
+  assert.equal(mermaidId(rid, 'mermaid-svg-3_flowchart-v2-pointEnd'), 'mermaid-svg-3_flowchart-v2-pointEnd');
+  assert.equal(mermaidId(rid, 'mermaid-svg-31'), 'mermaid-svg-3-mermaid-svg-31', 'another render id is not ours');
+  for (const appId of ['status', 'groups', 'parking', 'toasts', 'sidebar', 'main', 'mermaid', 'doc-p1-x']) {
+    const v = mermaidId(rid, appId);
+    assert.equal(v, `mermaid-svg-3-${appId}`);
+    assert.notEqual(v, appId);
+  }
+  const map = new Map([['status', 'mermaid-svg-3-status'], ['grad', 'mermaid-svg-3-grad']]);
+  assert.equal(rewriteMermaidRefs('url(#status)', map), 'url(#mermaid-svg-3-status)');
+  assert.equal(rewriteMermaidRefs("fill:url( '#grad' ); stroke:url(#other)", map), "fill:url(#mermaid-svg-3-grad); stroke:url(#other)");
+  assert.equal(rewriteMermaidRefs('#status', map), '#mermaid-svg-3-status');
+  assert.equal(rewriteMermaidRefs('#statusx', map), '#statusx');
+  assert.equal(rewriteMermaidRefs('plain text #status', map), 'plain text #status');
+});
+
+test('tag cleaning is linear on long whitespace runs', () => {
+  const sp = ' '.repeat(100000);
+  for (const html of [`<span title="${sp}">x</span>`, `<p${sp}onclick=${sp}"x()"${sp}>y</p>`, `<a${sp}`, `<b ${sp}j${sp}a>`]) {
+    const t0 = Date.now();
+    const out = prefilterHtml(html);
+    assert.ok(Date.now() - t0 < 300, `${Date.now() - t0} ms`);
+    assert.doesNotMatch(out, /onclick/i);
+  }
+  assert.equal(prefilterHtml('<p onclick="x()">a</p>'), '<p>a</p>');
+  assert.equal(prefilterHtml('<img src=x onerror=alert(1) alt="o n=1">'), '<img src=x alt="o n=1">');
+  assert.equal(prefilterHtml("<a href='javascript:x' ONMOUSEOVER='y'>l</a>"), "<a href='blocked:x'>l</a>");
+  assert.equal(prefilterHtml('<svg/onload=alert(1)>'), '<svg/>');
 });

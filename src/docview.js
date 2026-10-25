@@ -35,6 +35,8 @@ import {
   MERMAID_SANITIZE_CONFIG,
   mermaidAttrAllowed,
   stripCssUrls,
+  mermaidId,
+  rewriteMermaidRefs,
 } from './docview-logic.js';
 import { isFocusTrapKey, focusLost } from './inbox-logic.js';
 
@@ -234,22 +236,50 @@ function loadImages(rel, images, alive) {
 
 let mermaidSeq = 0;
 
-/** Mermaid SVG (string) → sanitized fragment: no images, links, scripts, foreign URLs. */
-async function cleanMermaidSvg(svg) {
+/**
+ * Mermaid SVG (string) of render `rid` → sanitized fragment: no images, links, scripts, foreign
+ * URLs; every `id` / `name` outside the `rid` namespace is prefixed ({@link mermaidId}; some
+ * renderers write user-chosen ids such as `<g id="status">`) and `url(#…)` / `#…` references to
+ * renamed ids follow, so markers and gradients still work.
+ */
+export async function cleanMermaidSvg(svg, rid) {
   const { purify } = await engine();
+  const renamed = new Map();
   purify.removeAllHooks();
   purify.addHook('uponSanitizeAttribute', (_node, data) => {
-    if (!mermaidAttrAllowed(data.attrName, data.attrValue)) data.keepAttr = false;
-    else if (data.attrName === 'style') data.attrValue = stripCssUrls(data.attrValue);
+    if (!mermaidAttrAllowed(data.attrName, data.attrValue)) {
+      data.keepAttr = false;
+      return;
+    }
+    if (data.attrName === 'id' || data.attrName === 'name') {
+      const v = mermaidId(rid, data.attrValue);
+      if (v !== data.attrValue) renamed.set(data.attrValue, v);
+      data.attrValue = v;
+    } else if (data.attrName === 'style') {
+      data.attrValue = stripCssUrls(data.attrValue);
+    }
   });
   purify.addHook('uponSanitizeElement', (node) => {
     if (node.nodeName && node.nodeName.toLowerCase() === 'style') node.textContent = stripCssUrls(node.textContent);
   });
+  let frag;
   try {
-    return purify.sanitize(svg, { ...MERMAID_SANITIZE_CONFIG, RETURN_DOM_FRAGMENT: true });
+    frag = purify.sanitize(svg, { ...MERMAID_SANITIZE_CONFIG, RETURN_DOM_FRAGMENT: true });
   } finally {
     purify.removeAllHooks();
   }
+  if (renamed.size) {
+    // the fragment is not in the document yet: rewrite references before it can be seen
+    for (const el of frag.querySelectorAll('*')) {
+      for (const a of [...el.attributes]) {
+        if (a.name === 'id' || a.name === 'name') continue;
+        const v = rewriteMermaidRefs(a.value, renamed);
+        if (v !== a.value) el.setAttribute(a.name, v);
+      }
+      if (el.nodeName.toLowerCase() === 'style') el.textContent = rewriteMermaidRefs(el.textContent, renamed);
+    }
+  }
+  return frag;
 }
 
 /**
@@ -270,11 +300,12 @@ async function renderMermaidIn(el, alive) {
   for (const pre of blocks) {
     if (!alive()) return;
     try {
-      const { svg } = await m.render(`mermaid-svg-${++mermaidSeq}`, pre.textContent);
+      const rid = `mermaid-svg-${++mermaidSeq}`;
+      const { svg } = await m.render(rid, pre.textContent);
       if (!alive()) return;
       const div = document.createElement('div');
       div.className = 'mermaid';
-      div.appendChild(await cleanMermaidSvg(svg));
+      div.appendChild(await cleanMermaidSvg(svg, rid));
       pre.replaceWith(div);
     } catch (err) {
       pre.before(errorLine(err));

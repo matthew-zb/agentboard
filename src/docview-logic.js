@@ -279,17 +279,59 @@ function dropElements(s, t) {
   return out + s.slice(i);
 }
 
-/** Inside one tag: `on…=` attributes (after whitespace or `/`) and `javascript:` dropped. */
+const isWs = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f';
+
+/**
+ * Inside one tag (`<…>`): attributes named `on…` are dropped (with the whitespace before them)
+ * and `javascript:` is neutralised. A single left-to-right scan (no backtracking regex), so
+ * long whitespace runs cost linear time.
+ */
 function cleanTag(tag) {
-  let t = tag;
-  for (let k = 0; k < 4; k++) {
-    const prev = t;
-    t = t
-      .replace(/\s+on[a-z0-9_-]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)/gi, '')
-      .replace(/\/on[a-z0-9_-]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)/gi, '/');
-    if (t === prev) break;
+  const n = tag.length - 1; // index of the closing '>'
+  let i = 1;
+  while (i < n && !isWs(tag[i]) && tag[i] !== '/') i++; // tag name
+  const parts = [tag.slice(0, i)];
+  let pending = ''; // separators seen since the last kept part
+  while (i < n) {
+    const c = tag[i];
+    if (isWs(c)) {
+      const j0 = i;
+      while (i < n && isWs(tag[i])) i++;
+      pending += tag.slice(j0, i);
+      continue;
+    }
+    if (c === '/') {
+      parts.push(pending, '/');
+      pending = '';
+      i++;
+      continue;
+    }
+    const start = i;
+    while (i < n && !isWs(tag[i]) && tag[i] !== '/' && tag[i] !== '=') i++;
+    const name = tag.slice(start, i);
+    let k = i;
+    while (k < n && isWs(tag[k])) k++;
+    if (k < n && tag[k] === '=') {
+      k++;
+      while (k < n && isWs(tag[k])) k++;
+      if (k < n && (tag[k] === '"' || tag[k] === "'")) {
+        const close = tag.indexOf(tag[k], k + 1);
+        k = close < 0 || close >= n ? n : close + 1;
+      } else {
+        while (k < n && !isWs(tag[k])) k++;
+      }
+      i = k;
+    }
+    if (i === start) i++; // a stray '=' : keep moving
+    if (/^on/i.test(name)) {
+      pending = ''; // drop the attribute and the whitespace before it
+    } else {
+      parts.push(pending, tag.slice(start, i));
+      pending = '';
+    }
   }
-  return t.replace(/j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t\s*:/gi, 'blocked:');
+  parts.push(pending, tag.slice(n));
+  return parts.join('').replace(/j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t\s*:/gi, 'blocked:');
 }
 
 /**
@@ -337,6 +379,27 @@ export const MERMAID_SANITIZE_CONFIG = Object.freeze({
   SANITIZE_DOM: true,
   SANITIZE_NAMED_PROPS: false,
 });
+
+/**
+ * Id (or name) `value` inside the SVG of mermaid render `rid` (`mermaid-svg-N`): kept when it is
+ * in that render's namespace (`rid` itself or `rid` followed by a non-digit), otherwise prefixed
+ * `rid-` — so a diagram can never produce an app id (`status`, `parking`, …) or a named global.
+ */
+export function mermaidId(rid, value) {
+  const v = String(value ?? '');
+  const own = v.startsWith(rid) && (v.length === rid.length || !/[0-9]/.test(v[rid.length]));
+  return own ? v : `${rid}-${v}`;
+}
+
+/**
+ * References to renamed ids (`map`: old → new): `url(#old)` anywhere in `text`, or `text` being
+ * exactly `#old` (an href). Other text is unchanged.
+ */
+export function rewriteMermaidRefs(text, map) {
+  const t = String(text ?? '');
+  if (t.startsWith('#') && map.has(t.slice(1))) return `#${map.get(t.slice(1))}`;
+  return t.replace(/url\(\s*(['"]?)#([^'")\s]+)\1\s*\)/g, (m, _q, id) => (map.has(id) ? `url(#${map.get(id)})` : m));
+}
 
 /** Mermaid output attribute filter: no `on*`; href / xlink:href / src only as `#anchor`. */
 export function mermaidAttrAllowed(name, value) {
