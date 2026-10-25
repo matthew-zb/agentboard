@@ -502,10 +502,31 @@ fn doc_watch(state: State<'_, AppState>, pane_id: String, path: String) -> Resul
     if !is_doc {
         return Err(format!("문서 창이 아닙니다: {pane_id}"));
     }
-    let doc = docs::resolve_doc(&workspace_root(&state), &path)?;
-    let mtime = docs::mtime_of(&doc.abs);
-    state.docs.watch(&pane_id, doc.abs, mtime);
+    // a document missing right now is still watched (inside the root), so it reloads once created
+    let abs = docs::resolve_watch_path(&workspace_root(&state), &path)?;
+    let mtime = docs::mtime_of(&abs);
+    state.docs.watch(&pane_id, abs, mtime);
+    // the pane may have closed (and been unwatched by run_effects) since the check above:
+    // re-check after inserting so no orphan entry stays polled (locks taken one at a time)
+    let alive = state.ws.lock().unwrap().pane_by_id(&pane_id).is_some();
+    if !alive {
+        state.docs.unwatch(&pane_id);
+    }
     Ok(())
+}
+
+/// An image of a document as a `data:` URL. `src` is validated lexically before any file
+/// system call (`docs::check_image_src`: no UNC / device / drive / absolute paths), then
+/// resolved against the document's folder and prefix-checked against the canonical
+/// workspaceRoot (`docs::resolve_image`). Replaces the asset protocol (fix round 1, R23).
+#[tauri::command]
+async fn doc_image(app: AppHandle, doc: String, src: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        docs::read_image(&workspace_root(&state), &doc, &src)
+    })
+    .await
+    .map_err(|e| format!("이미지를 읽는 작업이 중단되었습니다 — {e}"))?
 }
 
 #[tauri::command]
@@ -531,16 +552,6 @@ fn inbox_issue_files(state: State<'_, AppState>, id: String) -> Result<docs::Iss
     docs::issue_files(&issues::resolve(&workspace, &issue)?)
 }
 
-/// Asset protocol (document images): only the canonical workspaceRoot, recursively, minus its
-/// `.agentboard` folder. Set once at startup; no command widens it (the scope check itself
-/// canonicalizes, so a junction under the root pointing elsewhere is not served).
-fn allow_assets(app: &tauri::App, root: &std::path::Path) -> Result<(), String> {
-    let real = std::fs::canonicalize(root).map_err(|e| format!("{} — {e}", root.display()))?;
-    let scope = app.asset_protocol_scope();
-    scope.allow_directory(&real, true).map_err(|e| e.to_string())?;
-    scope.forbid_directory(real.join(".agentboard"), true).map_err(|e| e.to_string())
-}
-
 /// The document watcher thread: one `poll` per second; changed panes get `doc-changed`.
 fn start_doc_watcher(app: AppHandle) {
     let _ = std::thread::Builder::new().name("doc-watch".into()).spawn(move || loop {
@@ -559,6 +570,8 @@ fn start_doc_watcher(app: AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
+        // the main WebView never leaves the app (document links, image maps, …): fix round 1
+        .plugin(webview::nav_guard())
         .invoke_handler(tauri::generate_handler![
             pty_attach,
             pty_write,
@@ -588,14 +601,12 @@ pub fn run() {
             doc_watch,
             doc_unwatch,
             doc_open_url,
+            doc_image,
         ])
         .setup(|app| {
             // load_all = load_settings + ensure_dotdir (incl. powershell profile) + load
             let appdata = appdata_dir();
             let loaded = config::load_all(&appdata);
-            if let Err(e) = allow_assets(app, &loaded.settings.workspace_root) {
-                eprintln!("[agentboard] 문서 이미지 경로를 허용하지 못했습니다: {e}");
-            }
             let ws_path = appdata.join("workspace.json");
             let mut startup_errors = Vec::new();
             let mut saving = true;

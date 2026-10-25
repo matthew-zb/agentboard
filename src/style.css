@@ -244,7 +244,8 @@ body.dragging-v, body.dragging-v * { cursor: row-resize !important; user-select:
 .markdown-body th, .markdown-body td { border: 1px solid var(--line); padding: 4px 10px; }
 .markdown-body th { background: var(--chrome-2); }
 .markdown-body img { max-width: 100%; }
-.markdown-body img.doc-img-blocked { display: inline-block; min-width: 16px; min-height: 16px; border: 1px dashed var(--line); }
+.markdown-body .doc-img-alt { color: var(--muted); font-size: 12px; border: 1px dashed var(--line); padding: 0 4px; border-radius: 3px; }
+.markdown-body img.doc-img.loading { min-width: 16px; min-height: 16px; }
 .markdown-body hr { border: 0; border-top: 1px solid var(--line); }
 .markdown-body ul, .markdown-body ol { padding-left: 2em; }
 .markdown-body li > input[type="checkbox"] { margin-right: .4em; }

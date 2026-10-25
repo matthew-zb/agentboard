@@ -204,3 +204,8 @@ export function docUnwatch(paneId) {
 export function docOpenUrl(url) {
   return invoke('doc_open_url', { url });
 }
+
+/** A document image (`src` as written in document `doc`) as a data: URL; validated in Rust. */
+export function docImage(doc, src) {
+  return invoke('doc_image', { doc, src });
+}

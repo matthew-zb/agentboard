@@ -41,10 +41,13 @@ export function joinRel(base, p) {
 
 const SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 
-/** Decoded path part of a local href (`?query` dropped), or null when unusable. */
+/**
+ * Decoded path part of a local href (`?query` dropped, `\` → `/`), or null when unusable:
+ * malformed escapes, control characters, protocol-relative / UNC (`//host`, `\\host`, also
+ * percent-encoded).
+ */
 function localPath(raw) {
-  let s = String(raw).replace(/\\/g, '/');
-  if (s.startsWith('//')) return null; // protocol-relative / UNC
+  let s = String(raw);
   const q = s.indexOf('?');
   if (q >= 0) s = s.slice(0, q);
   try {
@@ -52,9 +55,14 @@ function localPath(raw) {
   } catch (_) {
     return null;
   }
+  s = s.replace(/\\/g, '/');
+  if (s.startsWith('//')) return null;
   if (/[\u0000-\u001f]/.test(s)) return null;
   return s;
 }
+
+/** Elements whose activation could navigate: links, image-map areas, anything with an href (SVG xlink:href too). */
+export const LINK_SELECTOR = 'a, area, [href], [*|href]';
 
 /**
  * What a click on a link in document `currentRel` does:
@@ -102,19 +110,33 @@ export function resolveDocLink(currentRel, href) {
 }
 
 /**
- * An `<img src>` in document `currentRel`: `{type:'local', rel}` (inside the root → asset
- * URL), `{type:'keep'}` (data: image), `{type:'drop'}` (remote, other schemes, outside).
+ * An `<img src>` in document `currentRel`: `{type:'local', rel}` for a relative path that
+ * stays inside the root (then loaded through `doc_image`, which re-validates it), else
+ * `{type:'drop'}` — data:, remote, rooted `/x`, UNC / device paths (also percent-encoded),
+ * drive letters; the image is replaced by its alt text.
  */
 export function resolveAssetSrc(currentRel, src) {
   const s = String(src ?? '').trim();
-  if (!s) return { type: 'drop' };
-  if (/^data:image\//i.test(s)) return { type: 'keep' };
-  if (SCHEME.test(s)) return { type: 'drop' };
+  if (!s || SCHEME.test(s)) return { type: 'drop' };
   const hashAt = s.indexOf('#');
   const p = localPath(hashAt >= 0 ? s.slice(0, hashAt) : s);
-  if (p == null) return { type: 'drop' };
-  const rel = p.startsWith('/') ? joinRel('', p) : joinRel(dirOf(currentRel), p);
+  if (p == null || p.startsWith('/') || p.includes(':')) return { type: 'drop' };
+  const rel = joinRel(dirOf(currentRel), p);
   return rel ? { type: 'local', rel } : { type: 'drop' };
+}
+
+/** Text shown instead of an image that is not loaded. */
+export function imgAltText(alt) {
+  const a = String(alt ?? '').trim();
+  return a ? `[이미지: ${a}]` : '[이미지]';
+}
+
+/**
+ * Element id of a heading in pane `paneId`: `doc-<pane>-<slug>`, so no document can produce
+ * an id the app uses (`status`, `groups`, `parking`, …) or a named global (`mermaid`).
+ */
+export function headingId(paneId, slug) {
+  return `doc-${String(paneId).replace(/[^A-Za-z0-9_-]/g, '')}-${slug}`;
 }
 
 /**
@@ -195,6 +217,7 @@ const FORBID_ACTIVE = [
   'script', 'style', 'iframe', 'frame', 'frameset', 'object', 'embed', 'applet', 'form', 'input',
   'button', 'textarea', 'select', 'option', 'base', 'meta', 'link', 'template', 'portal',
   'audio', 'video', 'source', 'track', 'noscript', 'dialog', 'foreignobject', 'use',
+  'area', 'map', 'picture',
 ];
 const FORBID_ATTR_COMMON = ['target', 'formaction', 'action', 'srcset', 'ping', 'background', 'poster', 'xlink:href', 'autofocus', 'tabindex', 'contenteditable', 'accesskey'];
 
@@ -233,30 +256,105 @@ export const FINAL_SANITIZE_CONFIG = Object.freeze({
   WHOLE_DOCUMENT: false,
 });
 
+/** Remove `<t …>…</t>` elements (an unclosed one up to the end) in one linear scan. */
+function dropElements(s, t) {
+  const lower = s.toLowerCase();
+  const open = `<${t}`;
+  let out = '';
+  let i = 0;
+  for (let j = lower.indexOf(open, i); j >= 0; j = lower.indexOf(open, i)) {
+    const after = lower.charAt(j + open.length);
+    if (after && /[a-z0-9-]/.test(after)) {
+      out += s.slice(i, j + 1); // e.g. <styles>: not this element
+      i = j + 1;
+      continue;
+    }
+    out += s.slice(i, j);
+    const close = lower.indexOf(`</${t}`, j + open.length);
+    if (close < 0) return out; // unclosed: everything after it goes
+    const end = lower.indexOf('>', close);
+    if (end < 0) return out;
+    i = end + 1;
+  }
+  return out + s.slice(i);
+}
+
+/** Inside one tag: `on…=` attributes (after whitespace or `/`) and `javascript:` dropped. */
+function cleanTag(tag) {
+  let t = tag;
+  for (let k = 0; k < 4; k++) {
+    const prev = t;
+    t = t
+      .replace(/\s+on[a-z0-9_-]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)/gi, '')
+      .replace(/\/on[a-z0-9_-]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)/gi, '/');
+    if (t === prev) break;
+  }
+  return t.replace(/j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t\s*:/gi, 'blocked:');
+}
+
 /**
  * String pre-filter run before DOMPurify (belt and braces, not the sanitizer): drops
  * script/style/iframe/object/embed elements (also unclosed ones), `on*=` attributes and
- * `javascript:` URLs inside tags. Text outside tags is untouched.
+ * `javascript:` URLs inside tags. Text outside tags is untouched. Linear in the input (no
+ * backtracking regex over the whole document).
  */
 export function prefilterHtml(html) {
   let s = String(html ?? '');
   for (const t of ['script', 'style', 'iframe', 'object', 'embed', 'noscript', 'template']) {
-    s = s.replace(new RegExp(`<${t}\\b[\\s\\S]*?<\\/${t}\\s*>`, 'gi'), '');
-    s = s.replace(new RegExp(`<\\/?${t}\\b[^>]*>?`, 'gi'), '');
+    s = dropElements(s, t);
+    s = s.replace(new RegExp(`</${t}\\b[^<>]*>?`, 'gi'), '');
   }
-  // inside a tag: on…= attributes (after whitespace or `/`) and javascript: URLs
-  s = s.replace(/<[^>]*>/g, (tag) => {
-    let t = tag;
-    let prev;
-    do {
-      prev = t;
-      t = t
-        .replace(/\s+on[a-z0-9_-]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)/gi, '')
-        .replace(/\/on[a-z0-9_-]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)/gi, '/');
-    } while (t !== prev);
-    return t.replace(/j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t\s*:/gi, 'blocked:');
-  });
-  return s;
+  let out = '';
+  let i = 0;
+  for (let lt = s.indexOf('<'); lt >= 0; lt = s.indexOf('<', i)) {
+    const gt = s.indexOf('>', lt);
+    if (gt < 0) break; // no more complete tags
+    out += s.slice(i, lt) + cleanTag(s.slice(lt, gt + 1));
+    i = gt + 1;
+  }
+  return out + s.slice(i);
+}
+
+// ---------------------------------------------------------------- mermaid output
+
+/**
+ * DOMPurify config for mermaid's rendered SVG (mermaid 'strict' still lets `<img>` through its
+ * HTML labels): SVG + filters + HTML (foreignObject labels), its own `<style>` kept, but no
+ * images of any kind, no links, scripts or embedded content. `href` / `xlink:href` / `src`
+ * survive only as in-document anchors ({@link mermaidAttrAllowed}, a DOMPurify hook) and CSS
+ * `url()` only as `url(#…)` ({@link stripCssUrls}).
+ */
+export const MERMAID_SANITIZE_CONFIG = Object.freeze({
+  USE_PROFILES: Object.freeze({ svg: true, svgFilters: true, html: true }),
+  FORBID_TAGS: Object.freeze([
+    'img', 'image', 'feimage', 'use', 'a', 'area', 'map', 'picture', 'script', 'iframe', 'frame',
+    'object', 'embed', 'form', 'input', 'button', 'textarea', 'select', 'link', 'meta', 'base',
+    'audio', 'video', 'source', 'track', 'portal', 'template', 'noscript',
+  ]),
+  FORBID_ATTR: Object.freeze(['srcset', 'ping', 'formaction', 'action', 'background', 'poster', 'target']),
+  ALLOW_DATA_ATTR: false,
+  ALLOW_UNKNOWN_PROTOCOLS: false,
+  SANITIZE_DOM: true,
+  SANITIZE_NAMED_PROPS: false,
+});
+
+/** Mermaid output attribute filter: no `on*`; href / xlink:href / src only as `#anchor`. */
+export function mermaidAttrAllowed(name, value) {
+  const n = String(name || '').toLowerCase();
+  if (n.startsWith('on')) return false;
+  if (n === 'href' || n === 'xlink:href' || n === 'src') {
+    const v = String(value ?? '').trim();
+    return v.length > 1 && v.startsWith('#');
+  }
+  return true;
+}
+
+/** CSS text with `@import`, `image-set()` and every `url()` not pointing at `#id` removed. */
+export function stripCssUrls(css) {
+  return String(css ?? '')
+    .replace(/@import[^;]*;?/gi, '')
+    .replace(/(?:-webkit-)?image-set\([^)]*\)/gi, 'none')
+    .replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi, (m, _q, inner) => (String(inner).trim().startsWith('#') ? m : 'none'));
 }
 
 // ---------------------------------------------------------------- keys

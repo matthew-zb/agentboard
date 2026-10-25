@@ -2,12 +2,15 @@
 // applet pane `{type:'applet', kind:'doc'}` (the pane's `docPath` is the document as opened).
 //
 // Rendering (mdviewer's engine, vendored, no CDN): marked (GFM) with highlight.js inside code
-// blocks → string pre-filter → DOMPurify (first pass; image paths rewritten to asset URLs inside
-// workspaceRoot) → KaTeX auto-render (trust: false) → DOMPurify again (KaTeX output) → heading
-// ids + table of contents → mermaid (securityLevel 'strict', loaded only when a document has a
-// ```mermaid block). The markdown is untrusted (agents write it): nothing from it is ever
-// executed, links never navigate the WebView (relative .md → this tab, http(s) → system browser
-// through the backend, anything else ignored).
+// blocks → string pre-filter → DOMPurify (first pass; every <img src> is taken off and kept
+// aside) → KaTeX auto-render (trust: false) → DOMPurify again (KaTeX output) → heading ids
+// (`doc-<pane>-<slug>`) + table of contents → images: a relative path inside the root is read by
+// `doc_image` (validated in Rust, returned as a data: URL), anything else becomes its alt text →
+// mermaid (securityLevel 'strict', loaded only when a document has a ```mermaid block; its SVG is
+// sanitized again before it is inserted). The markdown is untrusted (agents write it): nothing
+// from it is ever executed, links never navigate the WebView (relative .md → this tab, http(s) →
+// system browser through the backend, anything else ignored; the backend also refuses any
+// navigation away from the app and every new window).
 //
 // Keys (document pane focused; app shortcuts are handled first by the key router): j/k line,
 // Space/Shift+Space page, g/G top/bottom, / search (n/N), o table of contents, [ ] back/forward,
@@ -26,6 +29,12 @@ import {
   docKeyAction,
   findMatches,
   docTitle,
+  headingId,
+  imgAltText,
+  LINK_SELECTOR,
+  MERMAID_SANITIZE_CONFIG,
+  mermaidAttrAllowed,
+  stripCssUrls,
 } from './docview-logic.js';
 import { isFocusTrapKey, focusLost } from './inbox-logic.js';
 
@@ -36,6 +45,8 @@ const HLJS_LANGS = [
   'rust', 'scss', 'shell', 'sql', 'swift', 'typescript', 'xml', 'yaml',
 ];
 const AUTO_HIGHLIGHT_MAX = 20000; // unlabeled code blocks larger than this are not auto-detected
+const AUTO_HIGHLIGHT_BUDGET = 200000; // auto-detected bytes per document render
+let autoBudget = AUTO_HIGHLIGHT_BUDGET;
 const KATEX_OPTIONS = {
   delimiters: [
     { left: '$$', right: '$$', display: true },
@@ -84,7 +95,8 @@ function engine() {
             if (lang && hljs.getLanguage(lang)) {
               body = hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
               cls += ` language-${lang.replace(/[^a-z0-9+#_-]/g, '')}`;
-            } else if (!lang && code.length <= AUTO_HIGHLIGHT_MAX) {
+            } else if (!lang && code.length <= AUTO_HIGHLIGHT_MAX && code.length <= autoBudget) {
+              autoBudget -= code.length;
               body = hljs.highlightAuto(code).value;
             } else {
               body = escHtml(code);
@@ -119,7 +131,10 @@ function loadMermaid() {
     }).then((m) => {
       m.initialize({
         startOnLoad: false,
-        securityLevel: 'strict',
+        securityLevel: 'strict', // + our own DOMPurify pass over the SVG (renderMermaidIn)
+        // labels as SVG text: no foreignObject HTML (DOMPurify drops foreignObject anyway)
+        htmlLabels: false,
+        flowchart: { htmlLabels: false },
         theme: 'dark',
         darkMode: true,
         fontFamily: '"Segoe UI", "Malgun Gothic", sans-serif',
@@ -133,35 +148,33 @@ function loadMermaid() {
   return mermaidPromise;
 }
 
-/** `root` + `rel` as a Windows path for convertFileSrc. */
-function absPath(root, rel) {
-  const r = String(root || '').replace(/[\\/]+$/, '');
-  return `${r}\\${String(rel).split('/').join('\\')}`;
+/** `<span>` with the image's alt text, standing in for an image that is not shown. */
+function altSpan(img) {
+  const s = document.createElement('span');
+  s.className = 'doc-img-alt';
+  s.textContent = imgAltText(img.getAttribute('alt'));
+  s.title = '작업 폴더 안의 상대 경로 이미지만 표시합니다';
+  return s;
 }
 
 /**
- * Render markdown `text` of document `rel` (root `root`) into a DocumentFragment plus its table
- * of contents. Images inside the root become asset URLs; other image sources are removed.
+ * Render markdown `text` of document `rel` (shown in pane `paneId`) into a DocumentFragment, its
+ * table of contents (`{id → heading element}` in `anchors`) and the images to load: every
+ * `<img>` loses its `src` in the first pass (no request is ever made for a document-written
+ * URL); a relative path inside the root is kept for `doc_image`, anything else becomes text.
  */
-async function renderMarkdown(text, rel, root) {
+async function renderMarkdown(text, rel, paneId) {
   const { marked, purify, renderMath } = await engine();
+  autoBudget = AUTO_HIGHLIGHT_BUDGET;
   const html = prefilterHtml(marked.parse(String(text)));
+  const srcs = [];
   purify.removeAllHooks();
   purify.addHook('afterSanitizeAttributes', (node) => {
     if (node.tagName === 'IMG') {
-      const r = resolveAssetSrc(rel, node.getAttribute('src'));
-      if (r.type === 'local') {
-        const conv = globalThis.__TAURI__ && globalThis.__TAURI__.core && globalThis.__TAURI__.core.convertFileSrc;
-        if (conv) node.setAttribute('src', conv(absPath(root, r.rel)));
-        else node.removeAttribute('src');
-      } else if (r.type === 'drop') {
-        node.removeAttribute('src');
-        node.classList.add('doc-img-blocked');
-        node.setAttribute('title', '외부·작업 폴더 밖 이미지는 표시하지 않습니다');
-      }
-      node.setAttribute('loading', 'lazy');
-      node.setAttribute('referrerpolicy', 'no-referrer');
-    } else if (node.tagName === 'A' && node.hasAttribute('href')) {
+      srcs.push(node.getAttribute('src') || '');
+      node.removeAttribute('src');
+      node.setAttribute('class', `doc-img doc-img-${srcs.length - 1}`);
+    } else if ((node.tagName === 'A' || node.tagName === 'AREA') && node.hasAttribute('href')) {
       const r = resolveDocLink(rel, node.getAttribute('href'));
       node.classList.add(`doc-link-${r.type}`);
       node.setAttribute('rel', 'noopener noreferrer');
@@ -183,36 +196,97 @@ async function renderMarkdown(text, rel, root) {
   const frag = purify.sanitize(box.innerHTML, { ...FINAL_SANITIZE_CONFIG, RETURN_DOM_FRAGMENT: true });
   const hs = [...frag.querySelectorAll('h1, h2, h3, h4, h5, h6')];
   const toc = extractToc(hs.map((h) => ({ level: Number(h.tagName[1]), text: h.textContent.trim() })));
+  const anchors = new Map();
   hs.forEach((h, i) => {
-    h.id = toc[i].id;
+    h.id = headingId(paneId, toc[i].id); // namespaced: never an app id or a named global
+    anchors.set(toc[i].id, h);
   });
-  return { frag, toc };
-}
-
-/** Replace `pre.mermaid-src` blocks under `el` with rendered diagrams (errors shown as text). */
-async function renderMermaidIn(el) {
-  const blocks = [...el.querySelectorAll('pre.mermaid-src')];
-  if (!blocks.length) return;
-  const nodes = blocks.map((pre) => {
-    const div = document.createElement('div');
-    div.className = 'mermaid';
-    div.textContent = pre.textContent;
-    pre.replaceWith(div);
-    return div;
-  });
-  try {
-    const m = await loadMermaid();
-    await m.run({ nodes, suppressErrors: false });
-  } catch (err) {
-    for (const n of nodes) {
-      if (!n.querySelector('svg')) {
-        const msg = document.createElement('div');
-        msg.className = 'doc-error';
-        msg.textContent = `Mermaid 오류: ${(err && err.message) || err}`;
-        n.prepend(msg);
-      }
+  const images = [];
+  for (const img of [...frag.querySelectorAll('img')]) {
+    const m = /\bdoc-img-(\d+)\b/.exec(img.getAttribute('class') || '');
+    const src = m ? srcs[Number(m[1])] : null;
+    img.removeAttribute('src');
+    if (src != null && resolveAssetSrc(rel, src).type === 'local') {
+      img.setAttribute('class', 'doc-img loading');
+      images.push({ img, src });
+    } else {
+      img.replaceWith(altSpan(img));
     }
   }
+  return { frag, toc, anchors, images };
+}
+
+/** Load the document's images through `doc_image` (data: URLs); failures become alt text. */
+function loadImages(rel, images, alive) {
+  for (const { img, src } of images) {
+    api.docImage(rel, src).then(
+      (url) => {
+        if (!alive() || typeof url !== 'string' || !url.startsWith('data:image/')) return;
+        img.src = url;
+        img.classList.remove('loading');
+      },
+      () => {
+        if (alive() && img.isConnected) img.replaceWith(altSpan(img));
+      },
+    );
+  }
+}
+
+let mermaidSeq = 0;
+
+/** Mermaid SVG (string) → sanitized fragment: no images, links, scripts, foreign URLs. */
+async function cleanMermaidSvg(svg) {
+  const { purify } = await engine();
+  purify.removeAllHooks();
+  purify.addHook('uponSanitizeAttribute', (_node, data) => {
+    if (!mermaidAttrAllowed(data.attrName, data.attrValue)) data.keepAttr = false;
+    else if (data.attrName === 'style') data.attrValue = stripCssUrls(data.attrValue);
+  });
+  purify.addHook('uponSanitizeElement', (node) => {
+    if (node.nodeName && node.nodeName.toLowerCase() === 'style') node.textContent = stripCssUrls(node.textContent);
+  });
+  try {
+    return purify.sanitize(svg, { ...MERMAID_SANITIZE_CONFIG, RETURN_DOM_FRAGMENT: true });
+  } finally {
+    purify.removeAllHooks();
+  }
+}
+
+/**
+ * Replace `pre.mermaid-src` blocks under `el` with rendered diagrams: `mermaid.render` gives the
+ * SVG as a string, which is sanitized ({@link cleanMermaidSvg}) before it reaches the document.
+ * Errors are shown as text; `alive()` false stops early.
+ */
+async function renderMermaidIn(el, alive) {
+  const blocks = [...el.querySelectorAll('pre.mermaid-src')];
+  if (!blocks.length) return;
+  let m;
+  try {
+    m = await loadMermaid();
+  } catch (err) {
+    for (const pre of blocks) pre.before(errorLine(err));
+    return;
+  }
+  for (const pre of blocks) {
+    if (!alive()) return;
+    try {
+      const { svg } = await m.render(`mermaid-svg-${++mermaidSeq}`, pre.textContent);
+      if (!alive()) return;
+      const div = document.createElement('div');
+      div.className = 'mermaid';
+      div.appendChild(await cleanMermaidSvg(svg));
+      pre.replaceWith(div);
+    } catch (err) {
+      pre.before(errorLine(err));
+    }
+  }
+}
+
+function errorLine(err) {
+  const msg = document.createElement('div');
+  msg.className = 'doc-error';
+  msg.textContent = `Mermaid 오류: ${(err && err.message) || err}`;
+  return msg;
 }
 
 // ---------------------------------------------------------------- search highlights (shared)
@@ -315,6 +389,7 @@ export function mountDoc(paneId, model) {
     rel: null,
     root: '',
     toc: [],
+    anchors: new Map(), // toc id (slug) → heading element
     query: '',
     matchIdx: -1,
     busy: false, // a prompt / choose flow is open
@@ -351,12 +426,14 @@ export function mountDoc(paneId, model) {
       stateEl.textContent = '';
       pathEl.textContent = st.rel || (model && model.docPath) || '';
       showMessage('파일을 찾을 수 없습니다', err);
+      // keep watching (a missing file inside the root is watched too): it reloads once created
+      if (mode === 'init') api.docWatch(paneId, path).catch(() => {});
       return false;
     }
     if (gen !== st.gen || st.disposed) return false;
     let rendered;
     try {
-      rendered = await renderMarkdown(doc.text, doc.rel, doc.root);
+      rendered = await renderMarkdown(doc.text, doc.rel, paneId);
     } catch (err) {
       if (gen !== st.gen || st.disposed) return false;
       showMessage('문서를 표시할 수 없습니다', err);
@@ -369,6 +446,7 @@ export function mountDoc(paneId, model) {
     st.rel = doc.rel;
     st.root = doc.root;
     st.toc = rendered.toc;
+    st.anchors = rendered.anchors;
     pathEl.textContent = doc.rel;
     pathEl.title = doc.path;
     stateEl.textContent = '';
@@ -376,13 +454,15 @@ export function mountDoc(paneId, model) {
 
     const hadFocus = root.contains(document.activeElement);
     content.replaceChildren(rendered.frag);
+    const alive = () => gen === st.gen && !st.disposed;
+    loadImages(doc.rel, rendered.images, alive);
     if (focusLost(hadFocus, document.activeElement, root, document.body)) root.focus({ preventScroll: true });
     const top = mode === 'reload' ? keepTop : mode === 'history' ? scroll : 0;
     body.scrollTop = top;
     if (hash) scrollToId(hash);
     const settled = body.scrollTop;
     refreshSearch(false);
-    await renderMermaidIn(content);
+    await renderMermaidIn(content, alive);
     // diagrams change heights: put the reader back where they were unless they scrolled since
     if (gen === st.gen && !st.disposed && body.scrollTop === settled && !hash) body.scrollTop = top;
     if (gen === st.gen) refreshSearch(false);
@@ -406,9 +486,10 @@ export function mountDoc(paneId, model) {
   function scrollToId(id) {
     const want = String(id);
     const target =
-      content.querySelector(`[id="${CSS.escape(want)}"]`) ||
-      content.querySelector(`[id="${CSS.escape(slugify(want))}"]`) ||
-      content.querySelector(`[id="user-content-${CSS.escape(want)}"]`);
+      st.anchors.get(want) ||
+      st.anchors.get(slugify(want)) ||
+      content.querySelector(`[id="user-content-${CSS.escape(want)}"]`) ||
+      content.querySelector(`[name="user-content-${CSS.escape(want)}"]`);
     if (target) body.scrollTop += target.getBoundingClientRect().top - body.getBoundingClientRect().top - 8;
   }
 
@@ -534,11 +615,13 @@ export function mountDoc(paneId, model) {
   };
 
   const onClick = (e) => {
-    const a = e.target && e.target.closest ? e.target.closest('a') : null;
-    if (!a || !content.contains(a)) return;
-    e.preventDefault(); // the WebView itself never navigates
+    const a = e.target && e.target.closest ? e.target.closest(LINK_SELECTOR) : null;
+    if (!a || !root.contains(a)) return;
+    e.preventDefault(); // the WebView itself never navigates (the backend refuses it as well)
     if (e.type !== 'click' || e.button !== 0) return;
-    const r = resolveDocLink(st.rel || '', a.getAttribute('href'));
+    if (!content.contains(a)) return;
+    const href = a.getAttribute('href') ?? a.getAttributeNS('http://www.w3.org/1999/xlink', 'href');
+    const r = resolveDocLink(st.rel || '', href);
     if (r.type === 'anchor') scrollToId(r.id);
     else if (r.type === 'doc') load(r.rel, { mode: 'push', hash: r.hash });
     else if (r.type === 'external') api.docOpenUrl(r.url).catch((err) => deps.toast(err));
@@ -553,7 +636,7 @@ export function mountDoc(paneId, model) {
 
   const view = {
     changed() {
-      if (!st.disposed && st.rel) reload();
+      if (!st.disposed) reload(); // also a document that was missing and has now appeared
     },
   };
   views.set(paneId, view);

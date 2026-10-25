@@ -29,6 +29,25 @@ pub const DOC_CHANGED: &str = "doc-changed";
 const URL_MAX: usize = 2048;
 /// Most files listed per issue sub-folder.
 const ISSUE_FILES_MAX: usize = 500;
+/// Most directory entries one listing walk looks at (`doc_list_md`, `issue_files`).
+pub const WALK_BUDGET: usize = 50_000;
+/// Longest a listing walk may take.
+const WALK_TIME: Duration = Duration::from_secs(3);
+/// Largest image `doc_image` returns (bytes).
+pub const IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// Image extensions `doc_image` serves, with their MIME types.
+const IMAGE_TYPES: [(&str, &str); 8] = [
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("webp", "image/webp"),
+    ("bmp", "image/bmp"),
+    ("ico", "image/x-icon"),
+    ("svg", "image/svg+xml"),
+];
+/// Top-level folders of workspaceRoot whose files are never served as images.
+const IMAGE_DENY_TOP: [&str; 2] = [".agentboard", ".git"];
 
 /// A validated document: `abs` = `<workspaceRoot>/<rel>` (not canonical, as the user sees it),
 /// `rel` = path under the root with `/` separators and the on-disk spelling.
@@ -120,21 +139,34 @@ pub fn read_doc(root: &Path, path: &str) -> Result<DocText, String> {
 /// loops, nothing outside). `query` = whitespace-separated words that must all appear
 /// (case-insensitive). At most `cap` entries.
 pub fn list_md(root: &Path, query: Option<&str>, cap: usize) -> Vec<String> {
+    list_md_budget(root, query, cap, WALK_BUDGET)
+}
+
+/// [`list_md`] that stops after looking at `budget` directory entries (or [`WALK_TIME`]).
+pub fn list_md_budget(root: &Path, query: Option<&str>, cap: usize, budget: usize) -> Vec<String> {
     let words: Vec<String> = query.unwrap_or("").split_whitespace().map(str::to_lowercase).collect();
+    let started = std::time::Instant::now();
+    let mut seen = 0usize;
     let mut out = Vec::new();
     let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
+    let mut exhausted = false;
     while let Some((dir, prefix)) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         let mut files = Vec::new();
         let mut dirs = Vec::new();
         for e in rd.flatten() {
+            seen += 1;
+            if seen > budget || started.elapsed() > WALK_TIME {
+                exhausted = true;
+                break;
+            }
             let Ok(ft) = e.file_type() else { continue };
             let name = e.file_name().to_string_lossy().into_owned();
             if ft.is_symlink() {
                 continue; // junctions and symlinks: not followed
             }
             if ft.is_dir() {
-                if !LIST_SKIP.contains(&name.as_str()) {
+                if !LIST_SKIP.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
                     dirs.push(name);
                 }
             } else if ft.is_file() && is_md(Path::new(&name)) {
@@ -153,6 +185,9 @@ pub fn list_md(root: &Path, query: Option<&str>, cap: usize) -> Vec<String> {
                     return out;
                 }
             }
+        }
+        if exhausted {
+            break;
         }
         for d in dirs.into_iter().rev() {
             stack.push((dir.join(&d), format!("{prefix}{d}/")));
@@ -208,28 +243,216 @@ pub fn issue_files(issue_dir: &Path) -> Result<IssueFiles, String> {
         if linked || !inside {
             return Vec::new();
         }
+        // depth-first in name order (files of a folder, then its sub-folders); stops at the
+        // cap or the walk budget, so the kept files are always the first ones in that order
+        let started = std::time::Instant::now();
+        let mut seen = 0usize;
         let mut out = Vec::new();
         let mut stack = vec![(dir, String::new())];
         while let Some((d, prefix)) = stack.pop() {
             let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            let mut ents: Vec<(String, bool)> = Vec::new();
             for e in rd.flatten() {
+                seen += 1;
+                if seen > WALK_BUDGET || started.elapsed() > WALK_TIME {
+                    break;
+                }
                 let Ok(ft) = e.file_type() else { continue };
-                let name = e.file_name().to_string_lossy().into_owned();
-                if ft.is_symlink() {
+                if ft.is_symlink() || !(ft.is_dir() || ft.is_file()) {
                     continue;
                 }
-                if ft.is_dir() {
-                    stack.push((d.join(&name), format!("{prefix}{name}/")));
-                } else if ft.is_file() && out.len() < ISSUE_FILES_MAX {
+                ents.push((e.file_name().to_string_lossy().into_owned(), ft.is_dir()));
+            }
+            ents.sort();
+            let mut subdirs = Vec::new();
+            for (name, is_dir) in ents {
+                if is_dir {
+                    subdirs.push(name);
+                } else {
+                    if out.len() >= ISSUE_FILES_MAX {
+                        return out;
+                    }
                     let p = d.join(&name);
                     out.push(IssueFile { name: format!("{prefix}{name}"), is_md: is_md(&p), path: p });
                 }
             }
+            if seen > WALK_BUDGET || started.elapsed() > WALK_TIME {
+                break;
+            }
+            for sd in subdirs.into_iter().rev() {
+                stack.push((d.join(&sd), format!("{prefix}{sd}/")));
+            }
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     };
     Ok(IssueFiles { input: list("input"), output: list("output") })
+}
+
+// ───────── watch path for a document that may not exist (yet) ─────────
+
+/// The path to watch for a document pane: [`resolve_doc`] when the file exists; otherwise a
+/// missing `.md` whose parent folder exists and resolves inside the root (so a document
+/// deleted before the app started is picked up when it is created again).
+pub fn resolve_watch_path(root: &Path, path: &str) -> Result<PathBuf, String> {
+    match resolve_doc(root, path) {
+        Ok(d) => Ok(d.abs),
+        Err(e) => {
+            let p = Path::new(path.trim());
+            let joined = if p.is_absolute() { p.to_path_buf() } else { root.join(p) };
+            if joined.exists() || !is_md(&joined) || path.chars().any(char::is_control) {
+                return Err(e);
+            }
+            let (Some(parent), Some(name)) = (joined.parent(), joined.file_name()) else { return Err(e) };
+            let root_real = std::fs::canonicalize(root).map_err(|_| e.clone())?;
+            let parent_real = std::fs::canonicalize(parent).map_err(|_| e.clone())?;
+            match parent_real.strip_prefix(&root_real) {
+                Ok(r) if r.components().all(|c| matches!(c, Component::Normal(_))) => {
+                    Ok(root.join(r).join(name))
+                }
+                _ => Err(e),
+            }
+        }
+    }
+}
+
+// ───────── document images (no asset protocol: validated, read, returned as data: URL) ─────────
+
+fn image_err(src: &str) -> String {
+    format!("이미지 경로를 쓸 수 없습니다: {}", src.chars().take(200).collect::<String>())
+}
+
+/// `%XX` decoding (once); None on a malformed escape or invalid UTF-8.
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let h = b.get(i + 1..i + 3)?;
+            let v = u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()?;
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn reserved_device(seg: &str) -> bool {
+    let stem = seg.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && stem.as_bytes()[3].is_ascii_digit())
+}
+
+fn image_mime(p: &Path) -> Option<&'static str> {
+    let ext = p.extension()?.to_str()?;
+    IMAGE_TYPES.iter().find(|(e, _)| e.eq_ignore_ascii_case(ext)).map(|(_, m)| *m)
+}
+
+/// Lexical check of an `<img src>` written in a document, **before any file system call**:
+/// percent-decoded once, `?query` / `#fragment` dropped, `\` treated as `/`. Refused: empty,
+/// control characters, anything absolute or rooted (`/x`, `\x`, UNC `\\host` / `//host`,
+/// device paths `\\?\` `\\.\`), any `:` (drive letters, drive-relative `C:x`, URL schemes,
+/// NTFS streams), segments ending in `.` or space, reserved device names, extensions other
+/// than images. Returns the relative path (`/` separators; `..` kept for [`resolve_image`]).
+pub fn check_image_src(src: &str) -> Result<String, String> {
+    let raw = src.trim();
+    if raw.is_empty() || raw.len() > 2048 {
+        return Err(image_err(src));
+    }
+    let raw = raw.split(['?', '#']).next().unwrap_or("");
+    let d = percent_decode(raw).ok_or_else(|| image_err(src))?;
+    if d.is_empty() || d.chars().any(|c| c.is_control()) {
+        return Err(image_err(src));
+    }
+    let d = d.replace('\\', "/");
+    if d.starts_with('/') || d.contains(':') {
+        return Err(image_err(src));
+    }
+    let mut segs = Vec::new();
+    for seg in d.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg != ".." && (seg.ends_with('.') || seg.ends_with(' ') || reserved_device(seg)) {
+            return Err(image_err(src));
+        }
+        segs.push(seg);
+    }
+    let last = segs.last().copied().unwrap_or("");
+    if last == ".." || image_mime(Path::new(last)).is_none() {
+        return Err(image_err(src));
+    }
+    Ok(segs.join("/"))
+}
+
+/// The image `src` of document `doc` (validated by [`resolve_doc`]): lexically checked
+/// ([`check_image_src`]), joined to the document's folder with `..` resolved lexically (never
+/// above the root, never into `.agentboard` / `.git`), then canonicalized and prefix-checked
+/// against the canonical root (junction-safe), an image extension on the real file too.
+/// Returns the file and its MIME type.
+pub fn resolve_image(root: &Path, doc: &str, src: &str) -> Result<(PathBuf, &'static str), String> {
+    let rel_src = check_image_src(src)?;
+    let doc = resolve_doc(root, doc)?;
+    let mut parts: Vec<&str> = doc.rel.split('/').collect();
+    parts.pop(); // the document's folder
+    for seg in rel_src.split('/') {
+        if seg == ".." {
+            if parts.pop().is_none() {
+                return Err(image_err(src));
+            }
+        } else {
+            parts.push(seg);
+        }
+    }
+    if parts.first().is_some_and(|t| IMAGE_DENY_TOP.iter().any(|d| d.eq_ignore_ascii_case(t))) {
+        return Err(image_err(src));
+    }
+    let joined = parts.iter().fold(root.to_path_buf(), |p, s| p.join(s));
+    let root_real = std::fs::canonicalize(root).map_err(|_| "workspaceRoot 폴더를 찾을 수 없습니다".to_string())?;
+    let real = std::fs::canonicalize(&joined).map_err(|_| format!("이미지를 찾을 수 없습니다: {src}"))?;
+    let inside = match real.strip_prefix(&root_real) {
+        Ok(r) => {
+            r.components().all(|c| matches!(c, Component::Normal(_)))
+                && !r
+                    .components()
+                    .next()
+                    .is_some_and(|c| IMAGE_DENY_TOP.iter().any(|d| c.as_os_str().to_string_lossy().eq_ignore_ascii_case(d)))
+        }
+        Err(_) => false,
+    };
+    if !inside || !real.is_file() {
+        return Err(image_err(src));
+    }
+    let mime = image_mime(&real).ok_or_else(|| image_err(src))?;
+    Ok((real, mime))
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { B64[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// `doc_image`: the validated image as a `data:` URL (at most [`IMAGE_MAX_BYTES`]).
+pub fn read_image(root: &Path, doc: &str, src: &str) -> Result<String, String> {
+    let (path, mime) = resolve_image(root, doc, src)?;
+    let len = std::fs::metadata(&path).map(|m| m.len()).map_err(|_| image_err(src))?;
+    if len > IMAGE_MAX_BYTES {
+        return Err(format!("이미지가 너무 큽니다({} MB 초과): {src}", IMAGE_MAX_BYTES / 1024 / 1024));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("이미지를 읽을 수 없습니다: {src} — {e}"))?;
+    Ok(format!("data:{mime};base64,{}", base64(&bytes)))
 }
 
 // ───────── watcher ─────────
@@ -258,6 +481,11 @@ impl DocWatch {
 
     pub fn unwatch(&self, pane: &str) {
         self.map.lock().unwrap().remove(pane);
+    }
+
+    /// Whether `pane` is watched.
+    pub fn contains(&self, pane: &str) -> bool {
+        self.map.lock().unwrap().contains_key(pane)
     }
 
     pub fn len(&self) -> usize {
@@ -454,6 +682,115 @@ mod tests {
             assert!(check_external_url(bad).is_err(), "{bad}");
         }
         assert!(check_external_url(&format!("https://e.com/{}", "a".repeat(3000))).is_err());
+    }
+
+    #[test]
+    fn image_src_is_checked_lexically_before_any_file_system_call() {
+        for ok in ["img/a.png", "./a.PNG", "..\\img\\b.jpg", "sub/%ED%95%9C.webp", "a.png?x=1#y", "a b.svg"] {
+            assert!(check_image_src(ok).is_ok(), "{ok}");
+        }
+        assert_eq!(check_image_src("..\\img\\./b.jpg").unwrap(), "../img/b.jpg");
+        assert_eq!(check_image_src("sub/%ED%95%9C.webp").unwrap(), "sub/한.webp");
+        for bad in [
+            "\\\\attacker\\x.png",
+            "//attacker/x.png",
+            "%5C%5Cattacker%5Cx.png",
+            "%2F%2Fattacker/x.png",
+            "\\\\?\\C:\\x.png",
+            "\\\\.\\pipe\\x.png",
+            "C:\\x.png",
+            "C:x.png",
+            "c%3A/x.png",
+            "/abs.png",
+            "\\abs.png",
+            "file:///C:/x.png",
+            "http://asset.localhost/x.png",
+            "a.png:stream",
+            "a.txt",
+            "img/",
+            "..",
+            "nul.png",
+            "COM1.png",
+            "a.png.",
+            "dir./a.png",
+            "x%00.png",
+            "%ZZ.png",
+            "",
+            "  ",
+        ] {
+            assert!(check_image_src(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn images_resolve_inside_the_root_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        write(&root.join("docs/t.md"), "x");
+        std::fs::write(root.join("docs").join("a.png"), [0x89u8, b'P', b'N', b'G']).unwrap();
+        write(&root.join("img/b.gif"), "GIF");
+        write(&root.join(".git/x.png"), "x");
+        write(&root.join(".agentboard/y.png"), "x");
+        write(&outside.join("o.png"), "x");
+        assert_eq!(read_image(&root, "docs/t.md", "a.png").unwrap(), "data:image/png;base64,iVBORw==");
+        assert_eq!(read_image(&root, "docs/t.md", "../img/b.gif").unwrap(), format!("data:image/gif;base64,{}", base64(b"GIF")));
+        for bad in ["../../outside/o.png", "../../../o.png", "../.git/x.png", "../.agentboard/y.png", "missing.png", "..\\..\\outside\\o.png"] {
+            assert!(read_image(&root, "docs/t.md", bad).is_err(), "{bad}");
+        }
+        // the document itself must validate
+        assert!(read_image(&root, "../outside/x.md", "o.png").is_err());
+        // a junction inside the root pointing outside is refused after canonicalization
+        if crate::issues::tests::link_dir(&root.join("docs").join("lnk"), &outside) {
+            assert!(read_image(&root, "docs/t.md", "lnk/o.png").is_err());
+        }
+        // size cap
+        let big = std::fs::File::create(root.join("docs").join("big.png")).unwrap();
+        big.set_len(IMAGE_MAX_BYTES + 1).unwrap();
+        assert!(read_image(&root, "docs/t.md", "big.png").unwrap_err().contains("큽니다"));
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+    }
+
+    #[test]
+    fn missing_documents_can_be_watched_inside_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        write(&root.join("docs/t.md"), "x");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert_eq!(resolve_watch_path(&root, "docs/t.md").unwrap(), root.join("docs").join("t.md"));
+        assert_eq!(resolve_watch_path(&root, "docs/gone.md").unwrap(), root.join("docs").join("gone.md"));
+        for bad in ["nodir/gone.md", "docs/gone.txt", "../outside/gone.md", "docs"] {
+            assert!(resolve_watch_path(&root, bad).is_err(), "{bad}");
+        }
+        assert!(resolve_watch_path(&root, &outside.join("gone.md").to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn listing_walks_have_a_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for i in 0..40 {
+            write(&root.join(format!("d{i:02}/x.md")), "x");
+        }
+        write(&root.join("Node_Modules/y.md"), "x");
+        assert_eq!(list_md(root, None, LIST_MAX).len(), 40, "skip names compare case-insensitively");
+        let few = list_md_budget(root, None, LIST_MAX, 10);
+        assert!(few.len() < 10, "{}", few.len());
+        assert_eq!(WALK_BUDGET, 50_000);
+        // issue files: the first files in name order are kept when capped
+        let issue = tmp.path().join("issue");
+        for i in 0..(ISSUE_FILES_MAX + 20) {
+            write(&issue.join(format!("output/f{i:04}.md")), "x");
+        }
+        std::fs::create_dir_all(issue.join("input")).unwrap();
+        let f = issue_files(&issue).unwrap();
+        assert_eq!(f.output.len(), ISSUE_FILES_MAX);
+        assert_eq!(f.output[0].name, "f0000.md");
+        assert_eq!(f.output[ISSUE_FILES_MAX - 1].name, format!("f{:04}.md", ISSUE_FILES_MAX - 1));
     }
 
     #[test]

@@ -14,6 +14,12 @@ import {
   findMatches,
   fileModeKey,
   docTitle,
+  headingId,
+  MERMAID_SANITIZE_CONFIG,
+  mermaidAttrAllowed,
+  stripCssUrls,
+  LINK_SELECTOR,
+  imgAltText,
 } from '../../src/docview-logic.js';
 import { docChoices, paletteItems } from '../../src/overlay-logic.js';
 
@@ -58,11 +64,26 @@ test('relative md links resolve against current doc and stay inside root', () =>
   }
   assert.equal(joinRel('a/b', '../../..'), null);
   assert.equal(joinRel('', 'x/./y/../z.md'), 'x/z.md');
-  // images: inside root → local rel, data: kept, everything else dropped
+  // images: only relative paths inside the root (loaded through doc_image); everything else
+  // — data:, remote, rooted, UNC (also percent-encoded), drive paths — is dropped (alt text)
   assert.deepEqual(resolveAssetSrc('docs/a.md', 'img/p.png'), { type: 'local', rel: 'docs/img/p.png' });
   assert.deepEqual(resolveAssetSrc('docs/a.md', '../%ED%95%9C.png'), { type: 'local', rel: '한.png' });
-  assert.deepEqual(resolveAssetSrc('docs/a.md', 'data:image/png;base64,AAAA'), { type: 'keep' });
-  for (const bad of ['../../x.png', 'https://example.com/t.png', 'file:///C:/x.png', 'C:\\x.png', '//h/x.png', 'javascript:x', '']) {
+  for (const bad of [
+    '../../x.png',
+    'https://example.com/t.png',
+    'file:///C:/x.png',
+    'C:\\x.png',
+    'C:x.png',
+    '//h/x.png',
+    '\\\\attacker\\x.png',
+    '%5C%5Cattacker%5Cx.png',
+    '\\\\?\\C:\\x.png',
+    '/abs.png',
+    'data:image/png;base64,AAAA',
+    'http://asset.localhost/%5C%5Cattacker.example%5Cs%5Cx.png',
+    'javascript:x',
+    '',
+  ]) {
     assert.deepEqual(resolveAssetSrc('docs/a.md', bad), { type: 'drop' }, bad);
   }
   assert.equal(docTitle('a/b/보고서.md'), '보고서.md');
@@ -123,7 +144,7 @@ test('sanitizer strips script and on* attributes', () => {
   // DOMPurify config (the real sanitizer runs in the WebView; Node has no DOM)
   for (const cfg of [SANITIZE_CONFIG, FINAL_SANITIZE_CONFIG]) {
     assert.ok(Object.isFrozen(cfg));
-    for (const t of ['script', 'iframe', 'object', 'embed', 'form', 'base', 'meta', 'link', 'style']) {
+    for (const t of ['script', 'iframe', 'object', 'embed', 'form', 'base', 'meta', 'link', 'style', 'area', 'map', 'portal']) {
       assert.ok(cfg.FORBID_TAGS.includes(t), t);
     }
     for (const a of ['target', 'formaction', 'srcset', 'ping']) assert.ok(cfg.FORBID_ATTR.includes(a), a);
@@ -235,4 +256,70 @@ test('palette: 문서 열기 entry and capped fuzzy doc choices', () => {
   const many = Array.from({ length: 1000 }, (_, i) => `d/${i}.md`);
   assert.equal(docChoices(many, '', 200).length, 200);
   assert.equal(docChoices(many, 'd/1', 50).length, 50);
+});
+
+test('heading ids are namespaced: no document can produce an app id', () => {
+  assert.equal(headingId('p12', 'status'), 'doc-p12-status');
+  assert.equal(headingId('p12', '개요'), 'doc-p12-개요');
+  for (const appId of ['status', 'groups', 'parking', 'toasts', 'sidebar', 'main', 'mermaid']) {
+    const toc = extractToc([{ level: 2, text: appId }]);
+    assert.notEqual(headingId('p1', toc[0].id), appId);
+    assert.ok(headingId('p1', toc[0].id).startsWith('doc-p1-'));
+  }
+  // pass 1 keeps DOMPurify's clobbering guards on (ids/names of raw HTML get user-content-)
+  assert.equal(SANITIZE_CONFIG.SANITIZE_DOM, true);
+  assert.equal(SANITIZE_CONFIG.SANITIZE_NAMED_PROPS, true);
+  assert.equal(FINAL_SANITIZE_CONFIG.SANITIZE_DOM, true);
+});
+
+test('links: every href-bearing element is intercepted', () => {
+  for (const sel of ['a', 'area', '[href]', '[*|href]']) assert.ok(LINK_SELECTOR.split(',').map((x) => x.trim()).includes(sel), sel);
+});
+
+test('mermaid output is re-sanitized: no images, scripts, foreign links or css urls', () => {
+  const c = MERMAID_SANITIZE_CONFIG;
+  assert.ok(Object.isFrozen(c));
+  assert.deepEqual(c.USE_PROFILES, { svg: true, svgFilters: true, html: true });
+  for (const t of ['img', 'image', 'use', 'script', 'a', 'iframe', 'object', 'embed', 'form', 'area', 'map', 'feimage', 'link', 'meta', 'base', 'audio', 'video']) {
+    assert.ok(c.FORBID_TAGS.includes(t), t);
+  }
+  assert.equal(c.ALLOW_DATA_ATTR, false);
+  // href/src only as in-document anchors
+  assert.equal(mermaidAttrAllowed('href', '#arrow'), true);
+  assert.equal(mermaidAttrAllowed('xlink:href', '#m1'), true);
+  for (const [n, v] of [
+    ['href', 'https://e/'],
+    ['xlink:href', 'http://asset.localhost/%5C%5Cx'],
+    ['src', 'x.png'],
+    ['href', '//h/x'],
+    ['href', ''],
+    ['onload', 'x'],
+    ['onclick', '#x'],
+  ]) {
+    assert.equal(mermaidAttrAllowed(n, v), false, `${n}=${v}`);
+  }
+  assert.equal(mermaidAttrAllowed('class', 'node'), true);
+  // style text: only url(#…) survives
+  assert.equal(stripCssUrls('marker-end:url(#arrow);'), 'marker-end:url(#arrow);');
+  assert.equal(stripCssUrls("fill:url( '#g' )"), "fill:url( '#g' )");
+  assert.equal(stripCssUrls('background:url(http://asset.localhost/%5C%5Ca%5Cb.png)'), 'background:none');
+  assert.equal(stripCssUrls('a{b:url("//host/x")} c{d:URL(x.png)}'), 'a{b:none} c{d:none}');
+  assert.equal(stripCssUrls('@import "//evil/x.css"; .a{}'), ' .a{}');
+  assert.equal(stripCssUrls('x:image-set("a.png" 1x)'), 'x:none');
+});
+
+test('blocked images become their alt text', () => {
+  assert.equal(imgAltText('로고'), '[이미지: 로고]');
+  assert.equal(imgAltText(''), '[이미지]');
+  assert.equal(imgAltText(null), '[이미지]');
+});
+
+test('prefilter is linear on unclosed tags', () => {
+  const big = '<style'.repeat(200000);
+  const t0 = Date.now();
+  const out = prefilterHtml(big);
+  assert.ok(Date.now() - t0 < 2000, `${Date.now() - t0} ms`);
+  assert.doesNotMatch(out, /<style/i);
+  assert.equal(prefilterHtml('<p>a</p><script>x</script><p>b</p>'), '<p>a</p><p>b</p>');
+  assert.equal(prefilterHtml('a<script>never closed <p>b</p>'), 'a');
 });
