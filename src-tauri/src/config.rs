@@ -699,6 +699,11 @@ pub fn config_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".agentboard").join("config.json")
 }
 
+/// Serializes every app-side config.json read-modify-write (Task 8 `create_manager_tab`; later
+/// writers such as `env_skip` take it too) for the whole append → apply → rollback sequence, so
+/// a rollback never undoes another call's entry. Outermost: taken before `ws` / `loaded`.
+pub static CONFIG_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Outcome of [`append_config_tab`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigEdit {

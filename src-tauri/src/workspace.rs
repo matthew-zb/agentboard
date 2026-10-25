@@ -365,7 +365,16 @@ impl Workspace {
     /// runs on a clone that replaces `self` only on success.
     pub fn apply(&mut self, cmd: WsCommand, loaded: &Loaded) -> Result<Effects, String> {
         let mut next = self.clone();
+        // commands that create or remove role/team panes re-check the persisted invariants, so a
+        // broken state becomes an Err here instead of a corrupt workspace.json on the next start
+        let recheck = matches!(
+            cmd,
+            WsCommand::CreateTab { .. } | WsCommand::AddTeamPane { .. } | WsCommand::RemoveTeam { .. } | WsCommand::ClosePane { .. }
+        );
         let fx = next.apply_inner(cmd, loaded)?;
+        if recheck {
+            next.check_roles()?;
+        }
         next.sanitize_last_location();
         *self = next;
         Ok(fx)
@@ -591,6 +600,11 @@ impl Workspace {
                         }
                     }
                     Some(r) => return Err(format!("'{}' 역할의 탭은 만들 수 없습니다", r.as_str())),
+                }
+                // a role tab's standing pane takes the tab name as its session name; a renamed tab
+                // keeps its old session name (R15) and team panes have their own, so check them all
+                if role.is_some() && self.session_taken(&name) {
+                    return Err(format!("세션 이름 '{name}'이(가) 이미 다른 에이전트가 쓰고 있습니다 — 다른 탭 이름을 쓰세요"));
                 }
                 let background = group.is_some();
                 let gid = match group {
@@ -1159,6 +1173,10 @@ impl Workspace {
         }
         if name == "dispatcher" {
             return Err("'dispatcher'는 예약된 탭 이름입니다".into());
+        }
+        // the name becomes a session name (--name) and is typed into prompts
+        if name.chars().any(char::is_control) {
+            return Err("탭 이름에 제어 문자(줄바꿈·탭 등)를 쓸 수 없습니다".into());
         }
         if self.tabs.values().any(|t| t.name == name && Some(t.id.as_str()) != except) {
             return Err(format!("탭 이름 '{name}'이(가) 이미 있습니다"));
@@ -2852,6 +2870,51 @@ mod tests {
             f(&mut bad);
             assert!(bad.normalize_and_validate().is_err(), "{name}");
         }
+    }
+
+    #[test]
+    fn role_tab_cannot_reuse_a_live_session_name() {
+        let (l, mut ws) = role_ws();
+        let b = tab(&ws, "billing").id.clone();
+        ws.apply(add(&b, "batch", Role::Lead), &l).unwrap();
+        // (a) R15: a renamed Manager tab keeps its session name "billing"
+        ws.apply(WsCommand::RenameTab { tab: b.clone(), name: "ops".into() }, &l).unwrap();
+        let mk = |name: &str, role| WsCommand::CreateTab {
+            name: name.into(),
+            dir: "x".into(),
+            template: Some("manager".into()),
+            group: None,
+            role,
+        };
+        let before = ws.clone();
+        // (a) the old name, (b) a team pane's session name
+        for name in ["billing", "billing-batch-lead"] {
+            let err = ws.apply(mk(name, Some(Role::Manager)), &l).unwrap_err();
+            assert!(err.contains("세션 이름"), "{name}: {err}");
+            assert_eq!(ws, before);
+        }
+        // a plain tab has no session, so the name is free for it
+        ws.apply(mk("billing", None), &l).unwrap();
+        valid(&ws);
+        // hiring checks every session name in the workspace, not only the tab's
+        let mut ws = before.clone();
+        let hp = ws.panes.values().find(|p| p.role == Some(Role::Handover)).unwrap().id.clone();
+        ws.panes.get_mut(&hp).unwrap().session_name = Some("ops-z-lead".into());
+        let err = ws.apply(add(&b, "z", Role::Lead), &l).unwrap_err();
+        assert!(err.contains("세션 이름"), "{err}");
+    }
+
+    #[test]
+    fn tab_names_reject_control_characters() {
+        let (l, mut ws) = role_ws();
+        let before = ws.clone();
+        for name in ["a\nb", "tab\u{7}", "x\ty", "\u{1b}[31m"] {
+            let cmd = WsCommand::CreateTab { name: name.into(), dir: "x".into(), template: None, group: None, role: Some(Role::Manager) };
+            assert!(ws.apply(cmd, &l).is_err(), "{name:?}");
+            let b = tab(&ws, "billing").id.clone();
+            assert!(ws.apply(WsCommand::RenameTab { tab: b, name: name.into() }, &l).is_err(), "{name:?}");
+        }
+        assert_eq!(ws, before);
     }
 
     #[test]

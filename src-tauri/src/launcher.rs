@@ -70,7 +70,10 @@
 //!   lock held, none taken inside — around the atomic config.json append and the in-memory
 //!   `config.tabs` push (and their rollback). It is never taken under `ws`; `execute` runs
 //!   after it is released. Team tools (`hire_*`, `dismiss*`) read `ws` briefly (released) and
-//!   change the model only through `execute`.
+//!   change the model only through `execute`. `config::CONFIG_WRITE` (static Mutex) is
+//!   outermost: `create_manager_tab` holds it across append → `execute` → rollback and takes
+//!   `loaded(write)` / `ws` only inside it, one at a time; nothing takes it while holding an
+//!   app lock.
 //! * Never call `PtyManager::spawn/kill/remove/write/resize/attach_with` while holding `ws`,
 //!   `loaded` or `prompts`: spawn/kill/write can block, and the PTY threads call back into
 //!   the sink (`output` -> prompts, `exited` -> ws).

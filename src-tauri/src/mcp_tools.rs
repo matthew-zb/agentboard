@@ -676,19 +676,27 @@ fn create_manager_tab(state: &AppState, _caller: &Caller, args: &Value) -> Resul
     }
     let spec = TabSpec { name: name.clone(), dir: dir.clone(), template: spec_template, role: Some(Role::Manager) };
     let cfg_path = config::config_path(&root);
-    let edit = {
+    // held through append → apply → rollback: no other config write can land in between, so
+    // restoring the previous text undoes exactly this call's entry
+    let _cfg = config::CONFIG_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    let (edit, pushed) = {
         let mut l = state.loaded.write().unwrap();
         let edit = config::append_config_tab(&cfg_path, &spec)?;
-        if !l.config.tabs.iter().any(|t| t.name == spec.name) {
+        let pushed = !l.config.tabs.iter().any(|t| t.name == spec.name);
+        if pushed {
             l.config.tabs.push(spec.clone());
         }
-        edit
+        (edit, pushed)
     };
     if let Err(e) = launcher::execute(state, cmd) {
         let mut l = state.loaded.write().unwrap();
-        if let ConfigEdit::Written(prev) = &edit {
-            let _ = config::restore_config_file(&cfg_path, prev.as_deref());
+        if pushed {
             l.config.tabs.retain(|t| t.name != spec.name);
+        }
+        if let ConfigEdit::Written(prev) = &edit {
+            if let Err(re) = config::restore_config_file(&cfg_path, prev.as_deref()) {
+                return Err(format!("{e} (config.json을 되돌리지 못했습니다: {re} — 탭 '{name}' 항목을 직접 지우세요)"));
+            }
         }
         return Err(e);
     }
@@ -1033,6 +1041,18 @@ mod tests {
             assert_eq!(f.config_text(), text, "{args}");
         }
         assert_eq!(tab_count("y"), 0);
+        // a renamed Manager keeps its session name: the old name is not free for a new Manager
+        let b = f.who("billing").tab;
+        crate::launcher::execute(&f.state, WsCommand::RenameTab { tab: b, name: "billing-old".into() }).unwrap();
+        std::fs::create_dir_all(f.root.join("billing2")).unwrap();
+        let err = f.call("dispatcher", "create_manager_tab", json!({"name":"billing","dir":"billing2"})).unwrap_err();
+        assert!(err.contains("세션 이름"), "{err}");
+        assert_eq!(f.config_text(), text, "nothing written");
+        assert!(!f.state.loaded.read().unwrap().config.tabs.iter().any(|t| t.dir == "billing2"));
+        f.valid();
+        // control characters never reach a session name or a prompt
+        assert!(f.call("dispatcher", "create_manager_tab", json!({"name":"a\nb","dir":"x"})).is_err());
+        assert_eq!(f.config_text(), text);
         // only the dispatcher may create standing tabs
         assert!(f.call("billing", "create_manager_tab", json!({"name":"y","dir":"x"})).is_err());
 
