@@ -84,11 +84,15 @@ struct Batch {
     space: Condvar,
     flush_lock: Mutex<()>,
     done: AtomicBool,
+    /// The single source of truth for snapshots. Appended in `flush` under `flush_lock`
+    /// immediately before `sink.output`, so it always equals the delivered bytes.
+    ring: Arc<Mutex<RingBuffer>>,
 }
 
 impl Batch {
-    fn new() -> Self {
+    fn new(ring: Arc<Mutex<RingBuffer>>) -> Self {
         Batch {
+            ring,
             pending: Mutex::new(Vec::new()),
             space: Condvar::new(),
             flush_lock: Mutex::new(()),
@@ -119,6 +123,7 @@ impl Batch {
         let bytes = std::mem::take(&mut *self.pending.lock().unwrap());
         self.space.notify_all();
         if !bytes.is_empty() {
+            self.ring.lock().unwrap().push(&bytes);
             sink.output(id, &bytes);
         }
         if finish {
@@ -235,7 +240,7 @@ impl PtyManager {
 
         let ring = Arc::new(Mutex::new(RingBuffer::new(RING_CAP)));
         let running = Arc::new(AtomicBool::new(true));
-        let batch = Arc::new(Batch::new());
+        let batch = Arc::new(Batch::new(ring.clone()));
         let entry = Arc::new(Entry {
             master: Mutex::new(Some(pair.master)),
             writer: Mutex::new(Some(writer)),
@@ -252,7 +257,7 @@ impl PtyManager {
 
         // reader thread
         {
-            let (ring, batch) = (ring.clone(), batch.clone());
+            let batch = batch.clone();
             let entry = entry.clone();
             std::thread::spawn(move || {
                 let _tx = reader_done_tx; // dropped on exit => waiter sees end-of-stream
@@ -275,12 +280,10 @@ impl PtyManager {
                         }
                     }
                     if !out.is_empty() {
-                        ring.lock().unwrap().push(&out);
                         batch.push(&out);
                     }
                 }
                 if !carry.is_empty() {
-                    ring.lock().unwrap().push(&carry);
                     batch.push(&carry);
                 }
             });
@@ -342,6 +345,17 @@ impl PtyManager {
 
     pub fn snapshot(&self, id: &str) -> Vec<u8> {
         self.entry(id).map(|e| e.ring.lock().unwrap().snapshot()).unwrap_or_default()
+    }
+
+    /// Atomically snapshot the pane's output and run `register` (e.g. subscribe a channel)
+    /// while no flush can happen: bytes are either in the snapshot or delivered to the sink
+    /// after `register` returns, never both and never neither. Returns false if unknown pane.
+    pub fn attach_with(&self, id: &str, register: impl FnOnce(Vec<u8>)) -> bool {
+        let Some(e) = self.entry(id) else { return false };
+        let _g = e.batch.flush_lock.lock().unwrap();
+        let snap = e.ring.lock().unwrap().snapshot();
+        register(snap);
+        true
     }
 
     pub fn is_running(&self, id: &str) -> bool {

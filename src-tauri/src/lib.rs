@@ -7,28 +7,19 @@ pub mod webview;
 #[cfg(windows)]
 pub mod winjob;
 
-use pty::{PtyManager, PtySink, SpawnSpec, RING_CAP};
-use ring::RingBuffer;
+use pty::{PtyManager, PtySink, SpawnSpec};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::ipc::{Channel, InvokeResponseBody, Response};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-#[derive(Default)]
-struct SinkState {
-    channels: HashMap<String, Channel<InvokeResponseBody>>,
-    /// Bytes exactly as delivered through `output`, per pane. Kept here (not in the
-    /// PtyManager ring) so a snapshot is consistent with what the channel has received.
-    rings: HashMap<String, RingBuffer>,
-}
-
-/// Delivers PTY output to the attached frontend channel as raw binary.
-/// One lock covers ring + channel map: `attach` snapshots and subscribes under it, and
-/// `output` appends and sends under it, so no byte is lost or delivered twice.
+/// Delivers PTY output to the attached frontend channel as raw binary. The only state is
+/// the channel map; the single ring buffer lives in PtyManager, which snapshots and runs
+/// the registration under its flush lock (see `PtyManager::attach_with`).
 pub struct AppSink {
     app: AppHandle,
-    state: Mutex<SinkState>,
+    channels: Mutex<HashMap<String, Channel<InvokeResponseBody>>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -39,29 +30,22 @@ struct ExitPayload {
 
 impl AppSink {
     fn new(app: AppHandle) -> Self {
-        AppSink { app, state: Mutex::new(SinkState::default()) }
-    }
-
-    pub fn attach(&self, id: &str, channel: Channel<InvokeResponseBody>) -> Vec<u8> {
-        let mut st = self.state.lock().unwrap();
-        let snap = st.rings.get(id).map(|r| r.snapshot()).unwrap_or_default();
-        st.channels.insert(id.to_string(), channel);
-        snap
+        AppSink { app, channels: Mutex::new(HashMap::new()) }
     }
 }
 
 impl PtySink for AppSink {
     fn output(&self, id: &str, bytes: &[u8]) {
-        let mut st = self.state.lock().unwrap();
-        st.rings.entry(id.to_string()).or_insert_with(|| RingBuffer::new(RING_CAP)).push(bytes);
-        if let Some(ch) = st.channels.get(id) {
+        let mut chs = self.channels.lock().unwrap();
+        if let Some(ch) = chs.get(id) {
             if ch.send(InvokeResponseBody::Raw(bytes.to_vec())).is_err() {
-                st.channels.remove(id);
+                chs.remove(id);
             }
         }
     }
 
     fn exited(&self, id: &str, code: i32) {
+        self.channels.lock().unwrap().remove(id);
         let _ = self.app.emit("pty-exit", ExitPayload { id: id.to_string(), code });
     }
 }
@@ -73,7 +57,13 @@ pub struct AppState {
 
 #[tauri::command]
 fn pty_attach(state: State<'_, AppState>, pane: String, channel: Channel<InvokeResponseBody>) -> Response {
-    Response::new(state.sink.attach(&pane, channel))
+    let mut snap = Vec::new();
+    // snapshot + subscribe under PtyManager's flush lock: no loss, no duplicates
+    state.pty.attach_with(&pane, |s| {
+        snap = s;
+        state.sink.channels.lock().unwrap().insert(pane.clone(), channel);
+    });
+    Response::new(snap)
 }
 
 #[tauri::command]
@@ -111,6 +101,7 @@ pub fn run() {
             app.manage(AppState { pty, sink });
             if let Some(w) = app.get_webview_window("main") {
                 webview::disable_browser_accelerators(&w);
+                webview::maybe_open_devtools(&w);
             }
             Ok(())
         })

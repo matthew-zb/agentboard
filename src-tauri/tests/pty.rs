@@ -230,3 +230,55 @@ fn job_kills_children_when_app_exits() {
         .unwrap();
     assert!(wait_until(|| !pid_alive(pid)), "ping {pid} survived app exit");
 }
+
+#[test]
+fn snapshot_equals_delivered_output() {
+    let (sink, m) = setup();
+    m.spawn("s1", spec("cmd.exe", &["/c", "echo snap-one & echo snap-two"], cwd())).unwrap();
+    assert!(wait_until(|| sink.exit("s1").is_some()));
+    let delivered = sink.out.lock().unwrap().get("s1").cloned().unwrap();
+    assert_eq!(m.snapshot("s1"), delivered);
+}
+
+#[test]
+fn attach_with_has_no_gap_or_duplicate_under_concurrent_output() {
+    let (sink, m) = setup();
+    m.spawn(
+        "a1",
+        spec("cmd.exe", &["/c", "for /L %i in (1,1,6000) do @echo line-%i-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"], cwd()),
+    )
+    .unwrap();
+    // attach as soon as some output exists, while output keeps flowing
+    assert!(wait_until(|| sink.out.lock().unwrap().get("a1").map(|v| !v.is_empty()).unwrap_or(false)));
+    let mut captured: Option<(Vec<u8>, usize)> = None;
+    assert!(m.attach_with("a1", |snap| {
+        // runs under the flush lock: nothing can be delivered meanwhile
+        let n = sink.out.lock().unwrap().get("a1").map(|v| v.len()).unwrap_or(0);
+        captured = Some((snap, n));
+    }));
+    let (snap, n) = captured.unwrap();
+    assert_eq!(snap.len(), n, "snapshot must equal everything delivered so far");
+    assert!(wait_until(|| sink.exit("a1").is_some()));
+    let delivered = sink.out.lock().unwrap().get("a1").cloned().unwrap();
+    assert!(delivered.len() > n, "test needs output after attach");
+    assert!(delivered.len() < 1_048_576, "ring must not wrap for this comparison");
+    assert_eq!(&delivered[..n], snap.as_slice());
+    let mut replay = snap.clone();
+    replay.extend_from_slice(&delivered[n..]);
+    assert_eq!(replay, m.snapshot("a1"));
+    assert!(!m.attach_with("nope", |_| panic!("must not run")));
+}
+
+#[test]
+fn respawn_starts_with_empty_ring() {
+    let (sink, m) = setup();
+    m.spawn("r1", spec("cmd.exe", &["/c", "echo first-run-marker"], cwd())).unwrap();
+    assert!(wait_until(|| sink.exit("r1").is_some()));
+    assert!(String::from_utf8_lossy(&m.snapshot("r1")).contains("first-run-marker"));
+    sink.exits.lock().unwrap().clear();
+    m.spawn("r1", spec("cmd.exe", &["/c", "echo second-run-marker"], cwd())).unwrap();
+    assert!(wait_until(|| sink.exit("r1").is_some()));
+    let snap = String::from_utf8_lossy(&m.snapshot("r1")).into_owned();
+    assert!(snap.contains("second-run-marker"));
+    assert!(!snap.contains("first-run-marker"), "old process output leaked: {snap:?}");
+}

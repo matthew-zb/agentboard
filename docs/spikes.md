@@ -28,7 +28,10 @@
 - [ ] 사용자 확인 필요 — `Ctrl+R`: 페이지 새로고침이 아니라 Claude 기록 검색이 열린다.
 - [ ] 사용자 확인 필요 — `Ctrl+P`: 인쇄 대화가 뜨지 않는다.
 - [ ] 사용자 확인 필요 — `F5`: 새로고침되지 않는다(화면·세션 유지).
-- [ ] 사용자 확인 필요 — 우클릭 시 기본 컨텍스트 메뉴가 뜨지 않는다.
+- [ ] 사용자 확인 필요 — 릴리스 빌드: 우클릭 시 기본 컨텍스트 메뉴가 뜨지 않는다. 디버그 빌드(`tauri dev`)에서는 의도적으로 메뉴를 남겨 우클릭 > "Inspect"로 DevTools를 연다.
+- [ ] 사용자 확인 필요 — 디버그 빌드: F12는 가속키라 동작하지 않을 수 있다. `AGENTBOARD_DEVTOOLS=1`로 실행하면(PowerShell: `$env:AGENTBOARD_DEVTOOLS='1'; npx tauri dev`) DevTools 창이 시작 시 열리는지 확인. Ctrl+R/F5는 디버그에서도 막혀 있어야 한다.
+
+DevTools 정책(R9): 가속키 비활성화는 디버그·릴리스 공통. 컨텍스트 메뉴 비활성화는 릴리스만. 디버그 전용 `AGENTBOARD_DEVTOOLS=1`이 DevTools를 연다.
 
 기대 결과: 위 항목 모두 통과.
 실패 시 대안(스펙 §10 S2): document keydown capture에서 해당 키를 `preventDefault` 한 뒤 PTY로 직접 전송(`api.write`).
