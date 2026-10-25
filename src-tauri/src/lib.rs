@@ -3,6 +3,7 @@ pub mod attention;
 pub mod bridge;
 pub mod config;
 pub mod control;
+pub mod docs;
 pub mod hookcli;
 pub mod inbox;
 pub mod issues;
@@ -52,6 +53,8 @@ pub trait Ui: Send + Sync {
     fn drop_channel(&self, id: &str);
     /// Emit `inbox-changed` (`{"version": n}`) after an inbox mutation (leaf, no app lock).
     fn inbox_changed(&self, _version: u64) {}
+    /// Emit `doc-changed` (`{"paneId": id}`): the pane's watched document changed (Task 14).
+    fn doc_changed(&self, _pane: &str) {}
 }
 
 /// Lock order: see the module docs of `launcher`.
@@ -92,6 +95,8 @@ pub struct AppState {
     pub last_input: Mutex<HashMap<PaneId, std::time::Instant>>,
     /// Folder-trust timers of role panes per spawn generation (Task 9, `attention`). Leaf lock.
     pub trust: Mutex<HashMap<PaneId, attention::Trust>>,
+    /// Watched documents of document panes (Task 14). Leaf lock.
+    pub docs: docs::DocWatch,
 }
 
 impl AppState {
@@ -133,6 +138,7 @@ impl AppState {
             bridge: bridge::Bridge::new(),
             last_input: Mutex::new(HashMap::new()),
             trust: Mutex::new(HashMap::new()),
+            docs: docs::DocWatch::new(),
         }
     }
 }
@@ -224,6 +230,16 @@ impl Ui for AppSink {
     fn inbox_changed(&self, version: u64) {
         let _ = self.app.emit(inbox::INBOX_CHANGED, inbox::InboxChanged { version });
     }
+
+    fn doc_changed(&self, pane: &str) {
+        let _ = self.app.emit(docs::DOC_CHANGED, DocChanged { pane_id: pane.to_string() });
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocChanged {
+    pane_id: String,
 }
 
 impl PtySink for AppSink {
@@ -447,6 +463,98 @@ async fn inbox_add_files(
     Ok(AddFilesResult { files, warning })
 }
 
+// ───────── document tabs (Task 14) ─────────
+
+fn workspace_root(state: &AppState) -> std::path::PathBuf {
+    state.loaded.read().unwrap().settings.workspace_root.clone()
+}
+
+/// Read a document (`path`: absolute or relative to workspaceRoot). Validated on every call
+/// (`docs::resolve_doc`): an existing `.md` inside workspaceRoot after resolving links.
+#[tauri::command]
+async fn doc_read(app: AppHandle, path: String) -> Result<docs::DocText, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        docs::read_doc(&workspace_root(&state), &path)
+    })
+    .await
+    .map_err(|e| format!("문서를 읽는 작업이 중단되었습니다 — {e}"))?
+}
+
+/// `.md` files under workspaceRoot (relative, `/`), excluding `.agentboard`, `node_modules`,
+/// `.git`, `target`; at most 5,000.
+#[tauri::command]
+async fn doc_list_md(app: AppHandle, query: Option<String>) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        Ok(docs::list_md(&workspace_root(&state), query.as_deref(), docs::LIST_MAX))
+    })
+    .await
+    .map_err(|e| format!("문서 목록 작업이 중단되었습니다 — {e}"))?
+}
+
+/// Watch the document a document pane shows (replaces its previous one). The watcher thread
+/// polls mtimes every second and emits `doc-changed {paneId}`.
+#[tauri::command]
+fn doc_watch(state: State<'_, AppState>, pane_id: String, path: String) -> Result<(), String> {
+    // ws taken and released; then loaded(read), released; then the watch map (leaf)
+    let is_doc = state.ws.lock().unwrap().pane_by_id(&pane_id).is_some_and(|p| p.kind.is_doc());
+    if !is_doc {
+        return Err(format!("문서 창이 아닙니다: {pane_id}"));
+    }
+    let doc = docs::resolve_doc(&workspace_root(&state), &path)?;
+    let mtime = docs::mtime_of(&doc.abs);
+    state.docs.watch(&pane_id, doc.abs, mtime);
+    Ok(())
+}
+
+#[tauri::command]
+fn doc_unwatch(state: State<'_, AppState>, pane_id: String) {
+    state.docs.unwatch(&pane_id);
+}
+
+/// An http(s) link of a document → the system browser (opener plugin's Rust API; the frontend
+/// gets no opener capability). Anything else is refused.
+#[tauri::command]
+fn doc_open_url(url: String) -> Result<(), String> {
+    let url = docs::check_external_url(&url)?;
+    tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| format!("브라우저를 열 수 없습니다 — {e}"))
+}
+
+/// Files of the inbox item's issue folder (`input/`, `output/`), for the inbox detail. The
+/// folder is re-derived and checked with `issues::resolve` (stored paths are not trusted).
+#[tauri::command]
+fn inbox_issue_files(state: State<'_, AppState>, id: String) -> Result<docs::IssueFiles, String> {
+    let item = state.inbox.get(&id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))?;
+    let Some(issue) = item.issue else { return Ok(docs::IssueFiles::default()) };
+    let workspace = mcp_tools::tab_workspace(&state, &item.owner_tab)?;
+    docs::issue_files(&issues::resolve(&workspace, &issue)?)
+}
+
+/// Asset protocol (document images): only the canonical workspaceRoot, recursively, minus its
+/// `.agentboard` folder. Set once at startup; no command widens it (the scope check itself
+/// canonicalizes, so a junction under the root pointing elsewhere is not served).
+fn allow_assets(app: &tauri::App, root: &std::path::Path) -> Result<(), String> {
+    let real = std::fs::canonicalize(root).map_err(|e| format!("{} — {e}", root.display()))?;
+    let scope = app.asset_protocol_scope();
+    scope.allow_directory(&real, true).map_err(|e| e.to_string())?;
+    scope.forbid_directory(real.join(".agentboard"), true).map_err(|e| e.to_string())
+}
+
+/// The document watcher thread: one `poll` per second; changed panes get `doc-changed`.
+fn start_doc_watcher(app: AppHandle) {
+    let _ = std::thread::Builder::new().name("doc-watch".into()).spawn(move || loop {
+        std::thread::sleep(docs::POLL_INTERVAL);
+        let Some(state) = app.try_state::<AppState>() else { continue };
+        if state.docs.is_empty() {
+            continue;
+        }
+        for pane in state.docs.poll(docs::mtime_of) {
+            state.ui.doc_changed(&pane);
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -474,11 +582,20 @@ pub fn run() {
             inbox_add_files,
             inbox_instruct,
             inbox_request_issue,
+            inbox_issue_files,
+            doc_read,
+            doc_list_md,
+            doc_watch,
+            doc_unwatch,
+            doc_open_url,
         ])
         .setup(|app| {
             // load_all = load_settings + ensure_dotdir (incl. powershell profile) + load
             let appdata = appdata_dir();
             let loaded = config::load_all(&appdata);
+            if let Err(e) = allow_assets(app, &loaded.settings.workspace_root) {
+                eprintln!("[agentboard] 문서 이미지 경로를 허용하지 못했습니다: {e}");
+            }
             let ws_path = appdata.join("workspace.json");
             let mut startup_errors = Vec::new();
             let mut saving = true;
@@ -537,6 +654,8 @@ pub fn run() {
             }
             // app → session messages: delivered off the hook/command threads
             bridge::start_worker(app.handle().clone());
+            // document tabs: mtime polling (Task 14)
+            start_doc_watcher(app.handle().clone());
             // spawning happens on the launcher thread: window creation is not blocked
             launcher::start(app.handle(), rx, initial);
 

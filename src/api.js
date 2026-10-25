@@ -173,3 +173,34 @@ export function inboxInstruct(id, text) {
 export function inboxRequestIssue(id) {
   return invoke('inbox_request_issue', { id });
 }
+
+/** `{input, output}` file lists (`{name, path, isMd}`) of the item's issue folder. */
+export function inboxIssueFiles(id) {
+  return invoke('inbox_issue_files', { id });
+}
+
+// ---------------------------------------------------------------- document tabs (Task 14)
+
+/** `{text, mtime, rel, path, root}`; the backend validates `path` on every call. */
+export function docRead(path) {
+  return invoke('doc_read', { path });
+}
+
+/** `.md` files under workspaceRoot (relative, `/`), at most 5,000. */
+export function docListMd(query = null) {
+  return invoke('doc_list_md', { query });
+}
+
+/** Poll the document shown in `paneId` (1 s); a change emits `doc-changed {paneId}`. */
+export function docWatch(paneId, path) {
+  return invoke('doc_watch', { paneId, path });
+}
+
+export function docUnwatch(paneId) {
+  return invoke('doc_unwatch', { paneId });
+}
+
+/** http(s) only, opened in the system browser by the backend. */
+export function docOpenUrl(url) {
+  return invoke('doc_open_url', { url });
+}

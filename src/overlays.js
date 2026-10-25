@@ -4,7 +4,7 @@
 // Pure logic lives in overlay-logic.js / fuzzy.js. No top-level DOM access (Node-importable).
 import * as api from './api.js';
 import { fuzzyRank } from './fuzzy.js';
-import { PICK_TIMEOUT_MS, TOAST_MS, pickerKey, listMove, dirChoices, newTabFlow, confirmKey } from './overlay-logic.js';
+import { PICK_TIMEOUT_MS, TOAST_MS, pickerKey, listMove, dirChoices, newTabFlow, confirmKey, docChoices } from './overlay-logic.js';
 
 const cfg = {
   /** router.pushModal(fn) -> token / router.popModal(token): a stack, copy mode may sit below. */
@@ -266,6 +266,20 @@ export async function palette(entries) {
   } catch (err) {
     toast(err);
   }
+}
+
+/**
+ * "문서 열기" (Task 14): fuzzy search over workspace-relative `.md` paths (only the best
+ * matches are drawn). Resolves the picked path or null.
+ */
+export async function pickDoc(paths) {
+  const r = await listOverlay({
+    title: '문서 열기',
+    placeholder: 'workspaceRoot 아래 md 파일 검색',
+    emptyText: paths.length ? '일치하는 문서가 없습니다' : 'md 파일이 없습니다',
+    compute: (q) => docChoices(paths, q).map((p) => ({ label: p, value: p })),
+  });
+  return r ? r.value : null;
 }
 
 /** Single-line text input. Enter → the text, Esc → null. */

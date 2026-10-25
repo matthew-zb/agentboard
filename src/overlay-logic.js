@@ -40,6 +40,16 @@ export function dirChoices(dirs, query) {
   return checkDirName(q) ? [...matches, create] : [create, ...matches];
 }
 
+/** Most rows the "문서 열기" list draws per keystroke (doc_list_md returns up to 5,000). */
+export const DOC_CHOICES_MAX = 200;
+
+/** "문서 열기": `paths` (workspace-root relative) fuzzy-filtered by `query`, best first, capped. */
+export function docChoices(paths, query, cap = DOC_CHOICES_MAX) {
+  return fuzzyRank(paths || [], query)
+    .slice(0, cap)
+    .map((i) => paths[i]);
+}
+
 /** Templates with the configured default first (unknown default → unchanged). */
 export function templateOrder(list, def) {
   if (!def || !list.includes(def)) return [...list];
@@ -187,7 +197,7 @@ const NOT_LISTED = new Set(['app.palette', 'pane.breakToTab']);
  * Palette entries `{label, hint?, action}` for the workspace. `bindings` = id → key string (null =
  * unbound); `has(id)` = a handler is registered. Actions:
  * `{type:'command', id}` | `{type:'ws', cmds}` | `{type:'rename', tab}` | `{type:'errors'}` |
- * `{type:'sidebar'}`.
+ * `{type:'sidebar'}` | `{type:'openDoc'}` (pick a workspace .md file → OpenDoc).
  */
 export function paletteItems(ws, { bindings = {}, has = () => true } = {}) {
   const out = [];
@@ -197,6 +207,7 @@ export function paletteItems(ws, { bindings = {}, has = () => true } = {}) {
   if (c && !c.tab.isDispatcher) out.push({ label: '탭 이름 바꾸기', action: { type: 'rename', tab: c.tab.id } });
   if (c && c.pane) out.push({ label: '현재 창을 새 탭으로 떼어내기', action: { type: 'ws', cmds: [{ type: 'breakPaneToTab', pane: c.pane }] } });
   out.push({ label: '설정 오류 보기', action: { type: 'errors' } });
+  out.push({ label: '문서 열기', hint: 'md 파일', action: { type: 'openDoc' } });
   out.push({ label: '사이드바 토글', action: { type: 'sidebar' } });
 
   const ids = [...new Set(Object.keys(bindings))];

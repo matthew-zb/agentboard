@@ -79,7 +79,12 @@ export function isApplet(pane) {
   return !!(pane && pane.kind && pane.kind.type === 'applet');
 }
 
-const APPLET_LABELS = { inbox: '인박스 (준비 중)' };
+const APPLET_LABELS = { inbox: '인박스 (준비 중)', doc: '문서 (준비 중)' };
+
+/** Document tab pane (`kind: {type: 'applet', kind: 'doc'}`, Task 14). */
+export function isDoc(pane) {
+  return isApplet(pane) && pane.kind.kind === 'doc';
+}
 
 /** Placeholder text for an applet until its real view exists. */
 export function appletLabel(pane) {
@@ -166,7 +171,7 @@ let hooks = {
  * (pane clicked while not focused), `report(error)` (status bar message),
  * `keyFilter(paneId, KeyboardEvent) -> bool` (xterm attachCustomKeyEventHandler: false = an app
  * shortcut, xterm must not process it), `syncTargets(paneId) -> paneId[] | null` (sync input), `onBell(paneId)` (terminal bell in a live pane),
- * `mountApplet(kind, paneId) -> {el, focus(), dispose()} | null` (applet view; null keeps the placeholder).
+ * `mountApplet(kind, paneId, model) -> {el, focus(), dispose()} | null` (applet view; null keeps the placeholder).
  */
 export function configurePanes(h) {
   hooks = { ...hooks, ...h };
@@ -210,7 +215,7 @@ function createAppletEntry(id, model) {
   const host = div('applet-host');
   let applet = null;
   try {
-    applet = hooks.mountApplet(model && model.kind && model.kind.kind, id);
+    applet = hooks.mountApplet(model && model.kind && model.kind.kind, id, model);
   } catch (err) {
     hooks.report(err);
   }
@@ -406,7 +411,8 @@ export function paneHeader(pane) {
   name.textContent = pane.name;
   const profile = document.createElement('span');
   profile.className = 'pane-profile';
-  profile.textContent = isApplet(pane) ? '애플릿' : pane.agent;
+  profile.textContent = isDoc(pane) ? '문서' : isApplet(pane) ? '애플릿' : pane.agent;
+  if (isDoc(pane) && pane.docPath) name.title = pane.docPath;
   h.append(status, name, profile);
   const warn = warnTitle(pane);
   if (warn) {

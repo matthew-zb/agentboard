@@ -19,6 +19,7 @@ import {
   routeText,
   shortTime,
 } from './inbox-logic.js';
+import { fileModeKey } from './docview-logic.js';
 
 // ---------------------------------------------------------------- DOM builders (pure-ish)
 
@@ -84,11 +85,21 @@ function field(doc, label, value) {
   return r;
 }
 
+/** Issue files flattened for the list: `[{where: 'input'|'output', name, path, isMd}]`. */
+export function flatFiles(files) {
+  if (!files) return [];
+  const out = [];
+  for (const where of ['input', 'output']) for (const f of files[where] || []) out.push({ ...f, where });
+  return out;
+}
+
 /**
  * The detail column for `item` (null → a hint): 제목·담당·출처·경로·확인할 것·리스크·타임라인·
- * 이슈 폴더, then the action buttons (`data-action`, disabled unless canDo).
+ * 이슈 폴더 (with its input/output files when `files` is given: `.md` rows open a document tab;
+ * `fileSel` = selected row index while `fileMode`), then the action buttons (`data-action`,
+ * disabled unless canDo).
  */
-export function buildDetail(doc, item, { focused = false } = {}) {
+export function buildDetail(doc, item, { focused = false, files = null, fileSel = -1, fileMode = false } = {}) {
   const root = el(doc, 'div', 'inbox-detail');
   root.classList.toggle('active', !!focused);
   if (!item) {
@@ -106,12 +117,40 @@ export function buildDetail(doc, item, { focused = false } = {}) {
   root.appendChild(section(doc, '확인할 것', item.check || []));
   root.appendChild(section(doc, '리스크 포인트', item.risk || [], 'risk'));
   if (item.refs && item.refs.length) root.appendChild(section(doc, '참고', item.refs));
-  // Task 14 attaches here: the issue folder's input/output file list (Enter → document tab).
+  // Task 14: the issue folder's input/output file list (Tab → list, Enter on .md → document tab).
   const issue = el(doc, 'div', 'inbox-sec inbox-issue');
   issue.appendChild(el(doc, 'div', 'inbox-sec-title', '이슈 폴더'));
   issue.appendChild(
     el(doc, 'div', 'inbox-path', item.issue ? item.issuePath || item.issue : '없음 — u: 담당 Manager에게 이슈 등록 요청'),
   );
+  if (item.issue && files) {
+    const flat = flatFiles(files);
+    issue.classList.toggle('file-mode', !!fileMode);
+    let i = 0;
+    for (const where of ['input', 'output']) {
+      const list = files[where] || [];
+      const box = el(doc, 'div', 'inbox-files');
+      box.appendChild(el(doc, 'div', 'inbox-files-title', `${where}/ (${list.length})`));
+      const ul = el(doc, 'ul', 'inbox-ul');
+      if (!list.length) ul.appendChild(el(doc, 'li', 'inbox-none', '없음'));
+      for (const f of list) {
+        const li = el(doc, 'li', 'inbox-file', f.name);
+        li.dataset.index = String(i);
+        li.title = f.path;
+        li.classList.toggle('md', !!f.isMd);
+        li.classList.toggle('sel', !!fileMode && i === fileSel);
+        ul.appendChild(li);
+        i++;
+      }
+      box.appendChild(ul);
+      issue.appendChild(box);
+    }
+    if (flat.length) {
+      issue.appendChild(
+        el(doc, 'div', 'inbox-hint', fileMode ? 'j/k: 이동 · Enter: 문서 탭으로 열기(.md) · Esc/Tab: 나가기' : 'Tab: 파일 목록 (.md는 Enter로 문서 탭)'),
+      );
+    }
+  }
   root.appendChild(issue);
 
   const tl = el(doc, 'div', 'inbox-sec inbox-timeline');
@@ -190,9 +229,13 @@ const deps = {
   confirm: async () => false,
   promptText: async () => null,
   choose: async () => null,
+  onOpenFile: () => {},
 };
 
-/** `{toast(msg, kind?), confirm(msg, opts), promptText(title, opts), choose(title, options)}` (app.js). */
+/**
+ * `{toast(msg, kind?), confirm(msg, opts), promptText(title, opts), choose(title, options),
+ * onOpenFile(path)}` (app.js; onOpenFile sends OpenDoc for a `.md` issue file).
+ */
 export function configureInbox(d) {
   Object.assign(deps, d);
 }
@@ -225,6 +268,37 @@ export function mountInbox() {
   root.className = 'inbox view-list';
   root.tabIndex = -1; // keydown target while the applet pane is focused
   const st = { sel: null, selIndex: 0, view: 'list', hideDone: loadHideDone(), busy: false, disposed: false };
+  // issue files of the item in the detail view (Task 14): fetched per item and inbox version
+  const fl = { id: null, version: -1, files: null, mode: false, sel: 0, seq: 0 };
+
+  const fetchFiles = (item, force = false) => {
+    if (!item || !item.issue) return;
+    if (!force && fl.id === item.id && fl.version === store.version) return;
+    const seq = ++fl.seq;
+    if (fl.id !== item.id) {
+      fl.files = null;
+      fl.mode = false;
+      fl.sel = 0;
+    }
+    fl.id = item.id;
+    fl.version = store.version;
+    api.inboxIssueFiles(item.id).then(
+      (files) => {
+        if (seq !== fl.seq || st.disposed) return;
+        fl.files = files;
+        const n = flatFiles(files).length;
+        if (fl.sel >= n) fl.sel = Math.max(0, n - 1);
+        if (!n) fl.mode = false;
+        view.render();
+      },
+      (err) => {
+        if (seq !== fl.seq || st.disposed) return;
+        fl.files = null;
+        fl.mode = false;
+        deps.toast(err);
+      },
+    );
+  };
 
   const list = () => visibleItems(store.items, { hideDone: st.hideDone });
   const selected = () => store.items.find((it) => it.id === st.sel) || null;
@@ -244,7 +318,14 @@ export function mountInbox() {
       const oldRows = root.querySelector('.inbox-rows');
       const rowsScroll = oldRows ? oldRows.scrollTop : 0;
       const l = buildList(document, items, { selected: st.sel, hideDone: st.hideDone, total: store.items.length });
-      const d = buildDetail(document, item, { focused: st.view === 'detail' });
+      const showFiles = st.view === 'detail' && item && item.issue && fl.id === item.id;
+      if (!showFiles) fl.mode = false;
+      const d = buildDetail(document, item, {
+        focused: st.view === 'detail',
+        files: showFiles ? fl.files : null,
+        fileSel: fl.sel,
+        fileMode: fl.mode,
+      });
       d.dataset.id = item ? item.id : '';
       const parts = [l, d];
       if (store.error) parts.unshift(el(document, 'div', 'inbox-error', `인박스를 읽을 수 없습니다: ${store.error}`));
@@ -258,7 +339,33 @@ export function mountInbox() {
       root.classList.toggle('view-detail', st.view === 'detail');
       const row = l.querySelector('.inbox-row.sel');
       if (row && row.scrollIntoView) row.scrollIntoView({ block: 'nearest' });
+      const frow = fl.mode ? d.querySelector('.inbox-file.sel') : null;
+      if (frow && frow.scrollIntoView) frow.scrollIntoView({ block: 'nearest' });
+      // after the paint: fetch (or refresh after an inbox change) the shown item's files
+      if (st.view === 'detail' && item && item.issue) fetchFiles(item);
     },
+  };
+
+  const openFile = (f) => {
+    if (!f) return;
+    if (!f.isMd) {
+      deps.toast(`.md 파일만 문서 탭으로 열 수 있습니다 — ${f.path}`, 'info');
+      return;
+    }
+    deps.onOpenFile(f.path);
+  };
+
+  /** Issue-file list mode (Task 14): j/k/Enter/Esc/Tab; false = not a list key. */
+  const fileKey = (e) => {
+    const k = fileModeKey(e);
+    if (!k) return false;
+    const list = flatFiles(fl.files);
+    if (k === 'leave') fl.mode = false;
+    else if (k === 'down') fl.sel = Math.min(list.length - 1, fl.sel + 1);
+    else if (k === 'up') fl.sel = Math.max(0, fl.sel - 1);
+    else if (k === 'open') openFile(list[fl.sel]);
+    view.render();
+    return true;
   };
 
   const markRead = (item) => {
@@ -383,6 +490,21 @@ export function mountInbox() {
 
   const onKey = (e) => {
     if (e.defaultPrevented || editable(e.target)) return; // the app key router / an input owns it
+    if (st.view === 'detail' && fl.mode && fileKey(e)) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    const files = flatFiles(fl.files);
+    if (isFocusTrapKey(e) && st.view === 'detail' && files.length && fl.id === st.sel) {
+      e.preventDefault(); // Tab steps into the issue-file list
+      const md = files.findIndex((f) => f.isMd);
+      fl.mode = true;
+      fl.sel = md >= 0 ? md : 0;
+      fetchFiles(selected(), true); // fresh list (agents may have written files meanwhile)
+      view.render();
+      return;
+    }
     if (isFocusTrapKey(e)) {
       e.preventDefault(); // no focus traversal into a neighbouring terminal (Task 14 may give Tab a job)
       return;
@@ -397,6 +519,14 @@ export function mountInbox() {
 
   const onMouse = (e) => {
     const t = e.target;
+    const frow = t && t.closest ? t.closest('.inbox-file[data-index]') : null;
+    if (frow) {
+      e.preventDefault(); // keep DOM focus on the applet
+      fl.mode = true;
+      fl.sel = Number(frow.dataset.index);
+      view.render();
+      return;
+    }
     const btn = t && t.closest ? t.closest('button[data-action]') : null;
     if (btn) {
       e.preventDefault(); // keep DOM focus on the applet
@@ -412,8 +542,14 @@ export function mountInbox() {
     }
   };
 
+  const onDbl = (e) => {
+    const frow = e.target && e.target.closest ? e.target.closest('.inbox-file[data-index]') : null;
+    if (frow) openFile(flatFiles(fl.files)[Number(frow.dataset.index)]);
+  };
+
   root.addEventListener('keydown', onKey);
   root.addEventListener('mousedown', onMouse);
+  root.addEventListener('dblclick', onDbl);
   subscribe(view);
   view.render();
 
@@ -427,6 +563,7 @@ export function mountInbox() {
       st.disposed = true;
       root.removeEventListener('keydown', onKey);
       root.removeEventListener('mousedown', onMouse);
+      root.removeEventListener('dblclick', onDbl);
       unsubscribe(view);
       root.remove();
     },

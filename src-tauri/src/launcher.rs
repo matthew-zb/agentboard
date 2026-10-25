@@ -72,6 +72,10 @@
 //!   `spawn_pane` arms it after `spawn` returns (no app lock held); `poll_trust` (prompt timer
 //!   thread) and the SessionStart / Notification handlers take it, release it, then read
 //!   `current_gen` / `ws` one at a time and change the model only via `execute`.
+//! * Documents (docs.rs, Task 14): `AppState::docs` (watch map) is a leaf. `doc_watch` takes
+//!   `ws` (released), then `loaded(read)` (released), then the map; the watcher thread takes
+//!   only the map (released before any file system call and before emitting `doc-changed`).
+//!   `OpenDoc` validates the path under `ws -> loaded(read)` (file system metadata only).
 //! * `loaded(write)` (Task 8): taken only by the MCP tool `create_manager_tab`, alone — no other
 //!   lock held, none taken inside — around the atomic config.json append and the in-memory
 //!   `config.tabs` push (and their rollback). It is never taken under `ws`; `execute` runs
@@ -383,6 +387,7 @@ pub fn run_effects(state: &AppState, fx: Effects) {
             state.tokens.revoke(id);
             crate::attention::forget(state, id);
             crate::agentcfg::remove_run_files(&state.run_dir, id);
+            state.docs.unwatch(id); // a closed document pane stops being polled
         } else {
             state.pty.kill(id);
         }
@@ -624,6 +629,7 @@ mod tests {
             role: None,
             team: None,
             session_name: None,
+            doc_path: None,
         }
     }
 

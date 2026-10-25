@@ -16,7 +16,7 @@ import {
   routeText,
   shortTime,
 } from '../../src/inbox-logic.js';
-import { buildList, buildDetail } from '../../src/inbox.js';
+import { buildList, buildDetail, flatFiles } from '../../src/inbox.js';
 
 const item = (id, state, read, extra = {}) => ({
   id,
@@ -299,4 +299,31 @@ test('keepSelection: a vanished item selects its neighbour at the old position',
   assert.equal(keepSelection(list, 'gone', 7), '10:00', 'clamped to the last');
   assert.equal(keepSelection(list, 'gone', -1), '12:00');
   assert.equal(keepSelection(list, '10:00', 0), '10:00', 'still listed → unchanged');
+});
+
+test('detail lists issue input/output files; .md rows are marked, selection only in file mode', () => {
+  const evil = '<img src=x onerror=alert(1)>.md';
+  const files = {
+    input: [{ name: '메일.md', path: 'C:/w/issues/x/input/메일.md', isMd: true }, { name: '첨부.pdf', path: 'p', isMd: false }],
+    output: [{ name: evil, path: 'q', isMd: true }],
+  };
+  assert.deepEqual(flatFiles(files).map((f) => [f.where, f.name]), [['input', '메일.md'], ['input', '첨부.pdf'], ['output', evil]]);
+  assert.deepEqual(flatFiles(null), []);
+  const it = item('10:00', 'in_progress', true, { issue: '20261025-x', issuePath: 'C:/w/issues/x' });
+  const doc = fakeDoc();
+  const d = buildDetail(doc, it, { focused: true, files, fileSel: 2, fileMode: true });
+  const rows = all(d).filter((e) => e.className === 'inbox-file');
+  assert.deepEqual(rows.map((r) => r.dataset.index), ['0', '1', '2']);
+  assert.deepEqual(rows.map((r) => r.classList.contains('md')), [true, false, true]);
+  assert.deepEqual(rows.map((r) => r.classList.contains('sel')), [false, false, true]);
+  assert.ok(d.textContent.includes(evil), 'file names are text');
+  assert.ok(!doc.created.some((e) => e.tagName === 'IMG'));
+  assert.ok(d.textContent.includes('Enter: 문서 탭으로 열기'));
+  // not in file mode: nothing selected, the hint says how to enter
+  const d2 = buildDetail(fakeDoc(), it, { focused: true, files, fileSel: 0, fileMode: false });
+  assert.ok(all(d2).filter((e) => e.className === 'inbox-file').every((r) => !r.classList.contains('sel')));
+  assert.ok(d2.textContent.includes('Tab: 파일 목록'));
+  // no issue → no list even when files are passed
+  const d3 = buildDetail(fakeDoc(), item('10:00', 'new', false), { files });
+  assert.ok(!all(d3).some((e) => e.className === 'inbox-file'));
 });

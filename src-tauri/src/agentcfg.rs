@@ -313,6 +313,7 @@ mod tests {
             role: Some(role),
             team: None,
             session_name: Some(session.into()),
+            doc_path: None,
         }
     }
 

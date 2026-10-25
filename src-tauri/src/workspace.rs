@@ -4,6 +4,7 @@
 //! never touch processes and instead return [`Effects`] (panes to spawn/kill) for the launcher.
 
 use crate::config::{check_relative, GroupSpec, Loaded, PaneSpec, Template};
+use crate::docs::{self, DOC_APPLET};
 use crate::layout::{Dir, LayoutNode, Side};
 use crate::profiles::resolve_cwd;
 use crate::roles::{session_name, Role};
@@ -96,6 +97,10 @@ impl PaneKind {
     pub fn is_applet(&self) -> bool {
         matches!(self, PaneKind::Applet { .. })
     }
+    /// A document tab's pane (`Applet { kind: "doc" }`).
+    pub fn is_doc(&self) -> bool {
+        matches!(self, PaneKind::Applet { kind } if kind == DOC_APPLET)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -132,6 +137,10 @@ pub struct Pane {
     /// that clears `attention` clears it too. Runtime state like `attention` (reset on load).
     #[serde(default)]
     pub attention_reason: Option<String>,
+    /// Document panes (`Applet { kind: "doc" }`, Task 14) only: the document as opened
+    /// (`<workspaceRoot>/<rel>`). Never trusted on use — `docs::resolve_doc` re-validates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_path: Option<PathBuf>,
 }
 
 impl Pane {
@@ -291,6 +300,13 @@ pub enum WsCommand {
     /// Kill and remove every pane of team `team` in `tab`; its column (and an emptied team
     /// area) disappears.
     RemoveTeam { tab: TabId, team: String },
+    // documents (Task 14)
+    /// User action only (inbox detail, palette — no MCP tool sends it). `path` (absolute or
+    /// relative to workspaceRoot) must be an existing `.md` inside workspaceRoot after
+    /// canonicalization. Already open → SetFocus to that pane; else a new one-pane tab named
+    /// after the file (phase-1 dedupe) in `group` (default: the focused group), which takes the
+    /// focus either way.
+    OpenDoc { path: String, group: Option<GroupId> },
     // state
     SetFocus { group: GroupId, tab: Option<TabId>, pane: Option<PaneId> },
     SetMaximized { tab: TabId, pane: Option<PaneId> },
@@ -419,7 +435,11 @@ impl Workspace {
         // broken state becomes an Err here instead of a corrupt workspace.json on the next start
         let recheck = matches!(
             cmd,
-            WsCommand::CreateTab { .. } | WsCommand::AddTeamPane { .. } | WsCommand::RemoveTeam { .. } | WsCommand::ClosePane { .. }
+            WsCommand::CreateTab { .. }
+                | WsCommand::AddTeamPane { .. }
+                | WsCommand::RemoveTeam { .. }
+                | WsCommand::ClosePane { .. }
+                | WsCommand::OpenDoc { .. }
         );
         let fx = next.apply_inner(cmd, loaded)?;
         if recheck {
@@ -522,13 +542,17 @@ impl Workspace {
         Ok(())
     }
 
-    /// Phase-2 invariants: applets carry no agent/role/team/session name; the Dispatcher role
+    /// Phase-2 invariants: applets carry no agent/role/team/session name; a document path is
+    /// set exactly on document panes; the Dispatcher role
     /// belongs to the Dispatcher tab only; at most one handover tab; per tab at most one
     /// standing-role pane, and its role equals the tab's role; session names are unique.
     fn check_roles(&self) -> Result<(), String> {
         for (pid, p) in &self.panes {
             if p.kind.is_applet() && (p.role.is_some() || p.team.is_some() || p.session_name.is_some() || !p.agent.is_empty()) {
                 return Err(format!("애플릿 창 '{pid}'에 에이전트·역할·팀·세션 이름이 있습니다"));
+            }
+            if p.kind.is_doc() != p.doc_path.is_some() {
+                return Err(format!("창 '{pid}'의 문서 경로가 창 종류와 맞지 않습니다"));
             }
         }
         if self.tabs.values().filter(|t| t.role == Some(Role::Handover)).count() > 1 {
@@ -720,6 +744,7 @@ impl Workspace {
                         role: None,
                         team: None,
                         session_name: None,
+                        doc_path: None,
                     },
                 );
                 let t = self.tabs.get_mut(&src.tab).unwrap();
@@ -845,6 +870,7 @@ impl Workspace {
                 fx.spawn.push((id, true));
             }
             RemoveTeam { tab, team } => fx.kill = self.remove_team(&tab, &team)?,
+            OpenDoc { path, group } => fx = self.open_doc(&path, group, loaded)?,
             SetFocus { group, tab, pane } => {
                 let g = self.group(&group)?;
                 let tid = match (&tab, &pane) {
@@ -1054,6 +1080,7 @@ impl Workspace {
                 role: Some(role),
                 team: Some(team.to_string()),
                 session_name: Some(sname),
+                doc_path: None,
             },
         );
         match &lead {
@@ -1192,6 +1219,82 @@ impl Workspace {
         Ok(ids)
     }
 
+    // ───────── documents (Task 14) ─────────
+
+    /// `OpenDoc`: validate, then focus the pane already showing that document, or make a new
+    /// document tab. Either way focus moves (user action).
+    fn open_doc(&mut self, path: &str, group: Option<GroupId>, loaded: &Loaded) -> Result<Effects, String> {
+        if let Some(g) = &group {
+            self.group(g)?;
+        }
+        let root = &loaded.settings.workspace_root;
+        let doc = docs::resolve_doc(root, path)?;
+        // an open tab with the same document: compare validated forms (spelling-independent);
+        // a stored path that no longer validates (file gone) simply does not match
+        let existing = self.panes.values().find(|p| {
+            p.kind.is_doc()
+                && p.doc_path.as_ref().is_some_and(|d| docs::resolve_doc(root, &d.to_string_lossy()).is_ok_and(|v| v.rel == doc.rel))
+        });
+        if let Some(p) = existing {
+            let (pid, tid) = (p.id.clone(), p.tab.clone());
+            let gid = self.group_of_tab(&tid).cloned().ok_or_else(|| no_tab(&tid))?;
+            if self.tabs[&tid].maximized_pane_id.as_ref().is_some_and(|m| *m != pid) {
+                self.tabs.get_mut(&tid).unwrap().maximized_pane_id = None;
+            }
+            self.apply_inner(WsCommand::SetFocus { group: gid, tab: Some(tid), pane: Some(pid) }, loaded)?;
+            return Ok(Effects::default());
+        }
+        let gid = group.unwrap_or_else(|| self.focus.group_id.clone());
+        let name = self.unique_tab_name(&doc.name());
+        self.check_tab_name(&name, None)?;
+        let tid = self.new_tab_id();
+        let pid = self.new_pane_id();
+        self.panes.insert(
+            pid.clone(),
+            Pane {
+                id: pid.clone(),
+                name: doc.name(),
+                tab: tid.clone(),
+                agent: String::new(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                cwd: root.clone(),
+                prompt: None,
+                status: PaneStatus::Starting,
+                attention: false,
+                prompt_warning: false,
+                attention_reason: None,
+                kind: PaneKind::Applet { kind: DOC_APPLET.into() },
+                role: None,
+                team: None,
+                session_name: None,
+                doc_path: Some(doc.abs.clone()),
+            },
+        );
+        self.tabs.insert(
+            tid.clone(),
+            Tab {
+                id: tid.clone(),
+                name,
+                dir: String::new(),
+                template: String::new(),
+                is_dispatcher: false,
+                workspace: root.clone(),
+                layout: LayoutNode::Leaf(pid.clone()),
+                last_focused_pane_id: pid.clone(),
+                maximized_pane_id: None,
+                sync_input: false,
+                role: None,
+                team_seq: BTreeMap::new(),
+            },
+        );
+        self.groups.get_mut(&gid).unwrap().tab_ids.push(tid.clone());
+        let prev = self.focus_location();
+        self.move_focus(prev, &gid, &tid);
+        // the launcher marks the applet Running (no process)
+        Ok(Effects { spawn: vec![(pid, false)], kill: Vec::new() })
+    }
+
     // ───────── helpers ─────────
 
     fn pane(&self, id: &str) -> Result<&Pane, String> {
@@ -1313,6 +1416,7 @@ impl Workspace {
                         role: pane_role,
                         team: None,
                         session_name: pane_role.map(|r| session_name(name, r, None, 0)),
+                        doc_path: None,
                     },
                 );
                 pid
@@ -3063,5 +3167,160 @@ mod tests {
             .unwrap();
         assert_eq!(ws.focus_location(), loc);
         assert_eq!(ws.groups[&g].tab_ids.last(), Some(&tab(&ws, "bg").id));
+    }
+
+    // ── phase 2: document tabs (Task 14) ──
+
+    /// `loaded_groups()` with a real workspaceRoot holding a few documents.
+    fn doc_ws() -> (tempfile::TempDir, Loaded, Workspace) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut l = loaded_groups();
+        l.settings.workspace_root = tmp.path().to_path_buf();
+        for f in ["HANDOVER.md", "billing/issues/x/output/보고서.md", "api/HANDOVER.md", "notes.txt", "dispatcher.md"] {
+            let p = tmp.path().join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "# x\n").unwrap();
+        }
+        let ws = Workspace::from_config(&l);
+        (tmp, l, ws)
+    }
+    fn open(path: &str) -> WsCommand {
+        WsCommand::OpenDoc { path: path.into(), group: None }
+    }
+    fn doc_panes(ws: &Workspace) -> Vec<&Pane> {
+        ws.panes.values().filter(|p| p.kind == PaneKind::Applet { kind: DOC_APPLET.into() }).collect()
+    }
+    fn has_hangul(s: &str) -> bool {
+        s.chars().any(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c))
+    }
+
+    #[test]
+    fn open_doc_rejects_outside_root_and_non_md() {
+        let (tmp, l, mut ws) = doc_ws();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.md"), "s").unwrap();
+        let before = ws.clone();
+        let secret = outside.path().join("secret.md").to_string_lossy().into_owned();
+        for bad in [secret.as_str(), "../secret.md", "notes.txt", "billing", "missing.md", ""] {
+            let e = ws.apply(open(bad), &l).unwrap_err();
+            assert!(has_hangul(&e), "Korean error for {bad:?}: {e}");
+            assert_eq!(ws, before, "{bad:?}: model untouched");
+        }
+        // a junction under the root pointing outside is refused after resolution
+        if crate::issues::tests::link_dir(&tmp.path().join("lnk"), outside.path()) {
+            assert!(ws.apply(open("lnk/secret.md"), &l).unwrap_err().contains("밖"));
+            assert_eq!(ws, before);
+        }
+        // an unknown group is an error too
+        let cmd = WsCommand::OpenDoc { path: "HANDOVER.md".into(), group: Some("g99".into()) };
+        assert!(ws.apply(cmd, &l).is_err());
+        assert_eq!(ws, before);
+    }
+
+    #[test]
+    fn open_doc_reuses_existing_tab() {
+        let (tmp, l, mut ws) = doc_ws();
+        let work = gid_named(&ws, "work");
+        let control = gid_named(&ws, "control");
+        // focus the work group, then open: new tab there, named after the file, focused
+        let api = tab(&ws, "api").id.clone();
+        ws.apply(WsCommand::SetFocus { group: work.clone(), tab: Some(api.clone()), pane: None }, &l).unwrap();
+        let fx = ws.apply(open("billing/issues/x/output/보고서.md"), &l).unwrap();
+        let t = tab(&ws, "보고서.md").clone();
+        assert_eq!(group_of(&ws, &t.id), work);
+        assert_eq!(ws.focus_location(), Some(Location { group_id: work.clone(), tab_id: t.id.clone() }));
+        assert_eq!(ws.last_location, Some(Location { group_id: work.clone(), tab_id: api.clone() }));
+        let pid = t.layout.leaves()[0].clone();
+        let p = &ws.panes[&pid];
+        assert_eq!(p.kind, PaneKind::Applet { kind: DOC_APPLET.into() });
+        assert_eq!(p.name, "보고서.md");
+        assert_eq!(p.agent, "");
+        assert_eq!((p.role, p.team.clone(), p.session_name.clone()), (None, None, None));
+        assert_eq!(p.doc_path.as_deref(), Some(tmp.path().join("billing/issues/x/output/보고서.md").as_path()));
+        assert_eq!(fx.spawn, vec![(pid.clone(), false)], "the launcher marks the applet Running");
+        assert!(fx.kill.is_empty());
+        assert!(!t.is_dispatcher && t.role.is_none());
+        assert_eq!(t.workspace, tmp.path());
+        valid(&ws);
+
+        // the same file under another spelling, from another group: focus moves to the tab
+        ws.apply(WsCommand::SetFocus { group: control.clone(), tab: None, pane: None }, &l).unwrap();
+        let n = ws.tabs.len();
+        let abs = tmp.path().join("billing\\issues\\x\\..\\x\\output\\보고서.md");
+        let fx = ws.apply(open(&abs.to_string_lossy()), &l).unwrap();
+        assert_eq!(ws.tabs.len(), n, "no second tab");
+        assert!(fx.spawn.is_empty());
+        assert_eq!(ws.focus_location(), Some(Location { group_id: work.clone(), tab_id: t.id.clone() }));
+        assert_eq!(ws.tabs[&t.id].last_focused_pane_id, pid);
+
+        // same file name elsewhere → phase-1 dedupe; reserved name too
+        ws.apply(open("HANDOVER.md"), &l).unwrap();
+        ws.apply(open("api/HANDOVER.md"), &l).unwrap();
+        assert!(has_tab(&ws, "HANDOVER.md") && has_tab(&ws, "HANDOVER.md-2"));
+        ws.apply(open("dispatcher.md"), &l).unwrap();
+        assert!(has_tab(&ws, "dispatcher.md"));
+        assert_eq!(doc_panes(&ws).len(), 4);
+
+        // an explicit group gets the tab and the focus (opening a document is a user action)
+        let fresh = tmp.path().join("new.md");
+        std::fs::write(&fresh, "x").unwrap();
+        ws.apply(WsCommand::OpenDoc { path: "new.md".into(), group: Some(control.clone()) }, &l).unwrap();
+        let nt = tab(&ws, "new.md").id.clone();
+        assert_eq!(group_of(&ws, &nt), control);
+        assert_eq!(ws.focus_location(), Some(Location { group_id: control.clone(), tab_id: nt }));
+        valid(&ws);
+
+        // a maximize hiding the doc pane is cleared on reuse
+        ws.apply(WsCommand::SetGroupMaximized { group: Some(control.clone()) }, &l).unwrap();
+        ws.apply(open("billing/issues/x/output/보고서.md"), &l).unwrap();
+        assert_eq!(ws.group_maximized, None);
+        assert_eq!(ws.focus.group_id, work);
+
+        // closing the tab closes the pane; reopening makes a new tab
+        ws.apply(WsCommand::CloseTab { tab: t.id.clone() }, &l).unwrap();
+        assert!(!ws.panes.contains_key(&pid));
+        ws.apply(open("billing/issues/x/output/보고서.md"), &l).unwrap();
+        assert!(has_tab(&ws, "보고서.md"));
+        // wire shape
+        let v = serde_json::to_value(open("a.md")).unwrap();
+        assert_eq!(v, serde_json::json!({"type":"openDoc","path":"a.md","group":null}));
+    }
+
+    #[test]
+    fn doc_tab_persists_and_restores() {
+        let (tmp, l, mut ws) = doc_ws();
+        ws.apply(open("billing/issues/x/output/보고서.md"), &l).unwrap();
+        let pid = doc_panes(&ws)[0].id.clone();
+        let file = tmp.path().join("ws.json");
+        crate::persist::save_atomic(&file, &ws).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(v["panes"][&pid]["kind"], serde_json::json!({"type":"applet","kind":"doc"}));
+        assert!(v["panes"][&pid]["docPath"].as_str().unwrap().ends_with("보고서.md"));
+        // the document vanishing does not break the restore (the tab shows "not found")
+        std::fs::remove_file(tmp.path().join("billing/issues/x/output/보고서.md")).unwrap();
+        let mut back = crate::persist::load(&file).unwrap().unwrap();
+        let fx = crate::persist::prepare_restored(&mut back);
+        assert!(fx.spawn.contains(&(pid.clone(), false)));
+        assert_eq!(back.panes[&pid].doc_path, ws.panes[&pid].doc_path);
+        assert_eq!(back.panes[&pid].kind, ws.panes[&pid].kind);
+
+        // invariants: a doc pane needs its path, nothing else may carry one
+        let mut broken = back.clone();
+        broken.panes.get_mut(&pid).unwrap().doc_path = None;
+        assert!(broken.normalize_and_validate().unwrap_err().contains(&pid));
+        let mut broken = back.clone();
+        let other = broken.panes.keys().find(|k| **k != pid).unwrap().clone();
+        broken.panes.get_mut(&other).unwrap().doc_path = Some(tmp.path().join("HANDOVER.md"));
+        assert!(broken.normalize_and_validate().is_err());
+        let mut broken = back.clone();
+        broken.panes.get_mut(&pid).unwrap().agent = "claude".into();
+        assert!(broken.normalize_and_validate().is_err());
+        // a pane without the field (phase 1 / before Task 14) loads with None
+        let mut raw = v.clone();
+        let some_terminal = raw["panes"].as_object().unwrap().keys().find(|k| **k != pid).unwrap().clone();
+        raw["panes"][&some_terminal].as_object_mut().unwrap().remove("docPath");
+        let mut w: Workspace = serde_json::from_value(raw).unwrap();
+        assert_eq!(w.panes[&some_terminal].doc_path, None);
+        w.normalize_and_validate().unwrap();
     }
 }

@@ -52,8 +52,10 @@ import {
   newTabWizard,
   promptText,
   choose,
+  pickDoc,
 } from './overlays.js';
 import { mountInbox, configureInbox } from './inbox.js';
+import { mountDoc, configureDocView } from './docview.js';
 import { configureCopyMode, toggleCopyMode, copyActive, pruneCopySessions } from './copy-ui.js';
 import { pickCommands, paletteItems, missingDirsFlow, closeFlow } from './overlay-logic.js';
 import { hiddenAttentionTabs, statusEntryText } from './attention-logic.js';
@@ -201,9 +203,31 @@ function runPaletteAction(a) {
     case 'sidebar':
       toggleSidebar();
       return undefined;
+    case 'openDoc':
+      return openDocPicker();
     default:
       return undefined;
   }
+}
+
+// ---------------------------------------------------------------- document tabs (Task 14)
+
+/** OpenDoc (user action: the new or existing document tab takes the focus). */
+function openDoc(path) {
+  enqueue(() => execute([{ type: 'openDoc', path, group: null }]));
+}
+
+/** Palette "문서 열기": workspace .md files → fuzzy pick → OpenDoc. */
+async function openDocPicker() {
+  let paths;
+  try {
+    paths = await api.docListMd();
+  } catch (err) {
+    showError(err);
+    return;
+  }
+  const path = await pickDoc(Array.isArray(paths) ? paths : []);
+  if (path) openDoc(path);
 }
 
 async function renameTab(tabId) {
@@ -475,9 +499,11 @@ configurePanes({
   onBell,
   // Applet panes (Task 10): the inbox view replaces the xterm. Its keys are handled on the
   // applet element (bubble phase), so the router's app chords always win.
-  mountApplet: (kind) => (kind === 'inbox' ? mountInbox() : null),
+  // Document tabs (Task 14) mount the markdown viewer the same way.
+  mountApplet: (kind, paneId, model) => (kind === 'inbox' ? mountInbox() : kind === 'doc' ? mountDoc(paneId, model) : null),
 });
-configureInbox({ toast, confirm, promptText, choose });
+configureInbox({ toast, confirm, promptText, choose, onOpenFile: openDoc });
+configureDocView({ toast, prompt, choose });
 // Tab drag & drop (spec 6.6). Errors from MoveTab/SplitGroupWith are toasted by sendCmd.
 installDnd($('groups'), {
   getWs: () => (current ? current.workspace : null),
