@@ -20,7 +20,7 @@
 //!   clone, releases it, then writes the file — never `ws` during IO, never `emit_lock`.
 //! * `prompts`, `channels`, `effects` and `emit_lock` are leaves: nothing is acquired while
 //!   holding them.
-//! * Never call `PtyManager::spawn/kill/write/resize/attach_with` while holding `ws`,
+//! * Never call `PtyManager::spawn/kill/remove/write/resize/attach_with` while holding `ws`,
 //!   `loaded` or `prompts`: spawn/kill/write can block, and the PTY threads call back into
 //!   the sink (`output` -> prompts, `exited` -> ws).
 //! * Never emit events while holding `ws`: snapshots are cloned under the lock, emitted after.
@@ -226,11 +226,18 @@ pub fn start(app: &AppHandle, rx: mpsc::Receiver<Effects>, initial: Effects) {
 }
 
 /// Execute effects: kills first, then spawns, then one `workspace-changed`.
-/// Holds no app lock while calling into PtyManager.
+/// Holds no app lock while calling into PtyManager. A killed pane that is no longer in the
+/// model (closed, not restarted) is removed from PtyManager and its output channel dropped.
 pub fn run_effects(state: &AppState, fx: Effects) {
     for id in &fx.kill {
         state.prompts.lock().unwrap().remove(id);
-        state.pty.kill(id);
+        let gone = state.ws.lock().unwrap().pane_by_id(id).is_none();
+        if gone {
+            state.pty.remove(id);
+            state.sink.drop_channel(id);
+        } else {
+            state.pty.kill(id);
+        }
     }
     if fx.spawn.is_empty() {
         return;

@@ -282,3 +282,32 @@ fn respawn_starts_with_empty_ring() {
     assert!(snap.contains("second-run-marker"));
     assert!(!snap.contains("first-run-marker"), "old process output leaked: {snap:?}");
 }
+
+#[test]
+fn remove_kills_and_forgets_the_pane() {
+    let (sink, m) = setup();
+    m.spawn("rm1", spec("ping", &["-n", "30", "127.0.0.1"], cwd())).unwrap();
+    assert!(wait_until(|| !m.snapshot("rm1").is_empty()), "no output");
+    let pid = m.pid("rm1").unwrap();
+    m.remove("rm1");
+    assert!(!m.is_running("rm1"));
+    assert!(m.snapshot("rm1").is_empty());
+    assert!(m.pid("rm1").is_none());
+    assert!(!m.attach_with("rm1", |_| panic!("must not run")));
+    assert!(m.write("rm1", b"x").is_err());
+    assert!(wait_until(|| sink.exit("rm1").is_some()), "removed process was not killed");
+    assert!(wait_until(|| !pid_alive(pid)));
+    // unknown / already removed ids are a no-op
+    m.remove("rm1");
+    m.remove("never-existed");
+    // an exited pane can be removed too, and the id can be spawned again afterwards
+    m.spawn("rm2", spec("cmd.exe", &["/c", "echo old-marker"], cwd())).unwrap();
+    assert!(wait_until(|| sink.exit("rm2").is_some()));
+    m.remove("rm2");
+    assert!(m.snapshot("rm2").is_empty());
+    sink.exits.lock().unwrap().clear();
+    m.spawn("rm2", spec("cmd.exe", &["/c", "echo new-marker"], cwd())).unwrap();
+    assert!(wait_until(|| sink.exit("rm2").is_some()));
+    let snap = String::from_utf8_lossy(&m.snapshot("rm2")).into_owned();
+    assert!(snap.contains("new-marker") && !snap.contains("old-marker"), "{snap:?}");
+}

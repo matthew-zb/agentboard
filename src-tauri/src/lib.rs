@@ -72,6 +72,11 @@ impl AppSink {
     fn new(app: AppHandle) -> Self {
         AppSink { app, channels: Mutex::new(HashMap::new()) }
     }
+
+    /// Forget the pane's output channel (the pane left the model). `channels` is a leaf lock.
+    pub(crate) fn drop_channel(&self, id: &str) {
+        self.channels.lock().unwrap().remove(id);
+    }
 }
 
 impl PtySink for AppSink {

@@ -344,6 +344,16 @@ impl PtyManager {
         }
     }
 
+    /// The pane left the model: kill its process if still running and forget it (entry and
+    /// ring are freed once its threads finish). Afterwards the id is unknown (`attach_with`
+    /// false, empty snapshot); `spawn` may reuse it. Unknown ids are a no-op.
+    pub fn remove(&self, id: &str) {
+        let Some(e) = self.panes.lock().unwrap().remove(id) else { return };
+        if e.running.load(Ordering::Acquire) {
+            let _ = e.killer.lock().unwrap().kill();
+        }
+    }
+
     /// Kill every pane's process (app exit). The Job Object still reaps grandchildren.
     pub fn kill_all(&self) {
         let entries: Vec<Arc<Entry>> = self.panes.lock().unwrap().values().cloned().collect();
