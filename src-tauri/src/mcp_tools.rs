@@ -499,9 +499,16 @@ fn lead_of(state: &AppState, tab: &str, team: &str) -> Option<Value> {
     Some(json!({ "team": team, "pane": p.id, "sessionName": p.session_name, "existing": true }))
 }
 
-/// One line (a prompt is typed into the PTY; a newline would submit early).
+/// One line (a prompt is typed into the PTY; a newline would submit early) without control
+/// characters (an ESC sequence or ^C would leave the paste and act as keystrokes — review #7):
+/// line breaks and tabs become spaces, every other control character is dropped.
 fn one_line(s: &str) -> String {
-    s.split(['\r', '\n']).map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ")
+    s.split(['\r', '\n'])
+        .map(|l| l.chars().filter_map(|c| if c == '\t' { Some(' ') } else if c.is_control() { None } else { Some(c) }).collect::<String>())
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn with_extra(base: String, extra: Option<&str>) -> String {
@@ -999,6 +1006,16 @@ mod tests {
         crate::launcher::execute(&f.state, WsCommand::CloseTab { tab: b }).unwrap();
         assert_eq!(f.call("ops", "inbox_list", json!({})).unwrap().as_array().unwrap().len(), 0);
         assert_eq!(f.call("dispatcher", "inbox_list", json!({})).unwrap().as_array().unwrap().len(), 1);
+    }
+
+    /// Review #7: an extra prompt typed into the new session's PTY carries no control
+    /// characters (an ESC sequence such as end-of-paste or ^C would act as keystrokes).
+    #[test]
+    fn extra_prompt_loses_control_characters() {
+        let p = with_extra("기본".into(), Some("a\x1b[201~b\x03c\r\nd\te"));
+        assert_eq!(p, "기본 추가 지시: a[201~bc d e");
+        assert!(!p.chars().any(char::is_control), "{p:?}");
+        assert_eq!(with_extra("기본".into(), Some("\x1b\x03")), "기본");
     }
 
     #[test]
