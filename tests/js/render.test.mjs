@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { leafIds, containsLeaf, normalizeSizes, dragSizes, pxToPct, MIN_SIZE } from '../../src/layout.js';
 import { tabHasAttention } from '../../src/tabs.js';
-import { statusSymbol, warnTitle, isDead, attachAction, staleIds, sizeChanged } from '../../src/pane.js';
+import { statusSymbol, warnTitle, isDead, attachAction, keepRestartMark, staleIds, sizeChanged } from '../../src/pane.js';
 import {
   focusedPaneId,
   visibleGroupIds,
@@ -86,6 +86,26 @@ test('attachAction: attach once, re-attach after restart, never while starting/f
   assert.equal(attachAction(null, 'exited', false, false), 'attach'); // ring still readable
   assert.equal(attachAction('running', 'exited', true, false), 'none');
   assert.equal(attachAction(null, 'failed', false, false), 'none');
+});
+
+test('attachAction: restarted process that exits before running is re-attached', () => {
+  assert.equal(attachAction('starting', 'exited', true, false), 'reattach'); // starting → exited
+  assert.equal(attachAction('running', 'exited', true, true), 'reattach'); // starting snapshot skipped
+  assert.equal(attachAction('exited', 'exited', true, false), 'none');
+});
+
+test('keepRestartMark: consumed by any attach, dropped on a terminal state', () => {
+  // never-attached failed pane restarted: starting keeps the mark, first attach consumes it
+  assert.equal(keepRestartMark('starting', attachAction('failed', 'starting', false, true), true), true);
+  assert.equal(keepRestartMark('running', attachAction('starting', 'running', false, true), true), false);
+  // reattach consumes it
+  assert.equal(keepRestartMark('running', 'reattach', true), false);
+  // restart ends failed / exited without attaching
+  assert.equal(keepRestartMark('failed', attachAction('starting', 'failed', false, true), true), false);
+  assert.equal(keepRestartMark('exited', 'none', true), false);
+  assert.equal(keepRestartMark('starting', 'none', false), false);
+  // after the mark is dropped, an unrelated running snapshot does not reset the terminal
+  assert.equal(attachAction('running', 'running', true, false), 'none');
 });
 
 test('staleIds lists panes missing from the snapshot', () => {

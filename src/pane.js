@@ -46,6 +46,8 @@ export function isDead(pane) {
  * - never attached + running/exited → 'attach' (exited still has its ring buffer)
  * - attached + running, coming from another state or after a local restart → 'reattach'
  *   (a restarted process has a fresh ring and the old channel is gone)
+ * - attached + exited right after a restart (starting → exited, or marked) → 'reattach': the new
+ *   process died before it was seen running; its output is only in the fresh ring
  * - otherwise 'none' (starting: no process yet; failed: nothing to show)
  */
 export function attachAction(prevState, state, attached, restartMarked) {
@@ -54,8 +56,19 @@ export function attachAction(prevState, state, attached, restartMarked) {
     if (restartMarked || prevState !== 'running') return 'reattach';
     return 'none';
   }
-  if (state === 'exited' && !attached) return 'attach';
+  if (state === 'exited') {
+    if (!attached) return 'attach';
+    if (restartMarked || prevState === 'starting') return 'reattach';
+  }
   return 'none';
+}
+
+/**
+ * Whether a local restart mark survives this status. It is consumed by any (re)attach and
+ * dropped when the restart ends in a terminal state (exited/failed) without one.
+ */
+export function keepRestartMark(state, action, marked) {
+  return !!marked && action === 'none' && state !== 'failed' && state !== 'exited';
 }
 
 /** Known pane ids that are no longer in the snapshot's `panes` map. */
@@ -174,6 +187,7 @@ function createEntry(id) {
     lastSize: null,
     visible: false,
     fitQueued: false,
+    resizeTimer: null,
     writeFailed: false,
     ro: null,
   };
@@ -286,17 +300,13 @@ export function syncPane(pane, ctx) {
   e.el.classList.toggle('dead', isDead(pane));
   e.restartLine.classList.toggle('hidden', !isDead(pane));
 
-  if (prev !== state) {
+  const action = attachAction(prev, state, e.attachState !== 'none', e.restartMarked);
+  e.restartMarked = keepRestartMark(state, action, e.restartMarked);
+  if (prev !== state && action === 'none') {
     if (state === 'exited' && e.attachState === 'ok') e.term.write(`\r\n\x1b[90m[프로세스 종료: ${pane.status.code}]\x1b[0m\r\n`);
     if (state === 'failed') e.term.write(`\r\n\x1b[31m[${pane.status.message || '실행 실패'}]\x1b[0m\r\n`);
   }
-
-  const action = attachAction(prev, state, e.attachState !== 'none', e.restartMarked);
-  if (action === 'attach') attach(e, false);
-  else if (action === 'reattach') {
-    e.restartMarked = false;
-    attach(e, true);
-  }
+  if (action !== 'none') attach(e, action === 'reattach');
   e.prevState = state;
   return e;
 }
@@ -305,6 +315,7 @@ function attach(e, reset) {
   const gen = ++e.gen;
   const { term, id } = e;
   if (reset) term.reset();
+  e.restartMarked = false; // any attach consumes a pending restart
   e.attachState = 'pending';
   e.suppressInput = true;
   e.live = false;
@@ -375,11 +386,20 @@ export function fitPane(paneId) {
   } catch (_) {
     return;
   }
+  // The xterm refits immediately; pty_resize is debounced so a border drag sends one resize.
+  clearTimeout(e.resizeTimer);
+  e.resizeTimer = setTimeout(() => sendResize(e), RESIZE_DEBOUNCE_MS);
+}
+
+const RESIZE_DEBOUNCE_MS = 100;
+
+function sendResize(e) {
+  if (entries.get(e.id) !== e) return; // disposed
   const { cols, rows } = e.term;
   const running = e.model && e.model.status && e.model.status.state === 'running';
   if (e.attachState !== 'ok' || !running || !sizeChanged(e.lastSize, cols, rows)) return;
   e.lastSize = { cols, rows };
-  api.resize(paneId, cols, rows).catch(() => {
+  api.resize(e.id, cols, rows).catch(() => {
     e.lastSize = null; // retry on the next fit
   });
 }
@@ -397,6 +417,7 @@ export function disposePane(paneId) {
   const e = entries.get(paneId);
   if (!e) return;
   e.gen++; // ignore late attach callbacks
+  clearTimeout(e.resizeTimer);
   entries.delete(paneId);
   e.ro.disconnect();
   try {
