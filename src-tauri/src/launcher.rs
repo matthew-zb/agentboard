@@ -47,8 +47,7 @@
 //!   `spawn_pane` takes them one at a time (issue the role pane's token, read the URL) before
 //!   `loaded(read)`; `plan_spawn` then writes the pane's run files under `loaded(read)` only
 //!   (small local files, no other lock, never under `ws`).
-//! * Control server (control.rs): `AppState::hooks` (HookRouter map) and
-//!   `AppState::handoffs` are leaves. The caller of a request is computed by taking `tokens`
+//! * Control server (control.rs): `AppState::hooks` (HookRouter map) is a leaf. The caller of a request is computed by taking `tokens`
 //!   (released) and then `ws` (released); nothing is held across an `.await`. Tool bodies and
 //!   hook handlers run on blocking threads and follow the rules here (model changes only via
 //!   `execute`, R13).
@@ -76,6 +75,11 @@
 //!   `ws` (released), then `loaded(read)` (released), then the map; the watcher thread takes
 //!   only the map (released before any file system call and before emitting `doc-changed`).
 //!   `OpenDoc` validates the path under `ws -> loaded(read)` (file system metadata only).
+//! * Nightly (nightly.rs, Task 11): the machine lock and the wake flag of `AppState::nightly`
+//!   are leaves (`handoff_done` takes the machine, releases it, then wakes). The scheduler
+//!   thread takes `loaded(read)`, `ws`, `last_input` and the machine one at a time (each
+//!   released) and performs its actions (`bridge::send` / `discard`, `execute`, the inbox,
+//!   the `nightly.json` write) with no lock held.
 //! * `loaded(write)` (Task 8): taken only by the MCP tool `create_manager_tab`, alone — no other
 //!   lock held, none taken inside — around the atomic config.json append and the in-memory
 //!   `config.tabs` push (and their rollback). It is never taken under `ws`; `execute` runs
@@ -1030,6 +1034,41 @@ mod tests {
         state.prompts.lock().unwrap().get_mut(id).unwrap().bind(gen2);
         assert!(on_exited(state, id, gen2, 0));
         assert_eq!(job_gen(state, id), None);
+    }
+
+    #[test]
+    fn restart_fresh_is_generation_safe_and_reinjects_prompt() {
+        let rt = runtime();
+        let (state, id) = (&rt.state, rt.pane.as_str());
+        state.ws.lock().unwrap().panes.get_mut(id).unwrap().prompt = Some("echo start".into());
+        let fx = initial_effects(&state.ws.lock().unwrap());
+        run_effects(state, fx);
+        let gen1 = state.pty.current_gen(id).expect("spawned");
+        // the first prompt is consumed (as if injected): no job left for gen1
+        state.prompts.lock().unwrap().remove(id);
+
+        // nightly path: execute → the worker queue (nothing runs inline) → run_effects
+        execute(state, WsCommand::RestartPaneFresh { pane: id.to_string() }).unwrap();
+        assert_eq!(status(state, id), PaneStatus::Starting);
+        assert_eq!(state.pty.current_gen(id), Some(gen1), "execute itself kills/spawns nothing");
+        let fx = rt.rx.try_recv().expect("effects submitted to the launcher worker");
+        assert_eq!(fx, Effects { spawn: vec![(id.to_string(), true)], kill: vec![id.to_string()] });
+        run_effects(state, fx);
+        let gen2 = state.pty.current_gen(id).expect("respawned");
+        assert_ne!(gen1, gen2, "a new process (fresh session)");
+        assert_eq!(status(state, id), PaneStatus::Running);
+        assert_eq!(job_gen(state, id), Some(Some(gen2)), "start prompt queued again, for the new generation only");
+
+        // the killed process's late events change nothing
+        assert!(!on_output(state, id, gen1, b"old"));
+        assert!(!on_exited(state, id, gen1, 1));
+        assert_eq!(status(state, id), PaneStatus::Running);
+        assert_eq!(job_gen(state, id), Some(Some(gen2)), "stale exit keeps the new start prompt");
+        // and a prompt job is never typed into another generation (poll_prompts checks gen)
+        let p = state.ws.lock().unwrap().pane_by_id(id).cloned().unwrap();
+        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:1", token: "t", run_dir: &state.run_dir, parent_env: &[] };
+        let spec = plan_spawn(&p, &state.loaded.read().unwrap(), &launch).unwrap();
+        assert!(!spec.args.iter().any(|a| a.contains("resume")), "never --resume: {:?}", spec.args);
     }
 
     #[test]

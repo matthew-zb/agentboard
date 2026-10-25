@@ -543,3 +543,17 @@ fn inbox_issue_request_files_and_done_notices_go_to_dispatcher() {
     assert_eq!(fx.state.inbox.get(&id2).unwrap().state, crate::inbox::ItemState::Done);
     assert!(notify_files_saved(&fx.state, &id2, &files).is_err());
 }
+
+#[test]
+fn discard_drops_only_matching_undelivered_messages() {
+    let fx = fixture();
+    fx.spawn(); // never registers: everything stays queued
+    let keep = send_tracked(&fx.state, &fx.pane, "사용자 지시").unwrap();
+    let gone = send_tracked(&fx.state, &fx.pane, "[AgentBoard] 야간 정리: 저장하라").unwrap();
+    assert_eq!(fx.state.bridge.queued(&fx.pane), 2);
+    assert_eq!(discard(&fx.state, &fx.pane, |t| t.starts_with("[AgentBoard] 야간 정리")), 1);
+    assert_eq!(fx.state.bridge.queued(&fx.pane), 1);
+    assert!(gone.recv_timeout(Duration::from_secs(1)).expect("outcome").is_err(), "tracked sender told");
+    assert!(keep.try_recv().is_err(), "the other message still waits");
+    assert_eq!(discard(&fx.state, "nope", |_| true), 0);
+}

@@ -18,7 +18,6 @@ use crate::AppState;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use Role::{Dispatcher as D, Handover as H, Lead as L, Manager as M, Member as Mb};
 
@@ -184,7 +183,7 @@ fn implemented() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "handoff_done",
-            description: "야간 정리에서 진행 내역 저장·보고를 마쳤다고 앱에 알립니다.",
+            description: "야간 정리에서 진행 내역 저장·보고를 마쳤다고 앱에 알립니다. 여러 번 불러도 한 번으로 칩니다. 야간 정리 중이 아니면 아무 일도 하지 않습니다.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
         ToolDef {
@@ -257,7 +256,7 @@ pub fn call(state: &AppState, caller: &Caller, name: &str, args: Value) -> Resul
         }
         "issue_create" => issue_create(state, caller, &args),
         "list_team" => list_team(state, caller, &args),
-        "handoff_done" => handoff_done(state, caller),
+        "handoff_done" => crate::nightly::handoff_done(state, caller),
         "hire_lead" => hire_lead(state, caller, &args),
         "hire_member" => hire_member(state, caller, &args),
         "dismiss" => dismiss(state, caller, &args),
@@ -721,12 +720,6 @@ fn create_manager_tab(state: &AppState, _caller: &Caller, args: &Value) -> Resul
     Ok(reply(&id, &group_name, false))
 }
 
-/// Stub for the nightly refresh (Task 11): remember when the pane reported done.
-fn handoff_done(state: &AppState, caller: &Caller) -> Result<Value, String> {
-    state.handoffs.lock().unwrap().insert(caller.pane.clone(), SystemTime::now());
-    Ok(json!("야간 정리 완료 신호를 받았습니다."))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,6 +841,23 @@ mod tests {
     }
 
     const TWO_MANAGERS: &str = r#"{"tabs":[{"name":"billing","role":"manager","dir":"billing"},{"name":"ops","role":"manager","dir":"ops"}]}"#;
+
+    #[test]
+    fn handoff_done_only_for_standing_roles_and_harmless_outside_a_run() {
+        let f = fx(TWO_MANAGERS);
+        f.brief("billing/teams/a/brief.md");
+        f.call("billing", "hire_lead", json!({"team":"a","brief_path":"teams/a/brief.md"})).unwrap();
+        f.call("billing-a-lead", "hire_member", json!({})).unwrap();
+        for who in ["billing-a-lead", "billing-a-m1"] {
+            let e = f.call(who, "handoff_done", json!({})).unwrap_err();
+            assert!(e.contains("handoff_done 도구를 쓸 수 없습니다"), "{who}: {e}");
+        }
+        for who in ["dispatcher", "billing", "ops", "billing"] {
+            let r = f.call(who, "handoff_done", json!({})).unwrap();
+            assert!(r.as_str().unwrap().contains("야간 정리 중이 아닙니다"), "{who}: {r}");
+        }
+        assert_eq!(f.state.nightly.phase(), crate::nightly::Phase::Idle, "no run started by the tool");
+    }
 
     #[test]
     fn lead_can_only_dismiss_own_members() {

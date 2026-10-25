@@ -276,6 +276,25 @@ fn enqueue(state: &AppState, pane: &str, text: &str, done: Option<mpsc::Sender<O
     Ok(())
 }
 
+/// Drop the pane's undelivered messages whose text satisfies `pred` (the nightly refresh drops
+/// its own before restarting a session, so the new session never gets the old run's request).
+/// Tracked ones report `Err`. Returns how many were dropped. Leaf lock (`inner`); a message the
+/// worker is writing at this very moment may still be delivered.
+pub fn discard(state: &AppState, pane: &str, pred: impl Fn(&str) -> bool) -> usize {
+    let dropped: Vec<Pending> = {
+        let mut g = state.bridge.inner.lock().unwrap();
+        let Some(q) = g.queues.get_mut(pane) else { return 0 };
+        let (gone, keep): (VecDeque<Pending>, VecDeque<Pending>) = q.drain(..).partition(|p| pred(&p.text));
+        *q = keep;
+        gone.into()
+    };
+    let n = dropped.len();
+    for p in dropped {
+        p.finish(Err("전달 전에 취소되었습니다".into()));
+    }
+    n
+}
+
 // ───────────────────────── delivery ─────────────────────────
 
 enum Step {

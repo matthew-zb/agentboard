@@ -250,12 +250,11 @@ fn tools_list_is_filtered_by_role() {
     let res = call(&fx, &m, "list_team", json!({"team":3}));
     assert_eq!(res["isError"], true);
 
-    // handoff_done records a timestamp for the caller pane
-    let mgr = fx.pane(Role::Manager);
-    assert!(fx.state.handoffs.lock().unwrap().get(&mgr).is_none());
+    // handoff_done outside a nightly run: a harmless no-op with a Korean message (Task 11)
     let res = call(&fx, &m, "handoff_done", json!({}));
     assert_eq!(res["isError"], false, "{res}");
-    assert!(fx.state.handoffs.lock().unwrap().get(&mgr).is_some());
+    assert!(res["content"][0]["text"].as_str().unwrap().contains("야간 정리 중이 아닙니다"), "{res}");
+    assert_eq!(fx.state.nightly.phase(), app_lib::nightly::Phase::Idle);
 }
 
 #[test]

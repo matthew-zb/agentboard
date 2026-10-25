@@ -283,6 +283,10 @@ pub enum WsCommand {
     SplitPane { pane: PaneId, dir: Dir },
     ClosePane { pane: PaneId },
     RestartPane { pane: PaneId },
+    /// Nightly refresh (Task 11): like [`WsCommand::RestartPane`] — kill, then spawn a new
+    /// session (never `--resume`) — but the pane's start prompt is injected again, as at app
+    /// start. Generation-safe through the launcher (the old process's late events are stale).
+    RestartPaneFresh { pane: PaneId },
     ResizePane { pane: PaneId, side: Side, delta: f32 },
     /// `tab: None` targets the group layout.
     SetSizes { tab: Option<TabId>, path: Vec<usize>, sizes: Vec<f32> },
@@ -788,6 +792,15 @@ impl Workspace {
                 p.prompt_warning = false;
                 fx.kill.push(pane.clone());
                 fx.spawn.push((pane, false));
+            }
+            RestartPaneFresh { pane } => {
+                self.pane(&pane)?;
+                self.set_status(&pane, PaneStatus::Starting);
+                let p = self.panes.get_mut(&pane).unwrap();
+                p.clear_attention();
+                p.prompt_warning = false;
+                fx.kill.push(pane.clone());
+                fx.spawn.push((pane, true));
             }
             ResizePane { pane, side, delta } => {
                 let tid = self.pane(&pane)?.tab.clone();
@@ -1889,6 +1902,31 @@ mod tests {
         let fx = ws.apply(WsCommand::RestartPane { pane: p.clone() }, &l).unwrap();
         assert_eq!(fx, Effects { spawn: vec![(p.clone(), false)], kill: vec![p.clone()] });
         assert_eq!(ws.pane_by_id(&p).unwrap().status, PaneStatus::Starting);
+    }
+
+    #[test]
+    fn restart_fresh_respawns_with_start_prompt() {
+        let l = loaded_fixture();
+        let mut ws = Workspace::from_config(&l);
+        let p = pane(&ws, "api", "coder");
+        {
+            let q = ws.panes.get_mut(&p).unwrap();
+            q.status = PaneStatus::Running;
+            q.attention = true;
+            q.attention_reason = Some("x".into());
+            q.prompt_warning = true;
+        }
+        let fx = ws.apply(WsCommand::RestartPaneFresh { pane: p.clone() }, &l).unwrap();
+        assert_eq!(fx, Effects { spawn: vec![(p.clone(), true)], kill: vec![p.clone()] }, "prompt injected again");
+        let q = ws.pane_by_id(&p).unwrap();
+        assert_eq!(q.status, PaneStatus::Starting);
+        assert!(!q.attention && q.attention_reason.is_none() && !q.prompt_warning);
+        let before = ws.clone();
+        assert!(ws.apply(WsCommand::RestartPaneFresh { pane: "nope".into() }, &l).is_err());
+        assert_eq!(ws, before);
+        // wire shape (the frontend never sends it, but it is a normal command)
+        let cmd: WsCommand = serde_json::from_str(r#"{"type":"restartPaneFresh","pane":"p1"}"#).unwrap();
+        assert_eq!(cmd, WsCommand::RestartPaneFresh { pane: "p1".into() });
     }
 
     #[test]

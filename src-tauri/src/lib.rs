@@ -10,6 +10,7 @@ pub mod issues;
 pub mod launcher;
 pub mod layout;
 pub mod mcp_tools;
+pub mod nightly;
 pub mod persist;
 pub mod profiles;
 pub mod roles;
@@ -84,8 +85,8 @@ pub struct AppState {
     pub run_dir: std::path::PathBuf,
     /// Hook event handlers of the control server (Tasks 7·10 register). Leaf lock.
     pub hooks: control::HookRouter,
-    /// Last `handoff_done` per pane (nightly refresh, Task 11). Leaf lock.
-    pub handoffs: Mutex<HashMap<PaneId, std::time::SystemTime>>,
+    /// Nightly refresh (Task 11): state machine (leaf lock) + scheduler wake/stop signals.
+    pub nightly: nightly::Runtime,
     /// Inbox store (`<workspaceRoot>/.agentboard/inbox`); its lock is a leaf (+ its own emit
     /// lock), see `inbox` module docs.
     pub inbox: inbox::Inbox,
@@ -133,7 +134,7 @@ impl AppState {
             ctrl_url: Mutex::new(None),
             run_dir,
             hooks,
-            handoffs: Mutex::new(HashMap::new()),
+            nightly: nightly::Runtime::new(),
             inbox,
             bridge: bridge::Bridge::new(),
             last_input: Mutex::new(HashMap::new()),
@@ -667,6 +668,8 @@ pub fn run() {
             bridge::start_worker(app.handle().clone());
             // document tabs: mtime polling (Task 14)
             start_doc_watcher(app.handle().clone());
+            // nightly refresh scheduler (Task 11); last run date in %APPDATA%/agentboard/nightly.json
+            nightly::start(app.handle().clone(), appdata.join(nightly::FILE_NAME));
             // spawning happens on the launcher thread: window creation is not blocked
             launcher::start(app.handle(), rx, initial);
 
@@ -683,6 +686,7 @@ pub fn run() {
             if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
                 if let Some(state) = app.try_state::<AppState>() {
                     state.saver.flush();
+                    state.nightly.stop(); // the scheduler thread ends at its next wake
                 }
             }
         });

@@ -589,3 +589,15 @@ control.rs 구현 지침: `server/discover`에는 **정확히 HTTP 200 + JSON-RP
 7. **링크 보안**: `https://` 링크는 시스템 브라우저로 열리고 앱 화면은 그대로인지. `file:`·`javascript:`·`C:\…` 링크, 작업 폴더 밖 `../..` md 링크는 아무 일도 하지 않는지(안내 토스트만).
 8. **복원**: 문서 탭을 연 채 앱을 껐다 켜면 같은 탭이 복원되는지. 그 사이 파일을 지웠으면 탭에 "파일을 찾을 수 없습니다"가 보이는지.
 9. **(수정 1차) 탐색 차단**: 문서에 `<img usemap>` + `<map><area href="https://…">`, `<a target="_blank">`를 넣고 클릭·가운데 클릭·Shift+클릭해도 AgentBoard 창이 다른 페이지로 바뀌거나 새 창이 뜨지 않는지(앱 로그에 `blocked navigation`만). `## Status`, `## Parking`, `# Mermaid` 제목이 있는 문서를 열어도 상태 표시줄·탭 전환·Mermaid가 정상인지.
+
+## 2단계 Task 11 — 야간 정리 수동 확인 (사용자 확인 필요, 미실시)
+
+자동 테스트는 상태 기계(시작 조건·하루 1회·입력 중 연기·handover 순서·완료/시간 초과·미완료 항목·팀 제외), `nightly.json` 읽기·쓰기, `handoff_done` 권한·멱등성, `RestartPaneFresh`의 generation 안전성(새 세션 + 시작 프롬프트 재주입, `--resume` 없음)을 본다. 아래는 실제 역할 세션으로 확인할 항목이다. 결과를 이 절에 적을 것. 스케줄러는 1분마다 돌므로 시각은 1–2분 여유를 둔다.
+
+1. **시각을 가깝게**: `config.json`에 `"nightlyRefresh"`를 지금으로부터 2–3분 뒤("HH:MM", 24시간)로, `"nightlyTimeoutMin": 5`로 두고 앱을 켠다(`%APPDATA%\agentboard\nightly.json`이 있으면 지워 둔다). 시각이 되면 dispatcher·각 Manager 세션에 `[AgentBoard] 야간 정리: … handover(@<handover 세션 이름>)에게 파일 위치를 보고하고 handoff_done을 호출하라.` 메시지가 새 턴으로 들어오는지, handover에는 아직 오지 않는지, 팀 리드·팀원 창에는 아무것도 오지 않는지 확인. `nightly.json`에 오늘 날짜(`lastRun`)가 바로 기록되는지.
+2. **handover 순서**: Manager·dispatcher가 모두 `handoff_done`을 부른 뒤 다음 1분 안에 handover에 `인덱스 문서(HANDOVER.md)의 포인터만 갱신하고 handoff_done…` 메시지가 오는지. 한 Manager가 끝내 부르지 않으면 제한 시간의 절반(위 설정이면 2분 30초)이 지난 뒤 handover에 오는지.
+3. **새 세션으로 재시작**: 모두 완료하면 곧(1분 이내), 아니면 제한 시간이 지나면 dispatcher·handover·Manager 창이 새로 시작되고 시작 프롬프트(handover 인덱스를 읽고 … 진행 준비)가 다시 들어가는지. 이전 대화가 이어지지 않는지(`/resume` 목록에 새 세션으로 보임). 팀 창(리드·팀원)은 그대로 하던 일을 계속하는지. 이미 꺼져 있던(○) 상시 창은 재시작되지 않는지.
+4. **미완료 항목**: 제한 시간 안에 `handoff_done`을 부르지 않은 세션마다 인박스에 "야간 정리 미완료: <세션 이름>" 항목(담당 = 그 탭, 확인할 것에 사유)이 생기는지.
+5. **입력 중 연기**: 시각 직전부터 dispatcher 입력란에 글자를 쳐 둔다. `nightlyQuietMin`(기본 10분) 동안은 시작하지 않고 5분 간격으로 다시 확인하는지(`nightly.json`이 갱신되지 않음). 재시작 직전에 어떤 대상 창에 입력하면 그 입력을 버리지 않도록 재시작이 조용해질 때까지 미뤄지는지.
+6. **하루 1회 / 앱 재시작**: 정리가 끝난 뒤 같은 날 앱을 껐다 켜도 다시 돌지 않는지. 시각이 지난 뒤 앱을 처음 켜면(그날 기록 없음) 1분쯤 뒤 한 번 도는지. `"nightlyRefresh": null`이면 돌지 않는지.
+7. **handoff_done 응답**: 야간 정리가 아닐 때 Manager에게 `handoff_done`을 부르게 하면 "지금은 야간 정리 중이 아닙니다…"만 돌아오고 아무 일도 없는지. 팀 리드가 부르면 권한 오류(한국어)인지.
