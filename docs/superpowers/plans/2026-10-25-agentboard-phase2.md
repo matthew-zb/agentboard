@@ -262,8 +262,12 @@ spikes/phase2/    # Task 1 버리는 스파이크 코드 (커밋은 하되 빌�
 - Modify: `src-tauri/src/control.rs`(Notification 처리기 → `SetAttention{on:true}`; 포커스된 창이면 무시), `src/groups.js`/`src/app.js`(상태 표시줄), `README.md`
 
 **Interfaces:**
-- Produces: Notification hook(권한 요청·입력 대기) → 해당 창 attention. 그룹 최대화 등으로 ⚠ 탭이 화면에 안 보이면 상태 표시줄에 `⚠ billing, api` (클릭·`Alt+a`로 이동). 순수 함수 `hiddenAttentionTabs(snapshot) -> string[]` + 테스트.
-- [ ] **Step 1–4** — 테스트(`hidden_attention_tabs`, hook → attention, 포커스 창 무시) → 구현 → PASS
+- Produces:
+  - Notification hook 중 `permission_prompt`만 → 해당 창 attention(`idle_prompt`는 무시 — 상시 에이전트가 쉬는 동안 늘 발생). 포커스된 창이면 무시.
+  - **MCP 도구 `need_user(reason: String)` (모든 역할)** — 호출자 창 attention on + `Pane.attention_reason: Option<String>`(serde default) 저장. SetFocus로 attention이 해제될 때 reason도 지운다. ⚠ 툴팁과 상태 표시줄 목록에 사유 표시.
+  - 그룹 최대화 등으로 ⚠ 탭이 화면에 안 보이면 상태 표시줄에 `⚠ billing(사유…), api` (클릭·`Alt+a`로 이동). 순수 함수 `hiddenAttentionTabs(snapshot) -> {tab, reason?}[]` + 테스트.
+  - SessionStart가 spawn 후 30초 안에 오지 않은 role 창 → attention + reason "폴더 신뢰 확인 필요"(ledger R5).
+- [ ] **Step 1–4** — 테스트(`hidden_attention_tabs`, `need_user_sets_reason_and_focus_clears_it`, permission_prompt → attention·idle_prompt 무시, 포커스 창 무시, `missing_session_start_flags_trust`) → 구현 → PASS
 - [ ] **Step 5: Commit** — `feat(attention): notification hook and status-bar attention list`
 
 ---
@@ -340,7 +344,7 @@ spikes/phase2/    # Task 1 버리는 스파이크 코드 (커밋은 하되 빌�
 
 **Interfaces:**
 - Produces (역할 지시 최소판 — 스펙 §2·§5·§7·§8·§9 반영, 각 1–2쪽):
-  - 공통: 세션 이름 규칙, `SendMessage`로 보낼 대상 규칙(경로: handover→dispatcher→Manager, 지시는 dispatcher 경유, 팀원→리드만), `[AgentBoard]` 메시지는 앱 지시로 취급.
+  - 공통: 사용자 결정이 필요하면 질문을 화면에 쓰고 `need_user(사유)` 호출, `[AgentBoard]`·agentboard 발신 메시지는 사용자 지시를 전달하는 것(R3), 세션 이름 규칙, `SendMessage`로 보낼 대상 규칙(경로: handover→dispatcher→Manager, 지시는 dispatcher 경유, 팀원→리드만), `[AgentBoard]` 메시지는 앱 지시로 취급.
   - dispatcher: handover 메시지 판단·담당 전달, 인박스 지시 전달, `create_manager_tab` 사용 조건.
   - handover: `/loop`는 템플릿 프롬프트가 시작, 인덱스 문서는 **포인터만**(업무·계획 파일·진행 파일·갱신 시각 한 줄), 야간 정리 절차.
   - manager: 보고 = `inbox_post`(확인할 것/리스크 짧고 명료), 종료 = `inbox_propose_close` + 최종 의견, 이슈 = `issue_create`, 팀 = `teams/<id>/brief.md`·`roster.md` 작성 후 `hire_lead`, 끝난 팀 brief에 `상태: 완료`, **시작 시 진행 중 팀 자동 재채용**, 야간 정리 절차.
