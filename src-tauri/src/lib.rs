@@ -677,6 +677,17 @@ fn restore_or_fresh(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // R30 / final review #4: registered first — a second launch (autostart + shortcut,
+        // installer relaunch) hands over to the running instance, which shows and focuses its
+        // window, and exits before restoring a second set of role sessions. The `--hook` CLI
+        // mode never gets here (main.rs returns before `run`), so hooks keep working.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_clipboard_manager::init())
         // the main WebView never leaves the app (document links, image maps, …): fix round 1
         .plugin(webview::nav_guard())
