@@ -229,7 +229,7 @@ fn is_absolute_like(p: &str) -> bool {
 }
 
 /// Returns an error message when `p` is not a relative path staying inside its base.
-fn check_relative(p: &str) -> Option<&'static str> {
+pub(crate) fn check_relative(p: &str) -> Option<&'static str> {
     if is_absolute_like(p) {
         return Some("절대경로는 사용할 수 없음 (탭 작업공간 기준 상대경로만 허용)");
     }

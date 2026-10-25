@@ -4,6 +4,7 @@
 pub mod config;
 pub mod layout;
 pub mod profiles;
+pub mod workspace;
 pub mod pty;
 pub mod ring;
 pub mod webview;
