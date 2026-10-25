@@ -87,6 +87,9 @@ pub struct RoleLaunch<'a> {
     pub ctrl_url: &'a str,
     pub token: &'a str,
     pub run_dir: &'a std::path::Path,
+    /// Variable names of the app's own environment; the session-bound ones are not passed on
+    /// to a role session (`agentcfg::SESSION_BOUND_VARS`, R19). Injected for testability.
+    pub parent_env: &'a [String],
 }
 
 /// Core of spawning: profile lookup, cwd check, command resolution, args/env merge.
@@ -127,7 +130,7 @@ pub fn plan_spawn(pane: &Pane, loaded: &Loaded, launch: &RoleLaunch) -> Result<S
         args.extend(extra_args);
         args.extend(loaded.config.role_config(role).args);
         role_env = extra_env;
-        env_remove = crate::agentcfg::inherited_claude_vars(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()));
+        env_remove = crate::agentcfg::inherited_claude_vars(launch.parent_env.iter().cloned());
     }
     args.extend(pane.args.iter().cloned());
     env.extend(pane.env.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -381,7 +384,12 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
     // `tokens` and `ctrl_url` are leaves, taken one at a time before `loaded`.
     let token = if pane.role.is_some() { state.tokens.issue(id) } else { String::new() };
     let ctrl_url = state.ctrl_url.lock().unwrap().clone().unwrap_or_else(|| PLACEHOLDER_CTRL_URL.to_string());
-    let launch = RoleLaunch { ctrl_url: &ctrl_url, token: &token, run_dir: &state.run_dir };
+    let parent_env: Vec<String> = if pane.role.is_some() {
+        std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect()
+    } else {
+        Vec::new()
+    };
+    let launch = RoleLaunch { ctrl_url: &ctrl_url, token: &token, run_dir: &state.run_dir, parent_env: &parent_env };
     let (plan, job) = {
         let loaded = state.loaded.read().unwrap();
         let plan = plan_spawn(&pane, &loaded, &launch);
@@ -577,7 +585,7 @@ mod tests {
     }
 
     fn no_role() -> RoleLaunch<'static> {
-        RoleLaunch { ctrl_url: "", token: "", run_dir: std::path::Path::new("") }
+        RoleLaunch { ctrl_url: "", token: "", run_dir: std::path::Path::new(""), parent_env: &[] }
     }
 
     #[test]
@@ -588,7 +596,7 @@ mod tests {
         p.args = vec!["--pane".into()];
         p.role = Some(Role::Manager);
         p.session_name = Some("billing".into());
-        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:4321", token: "tk", run_dir: run.path() };
+        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:4321", token: "tk", run_dir: run.path(), parent_env: &[] };
         let spec = plan_spawn(&p, &fx.loaded, &launch).unwrap();
         let exe = std::env::current_exe().unwrap();
         let (extras, xenv) = crate::agentcfg::role_spawn_extras_with_exe(
@@ -622,7 +630,7 @@ mod tests {
         let shim_s = shim.to_string_lossy().into_owned();
         fx.loaded.profiles.insert("shim".into(), profile("shim", &shim_s, vec![], BTreeMap::new()));
         let run = tempfile::tempdir().unwrap();
-        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:1", token: "t", run_dir: run.path() };
+        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:1", token: "t", run_dir: run.path(), parent_env: &[] };
         for (agent, batch) in [("shim", true), ("tool", false)] {
             let mut p = pane(agent, fx.root.path().to_path_buf());
             p.args = vec!["--pane".into()];
@@ -645,24 +653,27 @@ mod tests {
     }
 
     #[test]
-    fn role_spawn_spec_drops_inherited_claude_vars() {
-        // a unique name: other tests never read it
-        std::env::set_var("CLAUDE_CODE_AGENTBOARD_T4_PROBE", "stale");
+    fn role_spawn_spec_drops_only_session_bound_vars() {
         let fx = fixture();
         let run = tempfile::tempdir().unwrap();
-        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:1", token: "t", run_dir: run.path() };
+        // the app's environment is injected: no process-global set_var
+        let parent: Vec<String> = ["PATH", "CLAUDECODE", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_GIT_BASH_PATH", "CLAUDE_CODE_USE_BEDROCK"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:1", token: "t", run_dir: run.path(), parent_env: &parent };
         let mut p = pane("tool", fx.root.path().to_path_buf());
         let plain = plan_spawn(&p, &fx.loaded, &launch).unwrap();
         assert!(plain.env_remove.is_empty(), "phase-1 panes inherit everything as before");
         p.role = Some(Role::Manager);
         p.session_name = Some("billing".into());
         let spec = plan_spawn(&p, &fx.loaded, &launch).unwrap();
-        assert!(spec.env_remove.contains(&"CLAUDE_CODE_AGENTBOARD_T4_PROBE".to_string()), "{:?}", spec.env_remove);
-        if std::env::var_os("CLAUDECODE").is_some() {
-            assert!(spec.env_remove.contains(&"CLAUDECODE".to_string()));
-        }
-        assert!(spec.env_remove.iter().all(|k| k == "CLAUDECODE" || k.to_ascii_uppercase().starts_with("CLAUDE_CODE_")));
-        std::env::remove_var("CLAUDE_CODE_AGENTBOARD_T4_PROBE");
+        assert_eq!(
+            spec.env_remove,
+            vec!["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SSE_PORT"]
+        );
+        assert!(!spec.env_remove.iter().any(|k| k == "CLAUDE_CODE_GIT_BASH_PATH" || k == "CLAUDE_CODE_USE_BEDROCK" || k == "PATH"));
     }
 
     #[test]
@@ -681,7 +692,7 @@ mod tests {
         p.args = vec!["--pane".into()];
         p.role = Some(Role::Lead);
         p.session_name = Some("t-a-lead".into());
-        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:1", token: "t", run_dir: run.path() };
+        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:1", token: "t", run_dir: run.path(), parent_env: &[] };
         let spec = plan_spawn(&p, &loaded, &launch).unwrap();
         let n = spec.args.len();
         assert_eq!(&spec.args[n - 3..], &["--model".to_string(), "haiku".to_string(), "--pane".to_string()]);
@@ -692,7 +703,7 @@ mod tests {
         let fx = fixture();
         let run = tempfile::tempdir().unwrap();
         let p = pane("tool", fx.root.path().to_path_buf());
-        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:4321", token: "tk", run_dir: run.path() };
+        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:4321", token: "tk", run_dir: run.path(), parent_env: &[] };
         let spec = plan_spawn(&p, &fx.loaded, &launch).unwrap();
         assert_eq!(spec.args, vec!["--p1", "--p2"]);
         assert!(spec.env.iter().all(|(k, _)| !k.starts_with("AGENTBOARD_")));

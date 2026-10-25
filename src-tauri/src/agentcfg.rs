@@ -148,21 +148,55 @@ pub fn is_batch(cmd: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
 }
 
-/// One-line form of a multi-line argument for batch shims: each line break becomes ` ⏎ `.
+/// Safe form of a free-text argument for batch shims (R18/R19): each line break becomes
+/// ` ⏎ ` (cmd.exe ends the command line at a newline), then cmd.exe metacharacters are
+/// replaced by look-alikes — `"` would end the quoting early and make `& | < > ^` live,
+/// `%VAR%` expands even inside quotes. Native executables get the text unchanged.
 pub fn single_line(text: &str) -> String {
-    text.replace("\r\n", "\n").replace(['\n', '\r'], " ⏎ ")
+    text.replace("\r\n", "\n")
+        .replace(['\n', '\r'], " ⏎ ")
+        .chars()
+        .map(|c| match c {
+            '"' => '\'',
+            '%' => '％',
+            '^' => '＾',
+            '&' => '＆',
+            '|' => '｜',
+            '<' => '＜',
+            '>' => '＞',
+            c => c,
+        })
+        .collect()
 }
 
-/// Names (from `vars`) a role session must not inherit: `CLAUDECODE` and `CLAUDE_CODE_*`
-/// (e.g. a parent session's `CLAUDE_CODE_MESSAGING_SOCKET/TOKEN` when the app runs under
-/// Claude Code), R18.
+/// Variables Claude Code sets for one running session / its subprocesses (R19). A role
+/// session started from an app that itself runs under Claude Code (dev) must not inherit
+/// them — e.g. a stale `CLAUDE_CODE_MESSAGING_SOCKET/TOKEN` would point at the parent
+/// session. Everything else (user configuration such as `CLAUDE_CODE_GIT_BASH_PATH`,
+/// `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_OAUTH_TOKEN`) is inherited.
+/// Sources: code.claude.com/docs/en/env-vars ("set by Claude Code" / "set automatically")
+/// and the phase-2 spike's hook environment dump.
+pub const SESSION_BOUND_VARS: [&str; 12] = [
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+    "CLAUDE_JOB_DIR",
+];
+
+/// The names in `vars` (the app's environment) that are in [`SESSION_BOUND_VARS`]
+/// (case-insensitive, as Windows env names are), sorted, deduplicated.
 pub fn inherited_claude_vars(vars: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut v: Vec<String> = vars
         .into_iter()
-        .filter(|k| {
-            let u = k.to_ascii_uppercase();
-            u == "CLAUDECODE" || u.starts_with("CLAUDE_CODE_")
-        })
+        .filter(|k| SESSION_BOUND_VARS.iter().any(|s| s.eq_ignore_ascii_case(k)))
         .collect();
     v.sort();
     v.dedup();
@@ -377,15 +411,44 @@ mod tests {
         assert!(!is_batch(Path::new(r"C:\bin\claude.exe")) && !is_batch(Path::new("claude")));
         assert_eq!(single_line("a\nb\r\nc\rd"), "a ⏎ b ⏎ c ⏎ d");
         assert_eq!(single_line("one"), "one");
+        let nasty = "say \"hi\" & echo %PATH% | more < in > out ^x\nnext";
+        let safe = single_line(nasty);
+        assert_eq!(safe, "say 'hi' ＆ echo ％PATH％ ｜ more ＜ in ＞ out ＾x ⏎ next");
+        for c in ['"', '%', '^', '&', '|', '<', '>', '\n', '\r'] {
+            assert!(!safe.contains(c), "{c:?} left in {safe}");
+        }
     }
 
     #[test]
-    fn inherited_claude_vars_are_selected() {
-        let names = ["PATH", "CLAUDECODE", "CLAUDE_CODE_MESSAGING_SOCKET", "claude_code_x", "CLAUDE_PROJECT_DIR", "AGENTBOARD_URL"];
+    fn only_session_bound_vars_are_dropped() {
+        let names = [
+            "PATH",
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_CODE_SSE_PORT",
+            "claude_code_messaging_socket",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_CODE_SESSION_ID",
+            // user configuration: inherited
+            "CLAUDE_CODE_GIT_BASH_PATH",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+            "AGENTBOARD_URL",
+        ];
         assert_eq!(
             inherited_claude_vars(names.iter().map(|s| s.to_string())),
-            vec!["CLAUDECODE", "CLAUDE_CODE_MESSAGING_SOCKET", "claude_code_x"]
+            vec![
+                "CLAUDECODE",
+                "CLAUDE_CODE_ENTRYPOINT",
+                "CLAUDE_CODE_MESSAGING_TOKEN",
+                "CLAUDE_CODE_SESSION_ID",
+                "CLAUDE_CODE_SSE_PORT",
+                "claude_code_messaging_socket",
+            ]
         );
+        let all = inherited_claude_vars(SESSION_BOUND_VARS.iter().map(|s| s.to_string()));
+        assert_eq!(all.len(), SESSION_BOUND_VARS.len());
     }
 
     #[test]
