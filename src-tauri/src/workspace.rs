@@ -139,6 +139,7 @@ pub enum WsCommand {
     SetSyncInput { tab: TabId, on: bool },
     SetAttention { pane: PaneId, on: bool },
     // groups (Task 8)
+    /// `index` is the final position after the tab is removed from its old spot; out of range appends.
     MoveTab { tab: TabId, group: GroupId, index: usize },
     SplitGroupWith { tab: TabId, group: GroupId, dir: Dir, before: bool },
     MergeGroup { src: GroupId, dst: GroupId },
@@ -249,6 +250,7 @@ impl Workspace {
     pub fn apply(&mut self, cmd: WsCommand, loaded: &Loaded) -> Result<Effects, String> {
         let mut next = self.clone();
         let fx = next.apply_inner(cmd, loaded)?;
+        next.sanitize_last_location();
         *self = next;
         Ok(fx)
     }
@@ -536,9 +538,7 @@ impl Workspace {
                     gid.clone(),
                     Group { id: gid.clone(), name, tab_ids: vec![tab.clone()], active_tab_id: tab.clone() },
                 );
-                if !self.group_layout.split_leaf(&group, gid.clone(), dir, before) {
-                    return Err(no_group(&group));
-                }
+                assert!(self.group_layout.split_leaf(&group, gid.clone(), dir, before), "group existence was checked above");
                 self.remove_group_if_empty(&src);
                 self.move_focus(prev, &gid, &tab);
             }
@@ -695,6 +695,15 @@ impl Workspace {
         self.groups.get(&self.focus.group_id).map(|g| Location { group_id: g.id.clone(), tab_id: g.active_tab_id.clone() })
     }
 
+    /// `last_location` must name an existing group that contains the tab, and must differ from the
+    /// current focus (a "go back" that does nothing is stale). Called after every command.
+    fn sanitize_last_location(&mut self) {
+        let valid = self.last_location.as_ref().is_some_and(|l| self.groups.get(&l.group_id).is_some_and(|g| g.tab_ids.contains(&l.tab_id)));
+        if !valid || self.last_location == self.focus_location() {
+            self.last_location = None;
+        }
+    }
+
     /// Focus `(gid, tid)`: that tab becomes the group's active tab, `prev` (the location before the
     /// command) becomes `last_location` when it differs and still exists, a `last_location` equal to
     /// the new focus is stale and cleared, and the tab's last focused pane loses its attention mark.
@@ -730,7 +739,7 @@ impl Workspace {
         self.groups.get_mut(dst).unwrap().tab_ids.extend(moved);
         self.remove_group_if_empty(src);
         if let Some(p) = &prev {
-            let gid = self.group_of_tab(&p.tab_id).cloned().ok_or_else(|| no_tab(&p.tab_id))?;
+            let gid = self.group_of_tab(&p.tab_id).cloned().expect("focused tab still lives in some group");
             self.move_focus(prev.clone(), &gid, &p.tab_id);
         }
         Ok(())
@@ -1025,7 +1034,8 @@ mod tests {
         assert!(!ws.groups.contains_key(&work));
         assert_eq!(ws.group_layout, LayoutNode::Leaf(control.clone()));
         assert_eq!(ws.focus.group_id, control);
-        assert_eq!(ws.last_location, Some(Location { group_id: control.clone(), tab_id: tab(&ws, "dispatcher").id.clone() }));
+        // (control, dispatcher) is now the focus itself, so the "go back" target is stale
+        assert_eq!(ws.last_location, None);
 
         // lastLocation pointing at a closed tab/group is dropped
         let mut ws = Workspace::from_config(&l);
@@ -1201,6 +1211,14 @@ mod tests {
         assert!(ws.apply(WsCommand::SetMaximized { tab: api, pane: Some(d) }, &l).is_err());
     }
 
+    /// `last_location` is None or names an existing group containing the tab, and is not the focus.
+    fn assert_inv(ws: &Workspace) {
+        if let Some(l) = &ws.last_location {
+            assert!(ws.groups.get(&l.group_id).is_some_and(|g| g.tab_ids.contains(&l.tab_id)), "stale {l:?}");
+            assert_ne!(ws.last_location, ws.focus_location());
+        }
+        assert!(ws.groups.contains_key(&ws.focus.group_id));
+    }
     fn gid_named(ws: &Workspace, name: &str) -> GroupId {
         ws.groups.values().find(|g| g.name == name).unwrap_or_else(|| panic!("no group {name}")).id.clone()
     }
@@ -1230,12 +1248,16 @@ mod tests {
         // source group survives; its active tab follows the CloseTab rule (right, else left)
         let mut ws = Workspace::from_config(&l);
         ws.apply(create_in("x", &work), &l).unwrap();
+        assert_inv(&ws);
         ws.apply(create_in("y", &work), &l).unwrap();
+        assert_inv(&ws);
         let x = tab(&ws, "x").id.clone();
         ws.apply(WsCommand::SetFocus { group: work.clone(), tab: Some(x.clone()), pane: None }, &l).unwrap();
+        assert_inv(&ws);
         let before_loc = ws.last_location.clone();
         assert!(before_loc.is_some());
         ws.apply(WsCommand::MoveTab { tab: x.clone(), group: control.clone(), index: 1 }, &l).unwrap();
+        assert_inv(&ws);
         assert_eq!(tab_names(&ws, &work), ["api", "y"]);
         assert_eq!(ws.groups[&work].active_tab_id, tab(&ws, "y").id);
         assert_eq!(tab_names(&ws, &control), ["dispatcher", "x"]);
@@ -1255,7 +1277,9 @@ mod tests {
         let l = loaded_fixture();
         let mut ws = Workspace::from_config(&l);
         ws.apply(create("b", "solo"), &l).unwrap();
+        assert_inv(&ws);
         ws.apply(create("c", "solo"), &l).unwrap();
+        assert_inv(&ws);
         let g = ws.focus.group_id.clone();
         let c = tab(&ws, "c").id.clone();
         let d = tab(&ws, "dispatcher").id.clone();
@@ -1266,6 +1290,7 @@ mod tests {
         assert_eq!(ws.groups.len(), 1);
         // the dispatcher can be reordered too
         ws.apply(WsCommand::MoveTab { tab: d, group: g.clone(), index: 2 }, &l).unwrap();
+        assert_inv(&ws);
         assert_eq!(tab_names(&ws, &g), ["c", "api", "dispatcher", "b"]);
     }
 
@@ -1276,11 +1301,14 @@ mod tests {
         let control = gid_named(&ws, "control");
         let api = tab(&ws, "api").id.clone();
         ws.apply(create_in("x", &gid_named(&ws, "work")), &l).unwrap();
+        assert_inv(&ws);
         ws.apply(WsCommand::MoveTab { tab: api, group: control.clone(), index: 99 }, &l).unwrap();
+        assert_inv(&ws);
         assert_eq!(tab_names(&ws, &control), ["dispatcher", "api"]);
         // same group, out of range → end
         let d = tab(&ws, "dispatcher").id.clone();
         ws.apply(WsCommand::MoveTab { tab: d, group: control.clone(), index: 99 }, &l).unwrap();
+        assert_inv(&ws);
         assert_eq!(tab_names(&ws, &control), ["api", "dispatcher"]);
     }
 
@@ -1289,7 +1317,9 @@ mod tests {
         let l = loaded_fixture();
         let mut ws = Workspace::from_config(&l);
         ws.apply(create("b", "solo"), &l).unwrap();
+        assert_inv(&ws);
         ws.apply(create("c", "solo"), &l).unwrap();
+        assert_inv(&ws);
         let old = ws.focus.group_id.clone();
         let b = tab(&ws, "b").id.clone();
         let c = tab(&ws, "c").id.clone();
@@ -1319,6 +1349,7 @@ mod tests {
         // a different direction nests
         let api = tab(&ws, "api").id.clone();
         ws.apply(WsCommand::SplitGroupWith { tab: api, group: old, dir: Dir::Vertical, before: false }, &l).unwrap();
+        assert_inv(&ws);
         assert_eq!(ws.group_layout.leaf_count(), 4);
     }
 
@@ -1364,7 +1395,9 @@ mod tests {
         let control = gid_named(&ws, "control");
         let work = gid_named(&ws, "work");
         ws.apply(create_in("x", &work), &l).unwrap();
+        assert_inv(&ws);
         ws.apply(create_in("y", &work), &l).unwrap();
+        assert_inv(&ws);
         let d = tab(&ws, "dispatcher").id.clone();
         let fx = ws.apply(WsCommand::MergeGroup { src: work.clone(), dst: control.clone() }, &l).unwrap();
         assert_eq!(fx, Effects::default());
@@ -1378,7 +1411,9 @@ mod tests {
         let mut ws = Workspace::from_config(&l);
         let api = tab(&ws, "api").id.clone();
         ws.apply(WsCommand::SetFocus { group: work.clone(), tab: None, pane: None }, &l).unwrap();
+        assert_inv(&ws);
         ws.apply(WsCommand::MergeGroup { src: work.clone(), dst: control.clone() }, &l).unwrap();
+        assert_inv(&ws);
         assert_eq!(ws.focus.group_id, control);
         assert_eq!(ws.groups[&control].active_tab_id, api);
         assert_eq!(ws.last_location, Some(Location { group_id: control.clone(), tab_id: d }));
@@ -1411,6 +1446,7 @@ mod tests {
         let mut ws = Workspace::from_config(&l);
         let (one, two) = (gid_named(&ws, "one"), gid_named(&ws, "two"));
         ws.apply(WsCommand::CloseGroup { group: one }, &l).unwrap();
+        assert_inv(&ws);
         assert_eq!(tab_names(&ws, &two), ["a", "dispatcher"]);
         assert_eq!(ws.group_layout.leaf_count(), 2);
     }
@@ -1434,6 +1470,7 @@ mod tests {
         let work = gid_named(&ws, "work");
         let d = tab(&ws, "dispatcher").id.clone();
         ws.apply(WsCommand::MoveTab { tab: d.clone(), group: work.clone(), index: 0 }, &l).unwrap();
+        assert_inv(&ws);
         assert_eq!(tab_names(&ws, &work), ["dispatcher", "api"]);
         assert_eq!(group_of(&ws, &d), work);
         assert!(ws.tabs[&d].is_dispatcher);
@@ -1449,6 +1486,7 @@ mod tests {
         let work = gid_named(&ws, "work");
         let api = tab(&ws, "api").id.clone();
         ws.apply(create_in("x", &work), &l).unwrap();
+        assert_inv(&ws);
         let alive = ws.running_count();
         let x = tab(&ws, "x").id.clone();
         let cmds = vec![
@@ -1478,17 +1516,24 @@ mod tests {
         let control = gid_named(&ws, "control");
         let work = gid_named(&ws, "work");
         ws.apply(create_in("b", &control), &l).unwrap();
+        assert_inv(&ws);
         let (d, b) = (tab(&ws, "dispatcher").id.clone(), tab(&ws, "b").id.clone());
         ws.apply(WsCommand::SetFocus { group: control.clone(), tab: Some(d.clone()), pane: None }, &l).unwrap();
+        assert_inv(&ws);
         ws.apply(WsCommand::SetFocus { group: control.clone(), tab: Some(b.clone()), pane: None }, &l).unwrap();
+        assert_inv(&ws);
         assert_eq!(ws.last_location, Some(Location { group_id: control.clone(), tab_id: d.clone() }));
         // closing the focused tab falls back to the dispatcher → lastLocation now equals the focus
         ws.apply(WsCommand::CloseTab { tab: b }, &l).unwrap();
+        assert_inv(&ws);
         assert_eq!(ws.groups[&control].active_tab_id, d);
-        assert_eq!(ws.last_location, Some(Location { group_id: control.clone(), tab_id: d }));
+        // R13: (control, dispatcher) is the focus itself now, so the stale "go back" is cleared
+        assert_eq!(ws.last_location, None);
         ws.apply(WsCommand::SetGroupMaximized { group: Some(work.clone()) }, &l).unwrap();
+        assert_inv(&ws);
         assert_eq!(ws.group_maximized, Some(work.clone()));
         ws.apply(WsCommand::CloseGroup { group: work.clone() }, &l).unwrap();
+        assert_inv(&ws);
         assert_eq!(ws.last_location, None);
         assert_eq!(ws.group_maximized, None);
         // SetGroupMaximized validates the group
@@ -1496,6 +1541,28 @@ mod tests {
         assert!(ws.apply(WsCommand::SetGroupMaximized { group: Some(work) }, &l).is_err());
         assert_eq!(ws, before);
         ws.apply(WsCommand::SetGroupMaximized { group: None }, &l).unwrap();
+        assert_inv(&ws);
+    }
+
+    #[test]
+    fn last_location_never_points_at_a_tab_that_left_its_group() {
+        let l = loaded_groups();
+        let mut ws = Workspace::from_config(&l);
+        let control = gid_named(&ws, "control");
+        let work = gid_named(&ws, "work");
+        ws.apply(create_in("x", &control), &l).unwrap();
+        ws.apply(create_in("y", &work), &l).unwrap();
+        let (x, api) = (tab(&ws, "x").id.clone(), tab(&ws, "api").id.clone());
+        ws.apply(WsCommand::SetFocus { group: work.clone(), tab: Some(api.clone()), pane: None }, &l).unwrap();
+        assert_eq!(ws.last_location, Some(Location { group_id: control.clone(), tab_id: x.clone() }));
+        ws.apply(WsCommand::CloseTab { tab: api }, &l).unwrap();
+        assert_inv(&ws);
+        assert_eq!(ws.last_location, Some(Location { group_id: control, tab_id: x.clone() }));
+        // x leaves its group: the "go back" target no longer exists
+        ws.apply(WsCommand::MoveTab { tab: x, group: work.clone(), index: 0 }, &l).unwrap();
+        assert_inv(&ws);
+        // never the stale (control, x); the valid previous location (work, y) is recorded instead
+        assert_eq!(ws.last_location, Some(Location { group_id: work, tab_id: tab(&ws, "y").id.clone() }));
     }
 
     #[test]
