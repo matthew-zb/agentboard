@@ -531,3 +531,14 @@ control.rs 구현 지침: `server/discover`에는 **정확히 HTTP 200 + JSON-RP
 - 토큰은 그 세션의 모든 hook·Bash 명령(자식 프로세스)에 보인다. 앱 제어 서버로 보고할 때만 쓰고 로그에 남기지 않는다.
 
 결과: P1 성공 / P2 성공 / P3 성공 (2026-10-25, Claude Code 2.1.310). 대안 미채택.
+
+## 2단계 Task 4 검증 — 실제 hook → `agentboard.exe --hook` → HTTP POST
+
+2026-10-25, Claude Code 2.1.310. 한 번 실행: `claude -p --model haiku --name abverify-t4-<난수> --settings <파일> "Reply with exactly: OK"`(cwd `C:/workspace`, `cleanenv.sh`로 부모 `CLAUDE*` 변수 제거, 환경에 `AGENTBOARD_URL=http://127.0.0.1:<임의 포트>`, `AGENTBOARD_TOKEN=<시험 토큰>`). settings는 앱이 만드는 것과 같은 꼴(`crossSessionInbound: accept` + SessionStart/UserPromptSubmit/Stop/Notification). hook 명령은 Task 4 dev 빌드 `agentboard.exe`를 **공백이 있는 폴더**(`…/hookverify/hook bin/agentboard.exe`)에 복사해 `"\"C:/…/hook bin/agentboard.exe\" --hook SessionStart"` 형태로 줬다. 받는 쪽은 요청을 JSONL로 적고 204로 답하는 작은 Node HTTP 리스너.
+
+결과: **성공.** 모델 답 `OK`, claude 종료 코드 0. 리스너가 받은 요청:
+- `POST /hook/SessionStart`, `POST /hook/UserPromptSubmit`, `POST /hook/Stop`(이 순서. Notification은 `-p`라 오지 않음, 스파이크와 같음)
+- 모두 `Authorization: Bearer <시험 토큰>`, `Content-Type: application/json`
+- 본문 키 `event`, `stdin`, `socket`, `msgToken`, `cwd`. `socket` = `\\.\pipe\LOCAL\cc-msg-<32 hex>`, `msgToken` = 32자, `cwd` = `C:\workspace`
+- `stdin`은 파싱된 hook JSON 그대로. SessionStart에는 `session_title` = `--name` 값이 있었다
+→ 스파이크의 미검증 항목 "공백 있는 경로를 따옴표로 감싼 shell form"이 이제 **확인됨**. hook 모드는 Tauri 창을 띄우지 않고 바로 끝났다(남은 프로세스 없음).

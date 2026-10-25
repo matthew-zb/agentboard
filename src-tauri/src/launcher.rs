@@ -43,6 +43,10 @@
 //!   clone, releases it, then writes the file — never `ws` during IO, never `emit_lock`.
 //! * `prompts`, `channels`, `effects` and `emit_lock` are leaves: nothing is acquired while
 //!   holding them.
+//! * `AppState::tokens` (the `Tokens` map lock) and `AppState::ctrl_url` are leaves too.
+//!   `spawn_pane` takes them one at a time (issue the role pane's token, read the URL) before
+//!   `loaded(read)`; `plan_spawn` then writes the pane's run files under `loaded(read)` only
+//!   (small local files, no other lock, never under `ws`).
 //! * Never call `PtyManager::spawn/kill/remove/write/resize/attach_with` while holding `ws`,
 //!   `loaded` or `prompts`: spawn/kill/write can block, and the PTY threads call back into
 //!   the sink (`output` -> prompts, `exited` -> ws).
@@ -52,6 +56,7 @@
 //! single worker thread (`submit`), which runs `run_effects` in order without app locks held
 //! across PtyManager calls.
 
+use crate::agentcfg::PLACEHOLDER_CTRL_URL;
 use crate::config::Loaded;
 use crate::profiles::{encode_submit, AgentProfile, ReadyDetector, READY_TIMEOUT};
 use crate::pty::SpawnSpec;
@@ -76,9 +81,17 @@ pub fn profile_for<'a>(pane: &Pane, loaded: &'a Loaded) -> Option<&'a AgentProfi
     loaded.profiles.get(&pane.agent).or_else(|| loaded.profiles.get(&loaded.config.default_agent))
 }
 
-/// Pure core of spawning: profile lookup, cwd check, command resolution, args/env merge.
+/// Per-spawn inputs of a role pane's extras (`agentcfg::role_spawn_extras`). Ignored for
+/// panes without a role.
+pub struct RoleLaunch<'a> {
+    pub ctrl_url: &'a str,
+    pub token: &'a str,
+    pub run_dir: &'a std::path::Path,
+}
+
+/// Core of spawning: profile lookup, cwd check, command resolution, args/env merge.
 /// The working folder is checked before the command so the user sees the real cause.
-pub fn plan_spawn(pane: &Pane, loaded: &Loaded) -> Result<SpawnSpec, String> {
+pub fn plan_spawn(pane: &Pane, loaded: &Loaded, launch: &RoleLaunch) -> Result<SpawnSpec, String> {
     if pane.kind.is_applet() {
         return Err("애플릿 창은 프로세스를 실행하지 않습니다".into());
     }
@@ -90,9 +103,26 @@ pub fn plan_spawn(pane: &Pane, loaded: &Loaded) -> Result<SpawnSpec, String> {
     }
     let cmd = crate::profiles::resolve_cmd(&profile.cmd)
         .ok_or_else(|| format!("명령을 찾을 수 없습니다: {} (프로필 {})", profile.cmd, profile.name))?;
-    let args = profile.args.iter().chain(pane.args.iter()).cloned().collect();
+    // profile args, then (role panes) the role extras and `roles.<role>.args`, then pane args
+    let mut args: Vec<String> = profile.args.clone();
     let mut env = profile.env.clone();
+    let mut role_env = Vec::new();
+    if let Some(role) = pane.role {
+        let (extra_args, extra_env) = crate::agentcfg::role_spawn_extras(
+            pane,
+            role,
+            loaded,
+            launch.ctrl_url,
+            launch.token,
+            launch.run_dir,
+        )?;
+        args.extend(extra_args);
+        args.extend(loaded.config.role_config(role).args);
+        role_env = extra_env;
+    }
+    args.extend(pane.args.iter().cloned());
     env.extend(pane.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env.extend(role_env); // the app's identity variables win over profile/pane env
     Ok(SpawnSpec { cmd, args, env: env.into_iter().collect(), cwd: pane.cwd.clone(), cols: START_COLS, rows: START_ROWS })
 }
 
@@ -295,6 +325,9 @@ pub fn run_effects(state: &AppState, fx: Effects) {
         if gone {
             state.pty.remove(id);
             state.ui.drop_channel(id);
+            // a removed pane's identity ends here (only role panes have these)
+            state.tokens.revoke(id);
+            crate::agentcfg::remove_run_files(&state.run_dir, id);
         } else {
             state.pty.kill(id);
         }
@@ -327,9 +360,14 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
         state.ws.lock().unwrap().set_status(id, PaneStatus::Running);
         return;
     }
+    // Role panes get a fresh token on every spawn (the previous one stops resolving).
+    // `tokens` and `ctrl_url` are leaves, taken one at a time before `loaded`.
+    let token = if pane.role.is_some() { state.tokens.issue(id) } else { String::new() };
+    let ctrl_url = state.ctrl_url.lock().unwrap().clone().unwrap_or_else(|| PLACEHOLDER_CTRL_URL.to_string());
+    let launch = RoleLaunch { ctrl_url: &ctrl_url, token: &token, run_dir: &state.run_dir };
     let (plan, job) = {
         let loaded = state.loaded.read().unwrap();
-        let plan = plan_spawn(&pane, &loaded);
+        let plan = plan_spawn(&pane, &loaded, &launch);
         let job = match (&plan, inject, pane.prompt.as_deref()) {
             (Ok(_), true, Some(p)) if !p.trim().is_empty() => {
                 profile_for(&pane, &loaded).map(|prof| PromptJob::new(prof, p, Instant::now()))
@@ -341,6 +379,7 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
     let spec = match plan {
         Ok(s) => s,
         Err(message) => {
+            state.tokens.revoke(id);
             // The old process (if any) is dead but its `exited` may still be in flight. Forget
             // its generation first, so that event is stale and cannot overwrite the failure.
             state.pty.remove(id);
@@ -371,6 +410,7 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
             }
         }
         Err(e) => {
+            state.tokens.revoke(id);
             state.prompts.lock().unwrap().remove(id);
             state.ui.drop_channel(id); // like the plan failure: the old generation is retired
             state.ws.lock().unwrap().set_status(id, PaneStatus::Failed { message: format!("실행 실패: {e}") });
@@ -449,6 +489,7 @@ mod tests {
     use super::*;
     use crate::config::{load_all, ensure_dotdir};
     use crate::profiles::{encode_submit, Ready, READY_TIMEOUT};
+    use crate::roles::Role;
     use crate::workspace::{PaneKind, PaneStatus, WsCommand};
     use regex::Regex;
     use std::collections::BTreeMap;
@@ -518,6 +559,78 @@ mod tests {
         }
     }
 
+    fn no_role() -> RoleLaunch<'static> {
+        RoleLaunch { ctrl_url: "", token: "", run_dir: std::path::Path::new("") }
+    }
+
+    #[test]
+    fn plan_spawn_role_pane_gets_extras() {
+        let fx = fixture();
+        let run = tempfile::tempdir().unwrap();
+        let mut p = pane("tool", fx.root.path().to_path_buf());
+        p.args = vec!["--pane".into()];
+        p.role = Some(Role::Manager);
+        p.session_name = Some("billing".into());
+        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:4321", token: "tk", run_dir: run.path() };
+        let spec = plan_spawn(&p, &fx.loaded, &launch).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let (extras, xenv) = crate::agentcfg::role_spawn_extras_with_exe(
+            &p,
+            Role::Manager,
+            &fx.loaded,
+            "http://127.0.0.1:4321",
+            "tk",
+            run.path(),
+            &exe,
+        )
+        .unwrap();
+        let mut want = vec!["--p1".to_string(), "--p2".to_string()];
+        want.extend(extras);
+        want.push("--pane".into());
+        assert_eq!(spec.args, want, "profile args, role extras, pane args");
+        assert_eq!(spec.args[3], "billing");
+        let env: BTreeMap<_, _> = spec.env.into_iter().collect();
+        for (k, v) in xenv {
+            assert_eq!(env.get(&k), Some(&v), "{k}");
+        }
+        assert_eq!(env.get("A").map(String::as_str), Some("profile"));
+        assert!(run.path().join("p1.mcp.json").is_file() && run.path().join("p1.settings.json").is_file());
+    }
+
+    #[test]
+    fn plan_spawn_role_args_from_config() {
+        let fx = fixture();
+        std::fs::write(
+            fx.root.path().join(".agentboard/config.json"),
+            r#"{"defaultAgent":"cmd","roles":{"lead":{"args":["--model","haiku"]}}}"#,
+        )
+        .unwrap();
+        let mut loaded = load_all(fx._appdata.path());
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        loaded.profiles = fx.loaded.profiles.clone();
+        let run = tempfile::tempdir().unwrap();
+        let mut p = pane("tool", fx.root.path().to_path_buf());
+        p.args = vec!["--pane".into()];
+        p.role = Some(Role::Lead);
+        p.session_name = Some("t-a-lead".into());
+        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:1", token: "t", run_dir: run.path() };
+        let spec = plan_spawn(&p, &loaded, &launch).unwrap();
+        let n = spec.args.len();
+        assert_eq!(&spec.args[n - 3..], &["--model".to_string(), "haiku".to_string(), "--pane".to_string()]);
+    }
+
+    #[test]
+    fn plan_spawn_without_role_has_no_extras() {
+        let fx = fixture();
+        let run = tempfile::tempdir().unwrap();
+        let p = pane("tool", fx.root.path().to_path_buf());
+        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:4321", token: "tk", run_dir: run.path() };
+        let spec = plan_spawn(&p, &fx.loaded, &launch).unwrap();
+        assert_eq!(spec.args, vec!["--p1", "--p2"]);
+        assert!(spec.env.iter().all(|(k, _)| !k.starts_with("AGENTBOARD_")));
+        assert_eq!(std::fs::read_dir(run.path()).unwrap().count(), 0, "no run files");
+    }
+
     #[test]
     fn plan_spawn_merges_args_and_env() {
         let fx = fixture();
@@ -525,7 +638,7 @@ mod tests {
         p.args = vec!["--pane".into()];
         p.env.insert("B".into(), "pane".into());
         p.env.insert("C".into(), "pane".into());
-        let spec = plan_spawn(&p, &fx.loaded).unwrap();
+        let spec = plan_spawn(&p, &fx.loaded, &no_role()).unwrap();
         assert_eq!(spec.args, vec!["--p1", "--p2", "--pane"]);
         let env: BTreeMap<_, _> = spec.env.into_iter().collect();
         assert_eq!(env.get("A").map(String::as_str), Some("profile"));
@@ -542,7 +655,7 @@ mod tests {
     fn plan_spawn_uses_default_agent() {
         let fx = fixture();
         let p = pane("no-such-profile", fx.root.path().to_path_buf());
-        let spec = plan_spawn(&p, &fx.loaded).unwrap();
+        let spec = plan_spawn(&p, &fx.loaded, &no_role()).unwrap();
         let file = spec.cmd.file_name().unwrap().to_string_lossy().to_lowercase();
         assert_eq!(file, "cmd.exe"); // defaultAgent = cmd
         assert_eq!(profile_for(&p, &fx.loaded).unwrap().name, "cmd");
@@ -552,7 +665,7 @@ mod tests {
     fn failed_spawn_sets_failed_status() {
         let fx = fixture();
         let p = pane("ghost", fx.root.path().to_path_buf());
-        let err = plan_spawn(&p, &fx.loaded).unwrap_err();
+        let err = plan_spawn(&p, &fx.loaded, &no_role()).unwrap_err();
         assert!(err.contains("명령을 찾을 수 없습니다"), "{err}");
         assert_eq!(err, "명령을 찾을 수 없습니다: agentboard-no-such-cmd-xyz (프로필 ghost)");
     }
@@ -563,7 +676,7 @@ mod tests {
         let missing = fx.root.path().join("nope");
         // checked before the command, so even an unresolvable profile reports the folder
         let p = pane("ghost", missing.clone());
-        let err = plan_spawn(&p, &fx.loaded).unwrap_err();
+        let err = plan_spawn(&p, &fx.loaded, &no_role()).unwrap_err();
         assert_eq!(err, format!("작업 폴더가 없습니다: {}", missing.display()));
     }
 
@@ -675,7 +788,7 @@ mod tests {
         let ui = std::sync::Arc::new(RecUi::default());
         let (tx, rx) = mpsc::channel();
         let pty = crate::pty::PtyManager::new_per_child_job(std::sync::Arc::new(NullSink));
-        let state = AppState::new(ws, loaded, pty, ui.clone(), tx, crate::persist::Saver::disabled(), Vec::new());
+        let state = AppState::new(ws, loaded, pty, ui.clone(), tx, crate::persist::Saver::disabled(), Vec::new(), _appdata.path().join("run"));
         Rt { state, ui, rx, pane, _keep: (root, _appdata) }
     }
 
@@ -836,7 +949,7 @@ mod tests {
         let ui = std::sync::Arc::new(RecUi::default());
         let (tx, rx) = mpsc::channel();
         let pty = crate::pty::PtyManager::new_per_child_job(std::sync::Arc::new(NullSink));
-        let state = AppState::new(ws, loaded, pty, ui.clone(), tx, crate::persist::Saver::disabled(), Vec::new());
+        let state = AppState::new(ws, loaded, pty, ui.clone(), tx, crate::persist::Saver::disabled(), Vec::new(), _appdata.path().join("run"));
         let rt = Rt { state, ui, rx, pane: disp.clone(), _keep: (root, _appdata) };
         let state = &rt.state;
 
@@ -861,7 +974,45 @@ mod tests {
         assert_eq!(state.pty.current_gen(&inbox), None);
         // the planner refuses an applet outright (defence in depth)
         let p = state.ws.lock().unwrap().pane_by_id(&inbox).cloned().unwrap();
-        assert!(plan_spawn(&p, &state.loaded.read().unwrap()).is_err());
+        assert!(plan_spawn(&p, &state.loaded.read().unwrap(), &no_role()).is_err());
+    }
+
+    fn token_in_run_file(state: &AppState, id: &str) -> String {
+        let text = std::fs::read_to_string(state.run_dir.join(format!("{id}.mcp.json"))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let auth = v["mcpServers"]["agentboard"]["headers"]["Authorization"].as_str().unwrap();
+        auth.strip_prefix("Bearer ").unwrap().to_string()
+    }
+
+    #[test]
+    fn role_spawn_reissues_token_and_removal_revokes_it() {
+        let rt = runtime();
+        let (state, id) = (&rt.state, rt.pane.clone());
+        assert_eq!(state.ws.lock().unwrap().pane_by_id(&id).unwrap().role, Some(Role::Dispatcher));
+        let fx = initial_effects(&state.ws.lock().unwrap());
+        run_effects(state, fx);
+        let t1 = token_in_run_file(state, &id);
+        assert_eq!(state.tokens.resolve(&t1).as_deref(), Some(id.as_str()));
+        let settings = std::fs::read_to_string(state.run_dir.join(format!("{id}.settings.json"))).unwrap();
+        assert!(settings.contains("--hook SessionStart"));
+        let mcp = std::fs::read_to_string(state.run_dir.join(format!("{id}.mcp.json"))).unwrap();
+        assert!(mcp.contains(&format!("{PLACEHOLDER_CTRL_URL}/mcp")), "placeholder until ctrl_url is set");
+
+        *state.ctrl_url.lock().unwrap() = Some("http://127.0.0.1:6000".into());
+        restart(&rt);
+        let t2 = token_in_run_file(state, &id);
+        assert_ne!(t1, t2);
+        assert_eq!(state.tokens.resolve(&t1), None, "old token is dead after a respawn");
+        assert_eq!(state.tokens.resolve(&t2).as_deref(), Some(id.as_str()));
+        let mcp = std::fs::read_to_string(state.run_dir.join(format!("{id}.mcp.json"))).unwrap();
+        assert!(mcp.contains("http://127.0.0.1:6000/mcp"));
+
+        // the pane leaves the model: token revoked, run files deleted
+        state.ws.lock().unwrap().panes.remove(&id);
+        run_effects(state, Effects { spawn: vec![], kill: vec![id.clone()] });
+        assert_eq!(state.tokens.resolve(&t2), None);
+        assert!(!state.run_dir.join(format!("{id}.mcp.json")).exists());
+        assert!(!state.run_dir.join(format!("{id}.settings.json")).exists());
     }
 
     #[test]

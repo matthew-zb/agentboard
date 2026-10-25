@@ -1,4 +1,6 @@
+pub mod agentcfg;
 pub mod config;
+pub mod hookcli;
 pub mod launcher;
 pub mod layout;
 pub mod persist;
@@ -61,6 +63,14 @@ pub struct AppState {
     pub saver: persist::Saver,
     /// Startup problems outside config files (e.g. a discarded workspace.json), shown in the error list.
     pub startup_errors: Vec<String>,
+    /// Per-pane bearer tokens of role panes (leaf lock inside).
+    pub tokens: agentcfg::Tokens,
+    /// Control server base URL (`http://127.0.0.1:<port>`), set by the control server (Task 5)
+    /// before the initial spawns. `None` → role panes get `agentcfg::PLACEHOLDER_CTRL_URL`.
+    /// Leaf lock.
+    pub ctrl_url: Mutex<Option<String>>,
+    /// Where role panes' run files go (`%APPDATA%/agentboard/run`).
+    pub run_dir: std::path::PathBuf,
 }
 
 impl AppState {
@@ -72,6 +82,7 @@ impl AppState {
         effects: mpsc::Sender<Effects>,
         saver: persist::Saver,
         startup_errors: Vec<String>,
+        run_dir: std::path::PathBuf,
     ) -> Self {
         AppState {
             ws: Mutex::new(ws),
@@ -84,6 +95,9 @@ impl AppState {
             emit_lock: Mutex::new(()),
             saver,
             startup_errors,
+            tokens: agentcfg::Tokens::new(),
+            ctrl_url: Mutex::new(None),
+            run_dir,
         }
     }
 }
@@ -378,7 +392,7 @@ pub fn run() {
             let pty = PtyManager::new(sink.clone());
             let (tx, rx) = mpsc::channel();
             app.manage(sink.clone()); // pty_attach registers output channels on it
-            app.manage(AppState::new(ws, loaded, pty, sink, tx, saver, startup_errors));
+            app.manage(AppState::new(ws, loaded, pty, sink, tx, saver, startup_errors, agentcfg::default_run_dir()));
             // spawning happens on the launcher thread: window creation is not blocked
             launcher::start(app.handle(), rx, initial);
 
