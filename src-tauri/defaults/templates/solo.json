@@ -1,0 +1,4 @@
+{
+  "name": "solo",
+  "layout": { "pane": { "name": "main", "focus": true } }
+}

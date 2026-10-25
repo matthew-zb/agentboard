@@ -1,0 +1,19 @@
+{
+  "name": "agentboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "vendor": "node scripts/vendor.mjs",
+    "test:js": "node --test \"tests/js/*.test.mjs\""
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@xterm/xterm": "6.0.0",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/addon-unicode11": "0.9.0",
+    "@xterm/addon-search": "0.16.0",
+    "@xterm/addon-webgl": "0.19.0"
+  }
+}

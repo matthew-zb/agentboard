@@ -1,0 +1,74 @@
+# Phase 1 후속 과제 (리뷰에서 미룬 항목)
+
+SDD 진행 중 작업별 리뷰와 최종 리뷰에서 "미룸(deferred)"으로 기록한 사소한 지적과, 1단계에서 내린 결정(Ruling) 목록입니다. 2단계 착수 전 검토하세요. 최종 리뷰는 재시작 경합(spawn generation)과 keybindings.json 섀도잉을 2단계/두 번째 릴리스 전에 해결할 항목으로 분류했습니다.
+
+## 결정(Ruling)
+- Ruling R1: T5 creates a minimal `profiles.rs` stub (`pub struct AgentProfile { pub name: String }` + `load_dir` returning names/errors) so `Loaded.profiles` compiles; T6 replaces it with the full type — avoids circular task order — cost if wrong: small refactor in T6.
+- Ruling R2: T7 implements `remove_group_if_empty` itself (T8 reuses it) — CloseTab needs it in T7 — cost if wrong: none.
+- Ruling R3: T3 sends PTY bytes over the Channel as raw binary (`tauri::ipc::InvokeResponseBody::Raw` / ArrayBuffer), attach snapshot likewise returned as raw bytes where possible — JSON number arrays would hurt S4 performance — cost if wrong: T3 rework of the bridge only.
+- Ruling R4: SplitGroupWith returns Err only when the target `group` is the tab's own group and that group has exactly one tab; moving a group's only tab to another group's edge is allowed and the emptied source group is removed — spec §6.6 edge drop must work for any tab — cost if wrong: one rule change in T8.
+- Task 1: minor (deferred): test:js quoted glob needs Node ≥21 while CI uses Node 20 — Ruling: Node 22 is the dev minimum; bump CI setup-node to 22 in Task 17 — cost if wrong: CI test step fails until bumped.
+- Ruling R5: ConPTY ESC[6n is auto-answered in the PTY reader (Task 2); when the frontend replays an attach snapshot into xterm (Task 3+), terminal replies (onData) are suppressed until the snapshot write callback fires, so replayed queries never get a second answer — cost if wrong: a stray ESC[1;1R in a restored pane's input
+- Ruling R6 (Task 2 fix): Job Object — PtyManager::new keeps its signature; failures are logged (eprintln) and exposed via `job_error(&self) -> Option<String>`; prefer assigning the app's own process to the job at startup so children inherit it (closes the assign race), falling back to per-child assign — spec §7.1 needs the guarantee but Task 3/9 depend on the infallible constructor — cost if wrong: one constructor signature change later.
+- Ruling R7 (refines R6): when self-assigned, the job handle is intentionally leaked (closed by the OS at process exit) and the job gets JOB_OBJECT_LIMIT_BREAKAWAY_OK so future non-PTY launches (editor open, updater, relaunch) can use CREATE_BREAKAWAY_FROM_JOB — keeps §7.1 guarantee without making the app's lifetime depend on a Rust drop — cost if wrong: a leaked handle per process (negligible).
+- Ruling R8: spike steps that need a human at the keyboard (S1 Alt key/beep, S2 Ctrl+R/Ctrl+P/F5, S3 claude TUI/IME, later S4-S6 and QA) are prepared by implementers as checklists in docs/spikes.md marked "사용자 확인 필요"; execution continues using the planned primary approach, and the user runs the checklist — subagents cannot drive a native window by keyboard — cost if wrong: a spike failure discovered late forces the documented fallback after later tasks are built.
+- Ruling R9: DevTools must remain usable in debug builds (plan Task 9 Step 5 uses the devtools console) — WebView2 accelerator/context-menu disabling applies to release builds, or debug builds call open_devtools — reviewer Minor #3 conflicts with plan text so it enters the fix round — cost if wrong: none.
+- Ruling R10: resize returning true on a clamped no-op is accepted (pane at its limit does not fall back to moving the group border) — matches brief wording; avoids surprising jumps — cost if wrong: user must use the group border directly at the limit.
+- Ruling R11: deserialized layouts are not normalized by serde; Task 10 (persist load) must call normalize on every loaded LayoutNode — carried into Task 10 dispatch — cost if wrong: a hand-edited workspace.json with bad sizes renders oddly.
+- Ruling R12: phase-2/Dispatcher-created tabs must always pass an explicit `group` and must not change the focused group's active tab (no auto focus moves, §6.4) — note for phase-2 spec; phase 1 CreateTab with group None is a user action — cost if wrong: phase-2 rework of CreateTab.
+- Ruling R13: Task 8 clears last_location when it equals the new focus location after group removal/merge (stale "go back" no-op) — carried into Task 8 — cost if wrong: none.
+- Ruling R14: from Task 9 on, the Workspace model is mutated only through `Workspace::apply` and `set_status` (plus restore prep in Task 10); no direct field writes from launcher/lib — keeps the sanitize invariant — cost if wrong: a stale last_location in an unforeseen path.
+- Ruling R15: Task 9 Step 5 (devtools console check) follows R8 — added to docs/spikes.md as a user check; the implementer verifies via unit tests and launch logs — cost if wrong: late discovery of a wiring bug.
+- Ruling R16: Snapshot carries a monotonically increasing `version: u64` assigned under the ws lock, and emits are serialized by a leaf emit_lock (ws → emit_lock); ws_command returns the same versioned snapshot it emits; the frontend (Task 11) ignores snapshots with version <= last seen — belt and braces against cross-thread reordering — cost if wrong: one extra field.
+- Ruling R17: dropZone lives in a new pure module src/dropzone.js (not overlays.js, which Task 13 is editing concurrently); Task 16 imports it. Pre-build covers copymode.js (Task 14 pure state machine) + dropzone.js (Task 16) with their node tests, new files only; branch merged into feature/phase1 after Task 13 completes and reviewed as its own unit "PB" — cost if wrong: a later rename/import adjustment in Task 16.
+- Ruling R18: wizard step 1 — if the query equals an existing dir name (case-insensitive) that dir is first; otherwise the "create '<query>'" entry is first and preselected; step 2 title shows the chosen dir — brief says unknown name + Enter → create — cost if wrong: one extra arrow press to pick a fuzzy match.
+- Ruling R19: startup missing-dir flow is not cancelled by tab/group switches (alive: () => true) — §4.2 questions must all be asked — folded into Task 13 fix round (Minor #1) — cost if wrong: none.
+- Ruling R20: Task 14 copy mode must not use the single-slot setModal directly; setModal becomes a stack (push/pop) or copy mode registers through overlays' active mechanism — carried into Task 14 — cost if wrong: copy mode key capture lost when an overlay opens on top.
+- Ruling R21: sync forwards only user input — a pure classifier `isTerminalReply(data)` excludes CPR, DA (primary/secondary), focus in/out, SGR/X10 mouse reports and OSC/DCS responses; replies go to the source pane only; sync also skips panes in copy mode (inputBlocked) — spec §6.3 "같은 키 입력" — cost if wrong: an exotic reply pattern slips through (classifier extendable).
+- Ruling R22: final fix wave = the 4 Important + cheap Minors (README status-bar text, README Job Object note, RestartPane resets attention/prompt_warning, strip ESC[201~/ESC from encode_submit bracketed payload, remove unused uuid dep & set-title permission). SetFocus in Rust clears a maximize that hides its target (holds for phase-2 callers too) — cost if wrong: maximize exits when jumping to a hidden pane, which is the visible-focus promise anyway.
+
+## 미룬 사소한 지적
+- Task 1: minor (deferred): test:js quoted glob needs Node ≥21 while CI uses Node 20 — Ruling: Node 22 is the dev minimum; bump CI setup-node to 22 in Task 17 — cost if wrong: CI test step fails until bumped.
+- Task 1: minor (deferred): @tauri-apps/cli ^2 not exact-pinned (lockfile covers it).
+- Task 1: minor (deferred): build.yml artifact copy `2>/dev/null || true` hides missing bundles.
+- Task 2: minor (deferred): spawn check-then-insert race (matters for phase-2 concurrent MCP calls)
+- Task 2: minor (deferred): stale exited after fast respawn of same id
+- Task 2: minor (deferred): exit drain latency; setup-failure child not waited; hand-declared OpenProcess; exit code cast undocumented; kill test lacks ordering / reader-thread-leak check
+- Task 2: minor (deferred): self-assign production path has no automated test (subprocess test suggested)
+- Task 2: minor (deferred): after 2s drain timeout the ring keeps tail bytes the sink never got
+- Task 2: minor (deferred): non-PTY launches must pass CREATE_BREAKAWAY_FROM_JOB (none exist in phase 1)
+- Task 3: minor (deferred): onBinary sent as String → bytes ≥0x80 corrupted (mouse reports)
+- Task 3: minor (deferred): pty_write/pty_resize sync on main thread; large paste can block UI
+- Task 3: minor (deferred): redundant pty_resize calls when cols/rows unchanged
+- Task 3: minor (deferred): .term-host padding may make FitAddon over-count a row/col (visual check)
+- Task 3: minor (deferred): attach failure leaves suppressInput true forever (Task 9 should surface)
+- Task 3: minor (deferred): no committed Node-import test for api.js/pane.js
+- Task 3: minor (deferred): late exited of old process can remove a respawned pane's new channel (race window)
+- Task 3: minor (deferred): attach to an exited pane leaves a stale channel; Entry.ring duplicates Batch.ring Arc
+- Task 4: minor (deferred): resize clamp inverts when a size is already <5 (>20 siblings or unclamped set_sizes)
+- Task 4: minor (deferred): slot dropped when a single-child split collapses; untagged serde errors lack location; malformed empty split; test gaps (before=true same-dir, 2-level collapse, malformed JSON)
+- Task 5: minor (deferred): defaultAgent/dispatcher.agent not validated against profiles; Alt+, vs Alt+comma normalize differently; serde syntax messages English; fit_sizes silent on wrong count; tab dir defaults to ""; defaultGroup w/o groups unvalidated; no backslash cwd escape test; stale lib.rs comment; copied keybindings.json shadows future default changes
+- Task 5: minor (deferred): defaultGroup survives as dangling value when groups layout fails in parse_config
+- Task 6: minor (deferred): resolve_cwd_handles_korean_and_spaces is near-tautological (compare to literal path string)
+- Task 6: minor (deferred): resolve_cwd joins absolute/.. cwd without guard (validated earlier in config, but not at this layer); 4KB window mid-line edge; OSC ST terminator not handled; unused start field; deleted-dispatcher test no longer exercises embedded fallback
+- Task 7: minor (deferred): CreateTab/BreakPaneToTab don't record last_location; RestartPane doesn't reset attention/prompt_warning; SplitPane drops args/env; from_config panics if dispatcher template missing (guarded by load_all); failed ResizePane silent Ok untested; missing tests (CreateTab other group, dispatcher multi-pane break, invariant checker); SetAttention clones whole workspace; check_tab_name trims only for emptiness
+- Task 8: minor (deferred): unreachable Err paths after partial mutation in SplitGroupWith/merge_groups (use expect); MergeGroup clears attention on unrelated focused pane; tests lack nested-sibling CloseGroup and split-direction structure; MoveTab index doc comment missing
+- Task 8: minor (deferred): CreateTab into focused group changes focus_location implicitly without recording last_location; Workspace fields are pub (invariant relies on convention)
+- Task 9: minor (deferred): failed restart Failed{..} can be overwritten by old process's late Exited (needs spawn generation); check_dir_name accepts Windows reserved names/invalid chars/trailing dot-space and dot-dirs; failed_spawn_sets_failed_status doesn't test status mapping; READY_TIMEOUT starts at planning
+- Task 9: minor (deferred): api.snapshot() returns stale snapshot past the gate; send() may resolve null — Task 11 callers must handle
+- Task 10: minor (deferred): lock-order doc (emit_lock → saver.tx); failed save only logged; flush on main thread up to 5s; misleading "corrupt" message for read errors, startup_errors undismissable; roundtrip test lacks non-default sync/maximize; integrity test asserts only is_err; temp dir leak via keep(); timing-dependent saver tests
+- Task 11: minor (deferred): background snapshot can pull DOM focus back during in-flight click setFocus; WebGL contexts on hidden panes (oldest visible lose first); headers rebuilt every snapshot (lost tooltip/click); pty_resize on every drag step; restarted hidden pane runs at spawn size; old Channel callbacks not released per re-attach
+- Task 11: minor (deferred): stale exited snapshot with restartMarked triggers one extra reset (self-healing)
+- Task 12: minor (deferred): Ctrl+Shift+V paste swallowed until Task 14 wires pane.paste; empty keymap window at startup; failed get_passthrough never retried; overlapping mouse/key focus requests clear guard early; DOM router lacks node tests; tab moves no-op while a group is maximized
+- PB: minor (deferred): rows undefined/0 → NaN in PageUp/Down/viewportFor (guard Math.max(1,rows)); col is UTF-16 index (DOM layer maps to cells); unused anchor.col/search.dir; viewportFor unclamped; test gaps (visible-edge, empty buffer, setSearch clear, g/G col, exact 25%)
+- Task 13: minor (deferred): focus gaps between wizard steps during IPC; settleFocus/applyFocus not gated by overlayOpen; latent stuck-modal if build calls finish synchronously; picker numbers stop at 9; no router unit tests for modal semantics
+- Task 14: minor (deferred): first / and n/N skip cursor line; scrollback trim drifts copy cursor/anchor (use markers); wrapped lines copied as separate lines; success toast styled as error; dead legacy setModal path; no tests for fan-out path / focused-pane gating; IME composition in copy mode unverified
+- Task 14: minor (deferred): modified F3 keys (ESC[1;2R) indistinguishable from CPR → not fanned out; "복사했습니다" toast styled as error (toast has no style param)
+- Task 15: minor (deferred): regain-focus clear races with unrendered setAttention; regain-focus clear while overlay open; no tests for origin lifecycle; mid-file import in focus.test.mjs
+- Task 15: minor (deferred): enqueue drops jobs beyond MAX_QUEUED (regain-focus clear could be dropped); bellInFlight/regain-focus wiring untested
+- Task 16: minor (deferred): own-group center drop moves tab to end; hard-coded top:29px overlay offset; brief post-drop refocus gap before MoveTab snapshot
+- Task 16: minor (deferred): dragover freshness only refreshed under #groups — drag held over other chrome >400ms + stray buttons===0 event could still cancel (move freshness to document capture dragover)
+- Task 17: minor (deferred): running_count failure shows "1개"; app_exit sync on main thread (flush up to 5s); close listener registered async without catch; Enter confirms destructive exit dialog (spec says Y/N); keytable.mjs '|' escape no-op; CI runs only on tags
+
+## 최종 리뷰 이후 남은 사소한 지적
+- Final fix: re-review clean (9/9 addressed; commits 044fd5f..5cd5b18). Minor: stale duplicate JSDoc overlays.js:307; run_effects remove branch untested; brief attach/drop_channel race self-heals

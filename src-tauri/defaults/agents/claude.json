@@ -1,0 +1,14 @@
+{
+  "name": "claude",
+  "level": "L2",
+  "cmd": "claude",
+  "args": [],
+  "env": {},
+  "ready": { "idleMs": 800 },
+  "submit": { "bracketedPaste": true, "key": "\r" },
+  "passthroughKeys": [],
+  "systemPrompt": { "arg": "--append-system-prompt" },
+  "mcp": { "arg": "--mcp-config", "format": "claude-json" },
+  "idle": { "via": "hook" },
+  "resume": { "via": "hook-session-id", "arg": "--resume" }
+}
