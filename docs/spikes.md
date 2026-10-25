@@ -409,7 +409,28 @@ Claude Code에서 `/config` → 알림 채널(notification channel)을 terminal 
  "hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node C:/workspace/agentboard/spikes/phase2/hooklog.mjs SessionStart C:/…/hooks"}]}],
           "UserPromptSubmit":[…같은 꼴…],"Stop":[…],"Notification":[…]}}
 ```
-- hook 명령(shell form)은 **Git Bash**로 실행된다(Git Bash가 없으면 PowerShell, 문서). 공백 있는 경로는 따옴표가 필요하다. `agentboard.exe --hook <event>`는 exec form(`"command":"<exe 절대경로>","args":["--hook","SessionStart"]`, 문서상 실제 `.exe`면 가능)을 권장 — **exec form 자체는 미검증**.
+- hook 명령(shell form)은 **Git Bash**로 실행된다(Git Bash가 없으면 PowerShell, 문서). **검증된 것은 공백 없는 경로의 shell form뿐이다**: `"command":"node C:/workspace/agentboard/spikes/phase2/hooklog.mjs SessionStart C:/…/hooks"`.
+
+#### 앱용 settings 파일 (복사용)
+`agentboard.exe`가 공백 있는 경로(예: `C:\Program Files\AgentBoard\agentboard.exe`)에 있을 때의 형태:
+
+```json
+{
+  "crossSessionInbound": "accept",
+  "hooks": {
+    "SessionStart":     [{"hooks":[{"type":"command","command":"\"C:/Program Files/AgentBoard/agentboard.exe\" --hook SessionStart"}]}],
+    "UserPromptSubmit": [{"hooks":[{"type":"command","command":"\"C:/Program Files/AgentBoard/agentboard.exe\" --hook UserPromptSubmit"}]}],
+    "Stop":             [{"hooks":[{"type":"command","command":"\"C:/Program Files/AgentBoard/agentboard.exe\" --hook Stop"}]}],
+    "Notification":     [{"hooks":[{"type":"command","command":"\"C:/Program Files/AgentBoard/agentboard.exe\" --hook Notification"}]}]
+  }
+}
+```
+따옴표·이스케이프 규칙:
+- `command` 문자열은 Git Bash가 해석한다. exe 경로를 **큰따옴표로 감싸고**, JSON 안에서는 그 큰따옴표를 `\"`로 쓴다.
+- 경로 구분자는 **슬래시(`C:/Program Files/…`)를 권장**한다. 역슬래시를 쓰려면 JSON에서 `\\`로 두 번 쓴다: `"\"C:\\Program Files\\AgentBoard\\agentboard.exe\" --hook SessionStart"`. 그러면 bash는 `"C:\Program Files\AgentBoard\agentboard.exe"`를 받는다. bash 큰따옴표 안의 `\P`·`\A`는 그대로 남지만, 경로에 `$`, `` ` ``, `"`, `\`가 연달아 오는 경우는 깨질 수 있다. 그래서 슬래시가 안전하다.
+- Rust에서는 `serde_json`으로 만들면 JSON 이스케이프는 자동이다. 앱은 `format!("\"{}\" --hook {}", exe_path.replace('\\', "/"), event)`만 만들면 된다.
+- **미검증**: 공백 있는 경로를 따옴표로 감싼 shell form(위 JSON)은 스파이크에서 실제로 실행해 보지 않았다. 검증된 것은 공백 없는 경로뿐이다. Task 4/5에서 첫 실행 때 SessionStart 보고가 오는지로 확인할 것.
+- **미검증**: exec form(`"command":"C:/Program Files/AgentBoard/agentboard.exe","args":["--hook","SessionStart"]`, 문서상 실제 `.exe`면 셸 없이 실행). 따옴표 문제가 없어 더 안전해 보이지만 실행해 보지 않았다.
 
 ### hook이 받는 환경 변수 (SessionStart뿐 아니라 모든 hook에 있음)
 ```
@@ -441,6 +462,7 @@ named pipe에 연결(Node `net.connect(path)`) → 아래 두 줄을 쓰고 → 
   ```
   → 수신 transcript의 `origin`이 `{"kind":"peer","from":"unknown","selfSent":true,"name":"agentboard","body":"본문"}`이고, 모델은 보낸 이를 "agentboard"로 인식한다. 속성 순서는 `from`, `from-session`, `hop-chain`, `from-name`, `from-mode`, `from-plugin`이며 이 순서를 어기면 래퍼로 인식되지 않는다(바이너리의 파서 정규식). 이름에 `"`, `<`, `>`, 줄바꿈 금지. **`from=`은 넣지 말 것** — 회신 주소(`uds:<파이프>`)로 쓰인다.
 - 30초 안에 완전한 줄을 보내지 않으면 연결이 닫힌다(문서). 메시지가 준비된 뒤에 연결한다.
+- 줄 규칙: **한 줄에 JSON 객체 하나, 끝은 `\n`**. 여러 줄 본문은 JSON 문자열 안에서 `\n`으로 이스케이프한다(래퍼의 줄바꿈도 같다). 실제 개행 문자를 넣으면 줄이 끊긴다. 인코딩은 UTF-8로 쓴다(Node 기본값). 스파이크 본문은 ASCII만 썼으므로 **한글 등 비ASCII 본문은 미검증**이다.
 - 잘못된 토큰(`000…`): 연결이 닫히고 아무것도 전달되지 않았다(확인).
 
 ### 받는 쪽에서 어떻게 보이나 (중요)
@@ -478,7 +500,7 @@ Claude Code가 보내는 순서(모든 요청에 `authorization: Bearer x`, `acc
 | 5 | `POST` `{"method":"tools/list","jsonrpc":"2.0","id":1}` | | 200 `{"result":{"tools":[…]}}` |
 | 6 | `POST` `{"method":"tools/call","params":{"name":"echo_who","arguments":{"text":"ping"},"_meta":{"claudecode/toolUseId":"toolu_…","progressToken":2}},"jsonrpc":"2.0","id":2}` | | 200 `{"result":{"content":[{"type":"text","text":"…"}],"isError":false}}` |
 
-control.rs 구현 지침: `server/discover`는 `-32601`(또는 구현), `initialize`는 요청의 `protocolVersion`을 돌려주고, 알림(id 없음)은 202, `GET`은 405, 응답은 항상 `Content-Type: application/json` 단일 JSON. `Mcp-Session-Id`는 주면 그대로 되돌아온다(안 줬을 때의 동작은 미검증 — 주는 쪽을 권장). id는 숫자·문자열 둘 다 온다. 도구 이름은 `mcp__<서버키>__<도구>`.
+control.rs 구현 지침: `server/discover`에는 **정확히 HTTP 200 + JSON-RPC 오류 `{"jsonrpc":"2.0","id":<요청 id>,"error":{"code":-32601,"message":"Method not found"}}`**로 답한다. 검증된 것은 이 응답뿐이다. 404·405·500 같은 다른 HTTP 응답에 클라이언트가 initialize로 대체하는지는 **미검증**이므로, Task 5는 반드시 200 + -32601로 답한다. `initialize`는 요청의 `protocolVersion`을 돌려주고, 알림(id 없음)은 202, `GET`은 405, 응답은 항상 `Content-Type: application/json` 단일 JSON. `Mcp-Session-Id`는 주면 그대로 되돌아온다(안 줬을 때의 동작은 미검증 — 주는 쪽을 권장). id는 숫자·문자열 둘 다 온다. 도구 이름은 `mcp__<서버키>__<도구>`.
 - 대안(URL 경로 토큰)은 필요 없다.
 - 참고: P3 실행은 부모 세션 환경을 물려받아 user-agent에 `claude-desktop`이 찍혔다(아래 "환경 변수 정리").
 
@@ -496,6 +518,10 @@ control.rs 구현 지침: `server/discover`는 `-32601`(또는 구현), `initial
 {"session_id":"…","transcript_path":"…","cwd":"C:\\workspace","scratchpad_dir":"…","prompt_id":"…","hook_event_name":"Notification","message":"Claude is waiting for your input","notification_type":"idle_prompt"}
 ```
 - Notification은 `-p` 워커에서는 한 번도 발화하지 않았다(대화형 전용).
+- **`permission_prompt`는 `--permission-mode default`인 대화형 세션에서만 관찰했다.** 이 PC의 대화형 기본값은 `auto`이고, auto 실행에서는 같은 Write 요청이 프롬프트 없이 허용됐다. 그래서 permission_prompt가 오지 않았고 실제로 파일이 써졌다. 즉 권한 대기 주의(⚠) 표시는 **권한 모드에 따라 다르다**. auto 세션은 대부분 권한 대기 자체가 생기지 않으며, auto 분류기가 묻는 경우의 동작은 미검증이다.
+- `idle_prompt`: 정상 종료(Stop) 후 약 60초 동안 입력이 없을 때 1회 왔다(auto 실행, Stop 17:28:00 → Notification 17:29:07).
+- Esc 경우: 권한 프롬프트를 Esc로 중단하면 Stop이 오지 않았고, 이후 110초 동안 `idle_prompt`도 오지 않았다(아래 항목).
+- 시험 주의: auto 모드의 대화형 시험은 **실제로 파일을 쓴다**(스파이크에서 `C:/workspace/abspike-should-not-exist.txt`가 생겨 바로 지움). 권한 관련 시험은 `--permission-mode default`로 하고 거부(Esc)한다.
 - 대화형에서 권한 프롬프트를 **Esc로 중단**하면 Stop hook이 오지 않았고, 이후 110초 동안 `idle_prompt`도 오지 않았다. → 주의 표시·야간 정리의 "idle" 판단을 Stop 하나에만 기대지 말 것(UserPromptSubmit 뒤 Stop 없이 끝나는 경우가 있다).
 - `permission_mode`는 이 PC의 대화형 기본값이 `auto`로 나왔다(사용자 설정).
 
