@@ -1,0 +1,18 @@
+{
+  "name": "team-3",
+  "layout": {
+    "split": "horizontal",
+    "sizes": [60, 40],
+    "children": [
+      { "pane": { "name": "lead", "agent": "claude", "focus": true } },
+      {
+        "split": "vertical",
+        "slot": "members",
+        "children": [
+          { "pane": { "name": "coder", "agent": "claude" } },
+          { "pane": { "name": "tests", "agent": "powershell" } }
+        ]
+      }
+    ]
+  }
+}
