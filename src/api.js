@@ -31,19 +31,53 @@ export function resize(paneId, cols, rows) {
 
 const invoke = (name, args) => tauri().core.invoke(name, args);
 
-/** Apply a WsCommand (`{type: 'splitPane', ...}`); resolves to the Snapshot `{workspace, errors}`. */
-export function send(cmd) {
-  return invoke('ws_command', { cmd });
+/**
+ * Version gate (R16): snapshots are emitted from several backend threads and may arrive out
+ * of order. `accept(snap)` is true only for a version greater than the last accepted one.
+ * Pure — no Tauri access — so it is unit-testable.
+ */
+export function makeVersionGate() {
+  let last = 0;
+  return {
+    accept(snap) {
+      if (!snap || typeof snap.version !== 'number' || snap.version <= last) return false;
+      last = snap.version;
+      return true;
+    },
+    get last() {
+      return last;
+    },
+  };
 }
 
-/** Current Snapshot `{workspace, errors}`. */
-export function snapshot() {
-  return invoke('ws_snapshot');
+// Module-wide last-seen snapshot version shared by send/snapshot/onWorkspaceChanged.
+const gate = makeVersionGate();
+
+/**
+ * Apply a WsCommand (`{type: 'splitPane', ...}`). Resolves to the Snapshot
+ * `{workspace, errors, version}` it produced, or `null` when a newer snapshot was already
+ * delivered (the caller then already has newer state). Rejects with the Korean error.
+ */
+export async function send(cmd) {
+  const snap = await invoke('ws_command', { cmd });
+  return gate.accept(snap) ? snap : null;
 }
 
-/** Called with a Snapshot after every model or pane status change; resolves to an unlisten fn. */
+/** Current Snapshot `{workspace, errors, version}` (always returned; also advances the gate). */
+export async function snapshot() {
+  const snap = await invoke('ws_snapshot');
+  gate.accept(snap);
+  return snap;
+}
+
+/**
+ * Called with a Snapshot after every model or pane status change, skipping snapshots older
+ * than the last delivered one; resolves to an unlisten fn.
+ */
 export function onWorkspaceChanged(fn) {
-  return on('workspace-changed', fn);
+  return on('workspace-changed', (snap) => {
+    if (gate.accept(snap)) fn(snap);
+  });
 }
 
 /** Config error lines (`파일:줄:열 — 원인`), job object problems included. */

@@ -16,6 +16,7 @@ use launcher::PromptJob;
 use pty::{PtyManager, PtySink};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use tauri::ipc::{Channel, InvokeResponseBody, Response};
@@ -24,11 +25,14 @@ use workspace::{Effects, PaneId, TabId, Workspace, WsCommand};
 
 /// Payload of `ws_command` / `ws_snapshot` and of the `workspace-changed` event.
 /// `errors` = number of config error lines (`config_errors().len()`).
+/// `version` strictly increases in model order (stamped under the `ws` lock); the frontend
+/// drops snapshots older than the last one it delivered (R16).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub workspace: Workspace,
     pub errors: usize,
+    pub version: u64,
 }
 
 /// Lock order: see the module docs of `launcher`.
@@ -41,6 +45,10 @@ pub struct AppState {
     /// Queue to the launcher worker thread (`launcher::submit`).
     pub effects: Mutex<mpsc::Sender<Effects>>,
     pub sink: Arc<AppSink>,
+    /// Last issued `Snapshot::version`; incremented only while `ws` is held.
+    pub version: AtomicU64,
+    /// Serializes "versioned snapshot + emit" (order ws -> emit_lock; leaf).
+    pub emit_lock: Mutex<()>,
 }
 
 /// Delivers PTY output to the attached frontend channel as raw binary and forwards
@@ -123,9 +131,7 @@ fn ws_command(state: State<'_, AppState>, cmd: WsCommand) -> Result<Snapshot, St
         ws.apply(cmd, &loaded)?
     };
     launcher::submit(&state, fx);
-    let snap = launcher::snapshot(&state);
-    let _ = state.app.emit(launcher::WORKSPACE_CHANGED, snap.clone());
-    Ok(snap)
+    Ok(launcher::publish(&state))
 }
 
 #[tauri::command]
@@ -223,6 +229,8 @@ pub fn run() {
                 prompts: Mutex::new(HashMap::new()),
                 effects: Mutex::new(tx),
                 sink,
+                version: AtomicU64::new(0),
+                emit_lock: Mutex::new(()),
             });
             // spawning happens on the launcher thread: window creation is not blocked
             launcher::start(app.handle(), rx, initial);

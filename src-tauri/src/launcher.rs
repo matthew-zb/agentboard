@@ -12,7 +12,11 @@
 //!   `ws -> PtyManager::is_running/job_error` (only the `panes` map lock / job_error lock +
 //!   an atomic; never blocks on a process), `flush_lock -> prompts` (sink `output` feeds the
 //!   ReadyDetector), `flush_lock -> channels` (sink `output` and `pty_attach`).
-//! * `prompts`, `channels` and `effects` are leaves: nothing is acquired while holding them.
+//! * `ws -> emit_lock` (R16): `publish` stamps a version under `ws`, takes `emit_lock`,
+//!   releases `ws`, emits, then releases `emit_lock` — emits go out in version order and
+//!   never while `ws` is held.
+//! * `prompts`, `channels`, `effects` and `emit_lock` are leaves: nothing is acquired while
+//!   holding them.
 //! * Never call `PtyManager::spawn/kill/write/resize/attach_with` while holding `ws`,
 //!   `loaded` or `prompts`: spawn/kill/write can block, and the PTY threads call back into
 //!   the sink (`output` -> prompts, `exited` -> ws).
@@ -27,6 +31,7 @@ use crate::profiles::{encode_submit, AgentProfile, ReadyDetector, READY_TIMEOUT}
 use crate::pty::SpawnSpec;
 use crate::workspace::{Effects, Pane, PaneStatus, TabId, Workspace};
 use crate::{AppState, Snapshot};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -135,15 +140,35 @@ pub fn error_lines(state: &AppState) -> Vec<String> {
     v
 }
 
-/// Snapshot of the model (`ws` is released before the error count is taken).
+/// Pure: a snapshot stamped with the next version. Callers hold the `ws` lock (R16), so
+/// version order equals model order.
+pub fn versioned(ws: &Workspace, counter: &AtomicU64, errors: usize) -> Snapshot {
+    let version = counter.fetch_add(1, Ordering::SeqCst) + 1;
+    Snapshot { workspace: ws.clone(), errors, version }
+}
+
+/// Versioned snapshot of the model, not emitted (`ws_snapshot`).
 pub fn snapshot(state: &AppState) -> Snapshot {
-    let workspace = state.ws.lock().unwrap().clone();
-    Snapshot { workspace, errors: error_lines(state).len() }
+    let errors = error_lines(state).len();
+    let ws = state.ws.lock().unwrap();
+    versioned(&ws, &state.version, errors)
+}
+
+/// Take a versioned snapshot and emit it as `workspace-changed`; returns exactly what was
+/// emitted. `emit_lock` is acquired before `ws` is released (ws -> emit_lock), so emits
+/// leave in version order while the emit itself runs without `ws` held.
+pub fn publish(state: &AppState) -> Snapshot {
+    let errors = error_lines(state).len();
+    let ws = state.ws.lock().unwrap();
+    let snap = versioned(&ws, &state.version, errors);
+    let _emit = state.emit_lock.lock().unwrap();
+    drop(ws);
+    let _ = state.app.emit(WORKSPACE_CHANGED, snap.clone());
+    snap
 }
 
 pub fn emit_changed(state: &AppState) {
-    let snap = snapshot(state);
-    let _ = state.app.emit(WORKSPACE_CHANGED, snap);
+    publish(state);
 }
 
 /// Queue effects for the launcher worker (run in submission order, off the caller's thread).
@@ -472,6 +497,21 @@ mod tests {
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].1, "api");
         assert_eq!(ws.tabs[&missing[0].0].name, "api");
+    }
+
+    #[test]
+    fn snapshot_versions_strictly_increase() {
+        let fx = fixture();
+        let ws = Workspace::from_config(&fx.loaded);
+        let counter = AtomicU64::new(0);
+        let vs: Vec<u64> = (0..5).map(|_| versioned(&ws, &counter, 2).version).collect();
+        assert!(vs.windows(2).all(|w| w[1] > w[0]), "{vs:?}");
+        assert!(vs[0] >= 1);
+        let s = versioned(&ws, &counter, 2);
+        assert_eq!(s.errors, 2);
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["version"], 6);
+        assert!(json.get("workspace").is_some());
     }
 
     #[test]
