@@ -38,7 +38,7 @@ DevTools 정책(R9): 가속키 비활성화는 디버그·릴리스 공통. 컨�
 결과: (미기록)
 
 ## S1 — Alt 키 처리
-`src/app.js`에 임시 프로브가 있다: 문서 keydown capture에서 `Alt+H`를 `preventDefault`(`// TEMP(Task 11)`).
+Task 11에서 `src/app.js`의 임시 프로브(`Alt+H` `preventDefault`)를 제거했다. `Alt+H` 항목은 Task 12 키 라우터가 들어온 뒤 확인한다.
 - [ ] 사용자 확인 필요 — `Alt`만 눌렀다 뗐을 때 xterm 포커스가 유지된다(이후 바로 타이핑됨).
 - [ ] 사용자 확인 필요 — `Alt`만 눌렀다 뗐을 때 경고음이 나지 않는다.
 - [ ] 사용자 확인 필요 — `Alt+H`(프로브 적용 상태)에서 경고음이 나지 않는다.
@@ -57,3 +57,103 @@ DevTools 정책(R9): 가속키 비활성화는 디버그·릴리스 공통. 컨�
 - [ ] 사용자 확인 필요 — 화면에 포커스된 탭의 창 하나가 나타나 입력이 된다(Task 11 전까지의 임시 화면).
 
 결과: (미기록)
+
+## Task 11 — 화면 렌더링 + 스파이크 S4 (사용자 확인 필요)
+
+자동 확인: `cargo test`·`npm run test:js` 통과. `npx tauri dev` 기동 후 개발 로그에 패닉·오류 없음.
+추가로 `__TAURI__`를 흉내 낸 모의 스냅샷(그룹 2개, 3분할 탭 + 숨은 탭)을 헤드리스 Chromium에 띄워 다음을 확인했다:
+- 탭 전환 시 숨은 탭의 창은 `#parking`으로 옮겨진다.
+- 돌아오면 같은 xterm DOM이 재사용된다.
+- 창 클릭과 탭 클릭은 `SetFocus` 명령을 보낸다.
+- 경계 드래그는 `SetSizes`를 보낸다(탭 경계는 `tab`, 그룹 경계는 `tab:null`).
+- ⟳를 누르면 `RestartPane` → ◌ → ●로 바뀌고 다시 attach한다.
+- 명령 오류는 상태 표시줄에 표시된다.
+- `pty_resize`는 열·행이 바뀔 때만 호출된다.
+
+이 확인은 실제 WebView2 창이나 실제 PTY에서 본 결과가 아니다. 아래 항목은 모두 사용자 확인이 필요하다.
+
+### 준비 파일 (`C:/workspace/.agentboard/`)
+`templates/grid-3x3.json` (S4용 임시 템플릿, Claude 9개):
+```json
+{
+  "name": "grid-3x3",
+  "layout": {
+    "split": "vertical",
+    "children": [
+      { "split": "horizontal", "children": [
+        { "pane": { "name": "c1", "agent": "claude", "focus": true } },
+        { "pane": { "name": "c2", "agent": "claude" } },
+        { "pane": { "name": "c3", "agent": "claude" } } ] },
+      { "split": "horizontal", "children": [
+        { "pane": { "name": "c4", "agent": "claude" } },
+        { "pane": { "name": "c5", "agent": "claude" } },
+        { "pane": { "name": "c6", "agent": "claude" } } ] },
+      { "split": "horizontal", "children": [
+        { "pane": { "name": "c7", "agent": "claude" } },
+        { "pane": { "name": "c8", "agent": "claude" } },
+        { "pane": { "name": "c9", "agent": "claude" } } ] }
+    ]
+  }
+}
+```
+`templates/grid-3x3-ping.json`도 만든다. 위 파일을 복사해 `name`을 `grid-3x3-ping`으로 바꾸고, 각 창을 다음처럼 바꾼다:
+
+```json
+{ "pane": { "name": "c1", "agent": "cmd", "args": ["/k", "ping", "-t", "127.0.0.1"] } }
+```
+
+이 템플릿은 `ping` 부하를 줄 때 쓴다. 대신 Claude 창에서 `!ping -t 127.0.0.1`을 실행해도 된다.
+
+`config.json` (Step 2와 S4에서 함께 사용; `dir`은 `C:/workspace` 아래에 실제로 있는 폴더여야 한다):
+```json
+{
+  "tabs": [
+    { "name": "team", "dir": "agentboard", "template": "team-3" },
+    { "name": "s4", "dir": "agentboard", "template": "grid-3x3" },
+    { "name": "s4-ping", "dir": "agentboard", "template": "grid-3x3-ping" }
+  ]
+}
+```
+주의: 모든 탭의 창은 시작 시 실행된다. Step 2만 확인할 때는 `s4`·`s4-ping` 항목을 빼고 실행한다.
+
+### Step 2 — 화면 확인
+- [ ] 사용자 확인 필요 — `team` 탭에서 3분할(lead 60% | coder/tests 상하)이 보인다. 각 창 헤더에 이름·프로필·상태 기호(● 실행)가 표시되고, 포커스 창은 파란 테두리로 강조된다.
+- [ ] 사용자 확인 필요 — 다음 순서로 확인한다:
+  1. 각 창에 글자를 출력한다.
+  2. 탭 바에서 `dispatcher`를 클릭한다.
+  3. 다시 `team`을 클릭한다.
+
+  출력이 그대로 남아 있으면 통과다. 터미널이 재생성되면(화면이 지워지거나 스크롤백이 사라지면) 실패다.
+- [ ] 사용자 확인 필요 — 창을 클릭하면 테두리와 상태 표시줄(`그룹 › 탭 › 창`)이 바뀌고, 바로 입력할 수 있다.
+- [ ] 사용자 확인 필요 — 창 경계를 끌어 크기를 바꾼다. 놓은 뒤에도 크기가 유지되고, TUI가 새 크기로 다시 그려진다.
+- [ ] 사용자 확인 필요 — `tests`(powershell)에서 `exit`를 입력한다:
+  1. 헤더가 `○ 0`으로 바뀌고, 창 아래에 "Enter: 재시작" 줄이 보인다.
+  2. Enter를 누르면 ◌ → ●로 바뀌고 새 프롬프트가 나온다.
+- [ ] 사용자 확인 필요 — 헤더 ⟳는 창을 재시작하고, ✕는 창을 닫는다.
+- [ ] 사용자 확인 필요 — 창 크기를 바꾸면 모든 보이는 창의 줄바꿈 폭이 따라간다.
+- [ ] 사용자 확인 필요 — 콘솔 오류가 없는지 DevTools 콘솔에서 확인한다(`$env:AGENTBOARD_DEVTOOLS='1'; npx tauri dev`).
+
+결과: (미기록)
+
+### Step 3 — 스파이크 S4 (성능)
+1. 위 `config.json`으로 실행하고 `s4` 탭을 연다. Claude 9개가 모두 ●가 될 때까지 기다린다.
+2. `s4-ping` 탭을 연다. 또는 `s4` 탭의 9개 창에서 각각 `!ping -t 127.0.0.1`을 실행한다.
+3. 출력이 계속 흐르는 동안 다음 두 가지를 관찰한다:
+   - 한 창에서 타이핑해 반응 지연을 본다.
+   - 작업 관리자에서 `agentboard.exe`와 WebView2(`msedgewebview2.exe`) 프로세스의 CPU 합계를 본다.
+4. 핑 탭을 숨긴 상태(`team` 탭 표시)에서 CPU도 기록한다.
+
+- 기준: 타이핑 반응이 체감상 지연 없음, 앱 CPU 30% 이하.
+- 참고: 브라우저의 WebGL 컨텍스트 수 제한(보통 16개) 때문에, 창이 많으면 오래된 창이 컨텍스트를 잃고 DOM 렌더러로 바뀔 수 있다(`onContextLoss` → dispose). 이 경우 콘솔에 WebGL 경고가 보이는지도 기록한다.
+- 미달이면 다음을 차례로 적용한다:
+  1. 비가시 탭은 `term.write`를 보류하고 attach 스냅샷으로 따라잡는다.
+  2. 배치 주기(16ms)를 늘린다.
+
+| 항목 | 값 |
+|---|---|
+| 9개 Claude 대기 시 CPU | (미기록) |
+| 9개 ping 출력 중 CPU (보이는 탭) | (미기록) |
+| 9개 ping 출력 중 CPU (숨은 탭) | (미기록) |
+| 타이핑 지연 체감 | (미기록) |
+| WebGL 컨텍스트 손실 여부 | (미기록) |
+| 적용한 완화책 | (미기록) |

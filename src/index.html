@@ -8,7 +8,12 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <div id="app"></div>
+  <div id="main">
+    <aside id="sidebar" class="hidden"></aside>
+    <div id="groups"></div>
+  </div>
+  <div id="status"><span class="status-path"></span><span class="status-msg"></span><span class="status-flags"></span></div>
+  <div id="parking" aria-hidden="true"></div>
   <script type="module" src="app.js"></script>
 </body>
 </html>

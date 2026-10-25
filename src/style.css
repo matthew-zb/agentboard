@@ -1,3 +1,91 @@
-html, body { margin: 0; height: 100%; background: #1e1e1e; color: #ddd; font-family: "Segoe UI", sans-serif; }
-#app { height: 100%; }
-.term-host { width: 100%; height: 100%; padding: 4px; box-sizing: border-box; }
+:root {
+  --bg: #1e1e1e;
+  --chrome: #252526;
+  --chrome-2: #2d2d2d;
+  --line: #3c3c3c;
+  --text: #dddddd;
+  --muted: #8a8a8a;
+  --accent: #4ea1ff;
+  --warn: #f5c542;
+  --bad: #f06464;
+  --ok: #5fcf80;
+}
+
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: "Segoe UI", "Malgun Gothic", sans-serif; font-size: 13px; overflow: hidden; }
+body { display: flex; flex-direction: column; }
+#main { flex: 1; display: flex; min-height: 0; }
+#groups { flex: 1; display: flex; min-width: 0; min-height: 0; }
+
+/* Offscreen home for panes of inactive tabs (terminal kept alive, not recreated). */
+#parking { position: absolute; left: -10000px; top: 0; width: 800px; height: 600px; overflow: hidden; visibility: hidden; }
+
+/* ---- split layout (layout.js) ---- */
+.groups-root { flex: 1; }
+.split { display: flex; flex: 1; min-width: 0; min-height: 0; }
+.split-h { flex-direction: row; }
+.split-v { flex-direction: column; }
+.layout-cell { display: flex; flex: 1; min-width: 0; min-height: 0; }
+.layout-cell > * { flex: 1; min-width: 0; min-height: 0; }
+.gutter { flex: 0 0 4px; background: var(--chrome-2); }
+.gutter-h { cursor: col-resize; }
+.gutter-v { cursor: row-resize; }
+.gutter:hover, .gutter.active { background: var(--accent); }
+body.dragging-h, body.dragging-h * { cursor: col-resize !important; user-select: none; }
+body.dragging-v, body.dragging-v * { cursor: row-resize !important; user-select: none; }
+
+/* ---- groups + tab bars ---- */
+.group { display: flex; flex-direction: column; min-width: 0; min-height: 0; border: 1px solid var(--line); box-sizing: border-box; }
+.group.focused { border-color: #2f5f8f; }
+.tabbar-slot { flex: 0 0 auto; }
+.group-body { flex: 1; display: flex; min-width: 0; min-height: 0; }
+.tabbar { display: flex; align-items: stretch; height: 28px; background: var(--chrome); border-bottom: 1px solid var(--line); overflow: hidden; user-select: none; }
+.tabbar.dim { opacity: 0.55; }
+.group-name { padding: 0 10px; display: flex; align-items: center; color: var(--muted); font-size: 11px; border-right: 1px solid var(--line); white-space: nowrap; }
+.tabbar.focused .group-name { color: var(--accent); }
+.tab { display: flex; align-items: center; gap: 5px; padding: 0 12px; cursor: pointer; color: var(--muted); border-right: 1px solid var(--line); white-space: nowrap; }
+.tab:hover { background: var(--chrome-2); }
+.tab.active { color: var(--text); background: var(--bg); box-shadow: inset 0 -2px 0 var(--muted); }
+.tabbar.focused .tab.active { box-shadow: inset 0 -2px 0 var(--accent); }
+.tab-icon { color: var(--accent); font-size: 10px; }
+.tab-badge { color: var(--warn); }
+
+/* ---- panes ---- */
+.pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; border: 2px solid transparent; box-sizing: border-box; background: var(--bg); }
+.pane.focused { border-color: var(--accent); }
+.pane-header { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; height: 22px; padding: 0 4px 0 8px; background: var(--chrome); font-size: 12px; user-select: none; white-space: nowrap; overflow: hidden; }
+.pane.focused .pane-header { background: #1f3550; }
+.pane-name { font-weight: 600; }
+.pane-profile { color: var(--muted); }
+.pane-status.running { color: var(--ok); }
+.pane-status.exited { color: var(--muted); }
+.pane-status.starting { color: var(--accent); }
+.pane-status.failed { color: var(--bad); }
+.pane-warn { color: var(--warn); cursor: help; }
+.spacer { flex: 1; }
+.pane-btn { background: none; border: none; color: var(--muted); font-size: 13px; padding: 0 5px; height: 20px; cursor: pointer; }
+.pane-btn:hover { color: var(--text); background: var(--chrome-2); }
+.pane-btn.close:hover { color: var(--bad); }
+/* Padding on the host; xterm lives in .term-inner so FitAddon measures the content box. */
+.term-host { flex: 1; min-height: 0; min-width: 0; padding: 4px; box-sizing: border-box; overflow: hidden; }
+.term-inner { width: 100%; height: 100%; }
+.pane-restart { flex: 0 0 auto; padding: 2px 8px; background: #3a3220; color: var(--warn); font-size: 12px; }
+.hidden { display: none !important; }
+
+/* ---- status bar ---- */
+#status { flex: 0 0 22px; display: flex; align-items: center; gap: 12px; padding: 0 10px; background: var(--chrome); border-top: 1px solid var(--line); font-size: 12px; white-space: nowrap; overflow: hidden; }
+.status-path { color: var(--text); }
+.status-msg { flex: 1; color: var(--bad); overflow: hidden; text-overflow: ellipsis; }
+.status-flags { display: flex; gap: 8px; }
+.flag.sync { color: var(--accent); font-weight: 600; }
+.flag.errors { color: var(--warn); cursor: help; }
+
+/* ---- sidebar ---- */
+#sidebar { flex: 0 0 220px; overflow: auto; background: var(--chrome); border-right: 1px solid var(--line); font-size: 12px; user-select: none; }
+#sidebar ul { list-style: none; margin: 0; padding-left: 12px; }
+#sidebar > ul.tree { padding: 6px 4px; }
+#sidebar span { display: block; padding: 1px 4px; white-space: nowrap; }
+.tree-group { color: var(--muted); font-weight: 600; }
+.tree-group.mark { color: var(--accent); }
+.tree-tab, .tree-pane { cursor: pointer; }
+.tree-tab.mark { color: var(--text); font-weight: 600; }
+.tree-tab:hover, .tree-pane:hover { background: var(--chrome-2); }
