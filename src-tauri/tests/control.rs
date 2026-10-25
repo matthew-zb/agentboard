@@ -421,7 +421,9 @@ fn inbox_tools_over_mcp() {
     assert_eq!(res["isError"], false, "{res}");
     let id = text(&res);
     let item = fx.state.inbox.get(&id).expect("stored");
-    assert_eq!((item.owner_tab.as_str(), item.owner_name.as_str()), (mgr_tab.as_str(), "billing"));
+    // R29: owned by the tab name; no tab id is stored
+    assert_eq!((item.owner_tab.as_deref(), item.owner_name.as_str()), (None, "billing"));
+    assert_eq!(fx.state.ws.lock().unwrap().tabs[&mgr_tab].name, "billing");
     assert_eq!(item.timeline[0].who, "billing");
     // retry of the identical post → same id
     assert_eq!(text(&call(&fx, &m, "inbox_post", post)), id);
@@ -438,7 +440,8 @@ fn inbox_tools_over_mcp() {
     };
     assert_eq!(list(&d, json!({})).len(), 1);
     assert_eq!(list(&m, json!({})).len(), 1);
-    assert_eq!(list(&m, json!({}))[0]["ownerTab"], mgr_tab.as_str());
+    assert_eq!(list(&m, json!({}))[0]["ownerName"], "billing");
+    assert!(list(&m, json!({}))[0].get("ownerTab").is_none(), "no tab id on the wire (R29)");
     assert_eq!(list(&m, json!({}))[0]["state"], "new");
     assert!(list(&l, json!({})).is_empty());
     assert!(list(&d, json!({"state":"done"})).is_empty());
