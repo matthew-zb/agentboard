@@ -389,9 +389,8 @@ impl Workspace {
                 let tpl = loaded.templates.get(&tn).ok_or_else(|| format!("템플릿 '{tn}'을(를) 찾을 수 없습니다"))?;
                 let tid = self.build_tab(&name, &dir, tpl, false, loaded);
                 fx.spawn = self.tabs[&tid].layout.leaves().into_iter().map(|p| (p, true)).collect();
-                let g = self.groups.get_mut(&gid).unwrap();
-                g.tab_ids.push(tid.clone());
-                g.active_tab_id = tid;
+                self.groups.get_mut(&gid).unwrap().tab_ids.push(tid.clone());
+                self.activate_tab(&gid, &tid);
             }
             CloseTab { tab } => {
                 let t = self.tab(&tab)?;
@@ -466,6 +465,9 @@ impl Workspace {
             RestartPane { pane } => {
                 self.pane(&pane)?;
                 self.set_status(&pane, PaneStatus::Starting);
+                let p = self.panes.get_mut(&pane).unwrap();
+                p.attention = false;
+                p.prompt_warning = false;
                 fx.kill.push(pane.clone());
                 fx.spawn.push((pane, false));
             }
@@ -533,7 +535,7 @@ impl Workspace {
                 let g = self.groups.get_mut(&gid).unwrap();
                 let idx = g.tab_ids.iter().position(|t| *t == tid).unwrap();
                 g.tab_ids.insert(idx + 1, nid.clone());
-                g.active_tab_id = nid;
+                self.activate_tab(&gid, &nid);
                 if origin_empty {
                     self.detach_tab(&tid);
                 }
@@ -799,7 +801,8 @@ impl Workspace {
 
     /// Focus `(gid, tid)`: that tab becomes the group's active tab, `prev` (the location before the
     /// command) becomes `last_location` when it differs and still exists, a `last_location` equal to
-    /// the new focus is stale and cleared, and the tab's last focused pane loses its attention mark.
+    /// the new focus is stale and cleared, the tab's last focused pane loses its attention mark, and a
+    /// group / pane maximize that would hide that pane is cleared (R22).
     fn move_focus(&mut self, prev: Option<Location>, gid: &GroupId, tid: &TabId) {
         let new = Location { group_id: gid.clone(), tab_id: tid.clone() };
         if let Some(prev) = prev {
@@ -816,6 +819,25 @@ impl Workspace {
         let focused = self.tabs[tid].last_focused_pane_id.clone();
         if let Some(p) = self.panes.get_mut(&focused) {
             p.attention = false;
+        }
+        // R22: never leave focus on a pane hidden by a maximize
+        if self.group_maximized.as_ref().is_some_and(|g| g != gid) {
+            self.group_maximized = None;
+        }
+        let t = self.tabs.get_mut(tid).unwrap();
+        if t.maximized_pane_id.as_ref().is_some_and(|m| *m != focused) {
+            t.maximized_pane_id = None;
+        }
+    }
+
+    /// Make `tid` the active tab of `gid`. In the focused group this is a focus move (records
+    /// `last_location`); in another group focus is left alone (R12).
+    fn activate_tab(&mut self, gid: &GroupId, tid: &TabId) {
+        if *gid == self.focus.group_id {
+            let prev = self.focus_location();
+            self.move_focus(prev, gid, tid);
+        } else {
+            self.groups.get_mut(gid).unwrap().active_tab_id = tid.clone();
         }
     }
 
@@ -1302,6 +1324,93 @@ mod tests {
         assert!(ws.tabs[&api].sync_input);
         let d = tab(&ws, "dispatcher").last_focused_pane_id.clone();
         assert!(ws.apply(WsCommand::SetMaximized { tab: api, pane: Some(d) }, &l).is_err());
+    }
+
+    /// R22: focusing a pane hidden by a pane maximize clears that maximize; focusing the
+    /// maximized pane itself (or just its tab) keeps it.
+    #[test]
+    fn set_focus_clears_pane_maximize_hiding_the_target() {
+        let l = loaded_fixture();
+        let mut ws = Workspace::from_config(&l);
+        let g = ws.focus.group_id.clone();
+        let api = tab(&ws, "api").id.clone();
+        let d = tab(&ws, "dispatcher").id.clone();
+        let coder = pane(&ws, "api", "coder");
+        let lead = pane(&ws, "api", "lead");
+        ws.apply(WsCommand::SetMaximized { tab: api.clone(), pane: Some(coder.clone()) }, &l).unwrap();
+        // the maximized pane itself / its tab without a pane / another tab: maximize kept
+        ws.apply(WsCommand::SetFocus { group: g.clone(), tab: Some(api.clone()), pane: Some(coder.clone()) }, &l).unwrap();
+        ws.apply(WsCommand::SetFocus { group: g.clone(), tab: Some(d.clone()), pane: None }, &l).unwrap();
+        ws.apply(WsCommand::SetFocus { group: g.clone(), tab: Some(api.clone()), pane: None }, &l).unwrap();
+        assert_eq!(ws.tabs[&api].maximized_pane_id, Some(coder.clone()));
+        // a hidden pane of that tab: maximize cleared, focus on it
+        ws.apply(WsCommand::SetFocus { group: g.clone(), tab: Some(api.clone()), pane: Some(lead.clone()) }, &l).unwrap();
+        assert_eq!(ws.tabs[&api].maximized_pane_id, None);
+        assert_eq!(ws.tabs[&api].last_focused_pane_id, lead);
+    }
+
+    /// R22: focusing a group other than the maximized one clears the group maximize.
+    #[test]
+    fn set_focus_clears_group_maximize_hiding_the_target() {
+        let l = loaded_groups();
+        let mut ws = Workspace::from_config(&l);
+        let control = gid_named(&ws, "control");
+        let work = gid_named(&ws, "work");
+        let api = tab(&ws, "api").id.clone();
+        ws.apply(WsCommand::SetFocus { group: work.clone(), tab: None, pane: None }, &l).unwrap();
+        ws.apply(WsCommand::SetGroupMaximized { group: Some(work.clone()) }, &l).unwrap();
+        // focus inside the maximized group keeps it
+        ws.apply(WsCommand::SetFocus { group: work.clone(), tab: Some(api), pane: Some(pane(&ws, "api", "tests")) }, &l).unwrap();
+        assert_eq!(ws.group_maximized, Some(work.clone()));
+        // focus onto the hidden group clears it
+        ws.apply(WsCommand::SetFocus { group: control.clone(), tab: None, pane: None }, &l).unwrap();
+        assert_eq!(ws.group_maximized, None);
+        assert_eq!(ws.focus.group_id, control);
+    }
+
+    /// CreateTab / BreakPaneToTab in the focused group record the tab left behind as
+    /// last_location; in another group they leave focus alone (R12).
+    #[test]
+    fn create_and_break_record_last_location() {
+        let l = loaded_fixture();
+        let mut ws = Workspace::from_config(&l);
+        let g = ws.focus.group_id.clone();
+        let d = tab(&ws, "dispatcher").id.clone();
+        let api = tab(&ws, "api").id.clone();
+        ws.apply(create("web", "solo"), &l).unwrap();
+        assert_eq!(ws.last_location, Some(Location { group_id: g.clone(), tab_id: d.clone() }));
+        ws.apply(WsCommand::SetFocus { group: g.clone(), tab: Some(api.clone()), pane: None }, &l).unwrap();
+        ws.apply(WsCommand::BreakPaneToTab { pane: pane(&ws, "api", "coder") }, &l).unwrap();
+        assert_eq!(ws.groups[&g].active_tab_id, tab(&ws, "api-coder").id);
+        assert_eq!(ws.last_location, Some(Location { group_id: g.clone(), tab_id: api.clone() }));
+
+        let l = loaded_groups();
+        let mut ws = Workspace::from_config(&l);
+        let control = gid_named(&ws, "control");
+        let work = gid_named(&ws, "work");
+        let before_focus = ws.focus_location();
+        ws.apply(WsCommand::CreateTab { name: "w2".into(), dir: "w2".into(), template: None, group: Some(work.clone()) }, &l)
+            .unwrap();
+        assert_eq!(ws.groups[&work].active_tab_id, tab(&ws, "w2").id);
+        assert_eq!(ws.focus.group_id, control);
+        assert_eq!(ws.focus_location(), before_focus);
+        assert_eq!(ws.last_location, None);
+        ws.apply(WsCommand::BreakPaneToTab { pane: pane(&ws, "api", "lead") }, &l).unwrap();
+        assert_eq!(ws.groups[&work].active_tab_id, tab(&ws, "api-lead").id);
+        assert_eq!(ws.focus_location(), before_focus);
+        assert_eq!(ws.last_location, None);
+    }
+
+    #[test]
+    fn restart_clears_attention_and_prompt_warning() {
+        let l = loaded_fixture();
+        let mut ws = Workspace::from_config(&l);
+        let p = pane(&ws, "api", "coder");
+        ws.apply(WsCommand::SetAttention { pane: p.clone(), on: true }, &l).unwrap();
+        ws.set_prompt_warning(&p, true);
+        ws.apply(WsCommand::RestartPane { pane: p.clone() }, &l).unwrap();
+        assert!(!ws.panes[&p].attention);
+        assert!(!ws.panes[&p].prompt_warning);
     }
 
     /// `last_location` is None or names an existing group containing the tab, and is not the focus.
