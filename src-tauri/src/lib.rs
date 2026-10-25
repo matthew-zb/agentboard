@@ -87,23 +87,78 @@ impl AppState {
     }
 }
 
+/// Per-pane frontend output channels. The map lock is taken before the `panes` lock
+/// (`channels -> panes`, in `remove_if_current`) and nothing else is acquired under it.
+pub struct ChannelMap<C> {
+    map: Mutex<HashMap<String, C>>,
+}
+
+impl<C> Default for ChannelMap<C> {
+    fn default() -> Self {
+        ChannelMap { map: Mutex::new(HashMap::new()) }
+    }
+}
+
+impl<C> ChannelMap<C> {
+    pub fn insert(&self, id: &str, ch: C) {
+        self.map.lock().unwrap().insert(id.to_string(), ch);
+    }
+
+    pub fn remove(&self, id: &str) {
+        self.map.lock().unwrap().remove(id);
+    }
+
+    /// Hand the pane's channel to `send`; a `false` result (frontend gone) drops the channel.
+    pub fn deliver(&self, id: &str, send: impl FnOnce(&C) -> bool) {
+        let mut m = self.map.lock().unwrap();
+        if let Some(ch) = m.get(id) {
+            if !send(ch) {
+                m.remove(id);
+            }
+        }
+    }
+
+    /// Drop the channel only if `gen` is still the id's current generation. The check and the
+    /// removal happen under the map lock, and a newer generation's channel can only be
+    /// inserted (`pty_attach`) after that generation is registered — so an old process's exit
+    /// never drops a respawned pane's channel. Returns whether `gen` was current (the caller
+    /// then announces the exit).
+    pub fn remove_if_current(&self, id: &str, gen: u64, pty: &PtyManager) -> bool {
+        let mut m = self.map.lock().unwrap();
+        if pty.current_gen(id) != Some(gen) {
+            return false;
+        }
+        m.remove(id);
+        true
+    }
+
+    #[cfg(test)]
+    fn get(&self, id: &str) -> Option<C>
+    where
+        C: Clone,
+    {
+        self.map.lock().unwrap().get(id).cloned()
+    }
+}
+
 /// Delivers PTY output to the attached frontend channel as raw binary and forwards
 /// output/exit to the launcher. The single ring buffer lives in PtyManager, which snapshots
 /// and runs the registration under its flush lock (see `PtyManager::attach_with`).
 pub struct AppSink {
     app: AppHandle,
-    channels: Mutex<HashMap<String, Channel<InvokeResponseBody>>>,
+    channels: ChannelMap<Channel<InvokeResponseBody>>,
 }
 
 #[derive(Clone, Serialize)]
 struct ExitPayload {
     id: String,
+    gen: u64,
     code: i32,
 }
 
 impl AppSink {
     fn new(app: AppHandle) -> Self {
-        AppSink { app, channels: Mutex::new(HashMap::new()) }
+        AppSink { app, channels: ChannelMap::default() }
     }
 }
 
@@ -112,9 +167,8 @@ impl Ui for AppSink {
         let _ = self.app.emit(launcher::WORKSPACE_CHANGED, snap);
     }
 
-    /// `channels` is a leaf lock.
     fn drop_channel(&self, id: &str) {
-        self.channels.lock().unwrap().remove(id);
+        self.channels.remove(id);
     }
 }
 
@@ -127,23 +181,20 @@ impl PtySink for AppSink {
                 return;
             }
         }
-        let mut chs = self.channels.lock().unwrap();
-        if let Some(ch) = chs.get(id) {
-            if ch.send(InvokeResponseBody::Raw(bytes.to_vec())).is_err() {
-                chs.remove(id);
-            }
-        }
+        self.channels.deliver(id, |ch| ch.send(InvokeResponseBody::Raw(bytes.to_vec())).is_ok());
     }
 
     // Runs on the pane's waiter thread with no PTY lock held.
     fn exited(&self, id: &str, gen: u64, code: i32) {
-        if let Some(state) = self.app.try_state::<AppState>() {
-            if !launcher::on_exited(&state, id, gen, code) {
-                return; // stale: the id belongs to a newer spawn (or none) — keep its channel
-            }
+        let Some(state) = self.app.try_state::<AppState>() else { return };
+        if !launcher::on_exited(&state, id, gen, code) {
+            return; // stale: the id belongs to a newer spawn (or none) — keep its channel
         }
-        self.channels.lock().unwrap().remove(id);
-        let _ = self.app.emit("pty-exit", ExitPayload { id: id.to_string(), code });
+        // Re-checked under the channel lock: a restart may have registered (and attached) a
+        // newer generation since `on_exited` released `ws`.
+        if self.channels.remove_if_current(id, gen, &state.pty) {
+            let _ = self.app.emit("pty-exit", ExitPayload { id: id.to_string(), gen, code });
+        }
     }
 }
 
@@ -158,7 +209,7 @@ fn pty_attach(
     // snapshot + subscribe under PtyManager's flush lock (current generation): no loss, no duplicates
     let known = state.pty.attach_with(&pane, |s| {
         snap = s;
-        sink.channels.lock().unwrap().insert(pane.clone(), channel);
+        sink.channels.insert(&pane, channel);
     });
     if !known {
         return Err(format!("프로세스가 없는 창입니다: {pane}"));
@@ -352,6 +403,49 @@ pub fn appdata_dir() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
     #[test]
     fn it_builds() {}
+
+    struct NullSink;
+    impl PtySink for NullSink {
+        fn output(&self, _: &str, _: u64, _: &[u8]) {}
+        fn exited(&self, _: &str, _: u64, _: i32) {}
+    }
+
+    fn cmd(args: &[&str]) -> pty::SpawnSpec {
+        pty::SpawnSpec {
+            cmd: "cmd.exe".into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            env: vec![],
+            cwd: std::env::current_dir().unwrap(),
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    #[test]
+    fn stale_exit_keeps_new_generation_channel() {
+        let pty = PtyManager::new_per_child_job(Arc::new(NullSink));
+        let chs: ChannelMap<&str> = ChannelMap::default();
+        let g1 = pty.spawn("c", cmd(&["/c", "exit 0"])).unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        while pty.is_running("c") && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        chs.insert("c", "gen1-channel");
+        // restart: gen2 registered and attached before gen1's exited is delivered
+        let g2 = pty.spawn("c", cmd(&[])).unwrap();
+        chs.insert("c", "gen2-channel");
+        assert!(!chs.remove_if_current("c", g1, &pty), "stale exit must not drop (and so not emit pty-exit)");
+        assert_eq!(chs.get("c"), Some("gen2-channel"));
+        // the current generation's exit drops its channel
+        assert!(chs.remove_if_current("c", g2, &pty));
+        assert_eq!(chs.get("c"), None);
+        // unknown ids: nothing to drop, not current
+        assert!(!chs.remove_if_current("nope", g2, &pty));
+        pty.remove("c");
+    }
 }

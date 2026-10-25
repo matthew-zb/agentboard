@@ -13,8 +13,12 @@
 //!   job_error lock + an atomic; never blocks on a process), `flush_lock -> panes`
 //!   (sink `output` checks `current_gen`; `attach_with` re-checks the generation),
 //!   `flush_lock -> prompts` (sink `output` feeds the ReadyDetector), `flush_lock -> channels`
-//!   (sink `output` and `pty_attach`). The `panes` map lock is a leaf: PtyManager never
-//!   takes `flush_lock` or any app lock while holding it.
+//!   (sink `output` and `pty_attach`), `channels -> panes` (`ChannelMap::remove_if_current`
+//!   on sink `exited`). The `panes` map lock is a leaf: PtyManager never takes `flush_lock`
+//!   or any app lock while holding it.
+//! * PtyManager `spawn/kill/remove` are called only from the launcher worker thread
+//!   (`run_effects`); MCP / nightly / other threads must go through `execute` → `submit`
+//!   (R13). `write`/`resize`/`attach_with` may be called from command threads.
 //!
 //! # Spawn generations
 //!
@@ -23,7 +27,11 @@
 //! tag `output`/`exited` with it. `current_gen(id)` is the latest registration — `None`
 //! after `remove` or a failed spawn. `on_output`/`on_exited` ignore any event whose
 //! generation is not current (a late exit of a restarted/retired process never touches the
-//! model, prompts or the frontend channel). A restart whose plan fails retires the old
+//! model, prompts or the frontend channel). Prompt jobs carry the generation they were
+//! spawned for (`PromptJob::bind`, unbound while their spawn is in progress): output feeds
+//! and exits remove only a matching job, and `poll_prompts` writes only into that
+//! generation. AppSink drops the output channel / emits `pty-exit` only if the generation is
+//! still current, re-checked under the channel lock. A restart whose plan fails retires the old
 //! generation (`remove`) before writing `Failed`, so the message survives the old exit. If
 //! the old process will not die within `KILL_WAIT`, its generation stays current: when it
 //! finally exits, `Exited` replaces the "won't terminate" failure (truthful; restartable).
@@ -91,6 +99,9 @@ pub struct PromptJob {
     deadline: Instant,
     payload: Vec<u8>,
     done: bool,
+    /// Generation of the spawn this job belongs to; `None` while that spawn has not returned
+    /// yet (the job is registered before `PtyManager::spawn` so the first output is seen).
+    gen: Option<u64>,
 }
 
 impl PromptJob {
@@ -100,7 +111,25 @@ impl PromptJob {
             deadline: start + READY_TIMEOUT,
             payload: encode_submit(prompt, &profile.submit),
             done: false,
+            gen: None,
         }
+    }
+
+    pub fn gen(&self) -> Option<u64> {
+        self.gen
+    }
+
+    /// Bind the job to the generation its spawn returned.
+    pub fn bind(&mut self, gen: u64) {
+        self.gen = Some(gen);
+    }
+
+    /// Whether output/exit of `gen` concerns this job. An unbound job accepts output of the
+    /// current generation only (callers check that first): it can only be its own spawn's,
+    /// because the previous process's final output precedes its `is_running == false`, which
+    /// `spawn_pane` waits for before registering the job.
+    fn owns(&self, gen: u64) -> bool {
+        self.gen.map_or(true, |g| g == gen)
     }
 
     /// Output from the pane (called on the PTY flush path: must stay cheap).
@@ -310,13 +339,19 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
             return;
         }
     };
-    // registered before spawning so the very first output reaches the detector
+    // Registered (unbound) before spawning so the very first output reaches the detector;
+    // bound to the generation once `spawn` returns it.
     if let Some(job) = job {
         state.prompts.lock().unwrap().insert(id.to_string(), job);
     }
     // A failed spawn leaves the id unregistered (see PtyManager::spawn): old events are stale.
     match state.pty.spawn(id, spec) {
         Ok(gen) => {
+            if let Some(job) = state.prompts.lock().unwrap().get_mut(id) {
+                if job.gen().is_none() {
+                    job.bind(gen);
+                }
+            }
             // A very fast exit may already have happened: claim Running only while this
             // generation is current and alive (otherwise `on_exited` sets / has set Exited).
             // Checked under `ws` so it is ordered against `on_exited`, which decides under `ws`.
@@ -327,6 +362,7 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
         }
         Err(e) => {
             state.prompts.lock().unwrap().remove(id);
+            state.ui.drop_channel(id); // like the plan failure: the old generation is retired
             state.ws.lock().unwrap().set_status(id, PaneStatus::Failed { message: format!("실행 실패: {e}") });
         }
     }
@@ -340,7 +376,7 @@ pub fn on_output(state: &AppState, id: &str, gen: u64, bytes: &[u8]) -> bool {
         return false;
     }
     let mut jobs = state.prompts.lock().unwrap();
-    if let Some(job) = jobs.get_mut(id) {
+    if let Some(job) = jobs.get_mut(id).filter(|j| j.owns(gen)) {
         job.feed(bytes, Instant::now());
     }
     true
@@ -355,7 +391,11 @@ pub fn on_exited(state: &AppState, id: &str, gen: u64, code: i32) -> bool {
             return false;
         }
         ws.set_status(id, PaneStatus::Exited { code });
-        state.prompts.lock().unwrap().remove(id);
+        // only this generation's job: an unbound one belongs to a spawn still in progress
+        let mut jobs = state.prompts.lock().unwrap();
+        if jobs.get(id).is_some_and(|j| j.gen() == Some(gen)) {
+            jobs.remove(id);
+        }
     }
     emit_changed(state);
     true
@@ -363,12 +403,12 @@ pub fn on_exited(state: &AppState, id: &str, gen: u64, code: i32) -> bool {
 
 /// Timer tick: inject due prompts (ready or timed out). The write happens outside every app lock.
 pub fn poll_prompts(state: &AppState, now: Instant) {
-    let due: Vec<(String, Vec<u8>, bool)> = {
+    let due: Vec<(String, Vec<u8>, bool, Option<u64>)> = {
         let mut jobs = state.prompts.lock().unwrap();
         let mut due = Vec::new();
         jobs.retain(|id, job| match job.poll(now) {
             Some((bytes, warn)) => {
-                due.push((id.clone(), bytes, warn));
+                due.push((id.clone(), bytes, warn, job.gen()));
                 false
             }
             None => true,
@@ -376,7 +416,11 @@ pub fn poll_prompts(state: &AppState, now: Instant) {
         due
     };
     let mut changed = false;
-    for (id, bytes, warn) in due {
+    for (id, bytes, warn, gen) in due {
+        // never type a prompt into a different process than the one it was meant for
+        if gen.is_some() && state.pty.current_gen(&id) != gen {
+            continue;
+        }
         if let Err(e) = state.pty.write(&id, &bytes) {
             eprintln!("[agentboard] prompt inject {id}: {e}");
         }
@@ -681,6 +725,56 @@ mod tests {
         assert!(!on_exited(state, id, gen1, 1));
         assert_eq!(status(state, id), want, "failure message must survive");
         assert!(rt.ui.dropped.lock().unwrap().contains(&id.to_string()), "old output channel dropped");
+    }
+
+    fn job_gen(state: &AppState, id: &str) -> Option<Option<u64>> {
+        state.prompts.lock().unwrap().get(id).map(|j| j.gen())
+    }
+
+    fn wait_dead(state: &AppState, id: &str) {
+        let end = Instant::now() + Duration::from_secs(5);
+        while state.pty.is_running(id) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!state.pty.is_running(id));
+    }
+
+    #[test]
+    fn stale_exit_keeps_new_generation_prompt_job() {
+        let rt = runtime();
+        let (state, id) = (&rt.state, rt.pane.as_str());
+        state.ws.lock().unwrap().panes.get_mut(id).unwrap().prompt = Some("echo hi".into());
+        let fx = initial_effects(&state.ws.lock().unwrap());
+        run_effects(state, fx);
+        let gen1 = state.pty.current_gen(id).expect("spawned");
+        assert_eq!(job_gen(state, id), Some(Some(gen1)), "job is bound to the generation it was spawned for");
+
+        // gen1 dies; a restart with injection registers gen2 before gen1's exit is delivered
+        state.pty.kill(id);
+        wait_dead(state, id);
+        spawn_pane(state, id, true);
+        let gen2 = state.pty.current_gen(id).expect("respawned");
+        assert_ne!(gen1, gen2);
+        assert_eq!(job_gen(state, id), Some(Some(gen2)));
+        assert!(!on_exited(state, id, gen1, 0));
+        assert_eq!(job_gen(state, id), Some(Some(gen2)), "the new generation's job survives a stale exit");
+
+        // window: the next spawn's job is registered (unbound) while the old generation is
+        // still current — its exit is accepted but must not take the pending job with it
+        state.pty.kill(id);
+        wait_dead(state, id);
+        let job = {
+            let loaded = state.loaded.read().unwrap();
+            PromptJob::new(&loaded.profiles["cmd"], "echo next", Instant::now())
+        };
+        state.prompts.lock().unwrap().insert(id.to_string(), job);
+        assert!(on_exited(state, id, gen2, 0));
+        assert_eq!(job_gen(state, id), Some(None), "pending job of the next spawn survives");
+
+        // a job bound to the exiting generation goes with it
+        state.prompts.lock().unwrap().get_mut(id).unwrap().bind(gen2);
+        assert!(on_exited(state, id, gen2, 0));
+        assert_eq!(job_gen(state, id), None);
     }
 
     #[test]
