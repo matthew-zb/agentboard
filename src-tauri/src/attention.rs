@@ -64,6 +64,8 @@ pub fn on_session_start(state: &AppState, caller: &Caller, body: &Value) {
     // a valid token belongs to the latest spawn: the hook is from the current generation
     let Some(gen) = state.pty.current_gen(&caller.pane) else { return };
     state.trust.lock().unwrap().insert(caller.pane.clone(), Trust::Started { gen });
+    // R28: the session is past any trust dialog — its start prompt may now be typed
+    launcher::release_prompt(state, &caller.pane, gen, Instant::now());
     // a SessionStart after the warning: the trust question was answered
     clear_trust_warning(state, &caller.pane);
 }

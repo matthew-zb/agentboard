@@ -297,6 +297,13 @@ impl ReadyDetector {
         self.done
     }
 
+    /// Count `now` as output: an idle rule then needs a quiet period from here on.
+    pub fn seed(&mut self, now: Instant) {
+        if !self.done {
+            self.last_output = Some(now);
+        }
+    }
+
     pub fn poll(&mut self, now: Instant) -> bool {
         if self.done {
             return true;

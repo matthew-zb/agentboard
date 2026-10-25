@@ -203,25 +203,72 @@ pub fn plan_spawn(pane: &Pane, loaded: &Loaded, launch: &RoleLaunch) -> Result<S
 }
 
 /// First-prompt injection state machine for one pane (time is passed in, so it is testable).
+///
+/// Phase-1 panes ([`PromptJob::new`]): ready by the profile's `ready` rule, or after
+/// `READY_TIMEOUT` with the header warning. Role panes ([`PromptJob::new_gated`], R28 / final
+/// review #2): nothing happens until [`PromptJob::release`] — the SessionStart hook of the
+/// job's generation ([`release_prompt`]). Before that the screen may be Claude's folder-trust
+/// dialog, which is idle and would take the prompt's Enter as an answer; without a SessionStart
+/// the prompt is never typed and the R5 trust ⚠ covers the wait. After the release a fresh
+/// detector applies (idle counted from the release) with `READY_TIMEOUT` from the release.
 pub struct PromptJob {
     detector: ReadyDetector,
+    ready: crate::profiles::Ready,
     deadline: Instant,
     payload: Vec<u8>,
     done: bool,
     /// Generation of the spawn this job belongs to; `None` while that spawn has not returned
     /// yet (the job is registered before `PtyManager::spawn` so the first output is seen).
     gen: Option<u64>,
+    gate: Gate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Phase-1 behaviour.
+    Open,
+    /// Role pane, waiting for SessionStart.
+    Waiting,
+    /// Role pane, SessionStart seen.
+    Released,
 }
 
 impl PromptJob {
     pub fn new(profile: &AgentProfile, prompt: &str, start: Instant) -> Self {
         PromptJob {
             detector: ReadyDetector::new(&profile.ready, start),
+            ready: profile.ready.clone(),
             deadline: start + READY_TIMEOUT,
             payload: encode_submit(prompt, &profile.submit),
             done: false,
             gen: None,
+            gate: Gate::Open,
         }
+    }
+
+    /// A role pane's start prompt: typed only after [`PromptJob::release`].
+    pub fn new_gated(profile: &AgentProfile, prompt: &str, start: Instant) -> Self {
+        PromptJob { gate: Gate::Waiting, ..PromptJob::new(profile, prompt, start) }
+    }
+
+    pub fn is_gated(&self) -> bool {
+        self.gate != Gate::Open
+    }
+
+    pub fn is_released(&self) -> bool {
+        self.gate == Gate::Released
+    }
+
+    /// SessionStart of this job's generation: start the readiness check now (fresh detector,
+    /// idle counted from `now`, deadline `now + READY_TIMEOUT`). Repeated calls are no-ops.
+    pub fn release(&mut self, now: Instant) {
+        if self.gate != Gate::Waiting {
+            return;
+        }
+        self.gate = Gate::Released;
+        self.detector = ReadyDetector::new(&self.ready, now);
+        self.detector.seed(now);
+        self.deadline = now + READY_TIMEOUT;
     }
 
     pub fn gen(&self) -> Option<u64> {
@@ -241,9 +288,10 @@ impl PromptJob {
         self.gen.map_or(true, |g| g == gen)
     }
 
-    /// Output from the pane (called on the PTY flush path: must stay cheap).
+    /// Output from the pane (called on the PTY flush path: must stay cheap). A gated job
+    /// ignores output until it is released (the detector is replaced then anyway).
     pub fn feed(&mut self, bytes: &[u8], now: Instant) {
-        if !self.done {
+        if !self.done && self.gate != Gate::Waiting {
             self.detector.feed(bytes, now);
         }
     }
@@ -251,7 +299,7 @@ impl PromptJob {
     /// `Some((bytes, warning))` exactly once: when ready (`warning=false`) or when
     /// `READY_TIMEOUT` has passed without readiness (`warning=true`).
     pub fn poll(&mut self, now: Instant) -> Option<(Vec<u8>, bool)> {
-        if self.done {
+        if self.done || self.gate == Gate::Waiting {
             return None;
         }
         let warning = if self.detector.poll(now) {
@@ -538,9 +586,15 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
         let loaded = state.loaded.read().unwrap();
         let plan = plan_spawn(&pane, &loaded, &launch);
         let job = match (&plan, inject, pane.prompt.as_deref()) {
-            (Ok(_), true, Some(p)) if !p.trim().is_empty() => {
-                profile_for(&pane, &loaded).map(|prof| PromptJob::new(prof, p, Instant::now()))
-            }
+            (Ok(_), true, Some(p)) if !p.trim().is_empty() => profile_for(&pane, &loaded).map(|prof| {
+                // R28: a role pane's start prompt waits for its SessionStart (never typed into
+                // the folder-trust dialog); other panes keep the phase-1 readiness rule
+                if pane.role.is_some() {
+                    PromptJob::new_gated(prof, p, Instant::now())
+                } else {
+                    PromptJob::new(prof, p, Instant::now())
+                }
+            }),
             _ => None,
         };
         (plan, job)
@@ -627,6 +681,26 @@ pub fn on_exited(state: &AppState, id: &str, gen: u64, code: i32) -> bool {
     }
     emit_changed(state);
     true
+}
+
+/// SessionStart of `pane`'s generation `gen` (hook path: `attention::on_session_start`):
+/// release that generation's gated start prompt. A job of another generation (stale hook,
+/// or a newer spawn) is left alone; an unbound job is accepted only while `gen` is current
+/// (it can only be that spawn's). Only the `prompts` lock (leaf) and the PtyManager `panes`
+/// map are taken, one at a time; the write itself stays with `poll_prompts` (timer thread),
+/// which re-checks the generation — no spawn/kill off the worker (R13).
+pub fn release_prompt(state: &AppState, pane: &str, gen: u64, now: Instant) {
+    let current = state.pty.current_gen(pane) == Some(gen);
+    let mut jobs = state.prompts.lock().unwrap();
+    if let Some(job) = jobs.get_mut(pane) {
+        let mine = match job.gen() {
+            Some(g) => g == gen,
+            None => current,
+        };
+        if mine {
+            job.release(now);
+        }
+    }
 }
 
 /// Timer tick: inject due prompts (ready or timed out). The write happens outside every app lock.
@@ -936,6 +1010,94 @@ mod tests {
         assert_eq!(job.poll(t0 + READY_TIMEOUT - Duration::from_millis(1)), None);
         assert_eq!(job.poll(t0 + READY_TIMEOUT), Some((want, true)));
         assert_eq!(job.poll(t0 + READY_TIMEOUT + Duration::from_secs(1)), None);
+    }
+
+    /// R28 / final review #2: a role pane's start prompt waits for SessionStart of its
+    /// generation — never typed into Claude's folder-trust dialog on idle or timeout.
+    #[test]
+    fn gated_prompt_job_waits_for_session_start() {
+        let fx = fixture();
+        let mut prof = fx.loaded.profiles["tool"].clone();
+        prof.ready = Ready::IdleMs(800);
+        let want = encode_submit("start", &prof.submit);
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_millis(n);
+
+        let mut job = PromptJob::new_gated(&prof, "start", t0);
+        assert!(job.is_gated());
+        // the trust dialog: static output, idle for minutes — nothing is typed, ever
+        job.feed(b"Do you trust the files in this folder?", s(500));
+        for at in [2_000, 11_000, 60_000, 600_000] {
+            assert_eq!(job.poll(s(at)), None, "{at} ms");
+        }
+        // SessionStart: ready once the session has been quiet for idleMs *after* it
+        job.release(s(600_000));
+        assert_eq!(job.poll(s(600_100)), None, "not idle since the release yet");
+        job.feed(b"\x1b[2J welcome", s(600_300));
+        assert_eq!(job.poll(s(600_900)), None);
+        assert_eq!(job.poll(s(601_100)), Some((want.clone(), false)));
+        assert_eq!(job.poll(s(700_000)), None, "once");
+
+        // released but never quiet: READY_TIMEOUT after the release, with the warning
+        let mut job = PromptJob::new_gated(&prof, "start", t0);
+        job.release(s(1_000));
+        for at in (1_000..11_000).step_by(100) {
+            job.feed(b".", s(at));
+            assert_eq!(job.poll(s(at)), None, "{at}");
+        }
+        assert_eq!(job.poll(s(1_000) + READY_TIMEOUT), Some((want.clone(), true)));
+
+        // a pattern that matched the dialog before SessionStart does not count
+        let mut pprof = prof.clone();
+        pprof.ready = Ready::Pattern(Regex::new(r"[>]\s*$").unwrap());
+        let mut job = PromptJob::new_gated(&pprof, "start", t0);
+        job.feed(b"> 1. Yes, proceed\r\n> ", s(100));
+        assert_eq!(job.poll(s(20_000)), None);
+        job.release(s(20_000));
+        assert_eq!(job.poll(s(20_001)), None, "fresh detector after the release");
+        job.feed(b"\r\n> ", s(20_500));
+        assert_eq!(job.poll(s(20_500)), Some((want, false)));
+
+        // phase-1 jobs are not gated
+        assert!(!PromptJob::new(&prof, "x", t0).is_gated());
+    }
+
+    #[test]
+    fn role_pane_prompt_is_injected_only_after_its_session_start() {
+        let rt = runtime();
+        let (state, id) = (&rt.state, rt.pane.as_str());
+        assert!(state.ws.lock().unwrap().pane_by_id(id).unwrap().role.is_some(), "the dispatcher pane");
+        state.ws.lock().unwrap().panes.get_mut(id).unwrap().prompt = Some("echo start".into());
+        let fx = initial_effects(&state.ws.lock().unwrap()); // guard dropped before run_effects
+        run_effects(state, fx);
+        let gen = state.pty.current_gen(id).expect("spawned");
+        let gated = || state.prompts.lock().unwrap().get(id).map(|j| (j.gen(), j.is_gated(), j.is_released()));
+        assert_eq!(gated(), Some((Some(gen), true, false)));
+        // no SessionStart: no injection however long it takes (the trust ⚠ covers the wait)
+        poll_prompts(state, Instant::now() + Duration::from_secs(120));
+        assert_eq!(gated(), Some((Some(gen), true, false)), "still waiting");
+        assert!(!state.ws.lock().unwrap().pane_by_id(id).unwrap().prompt_warning);
+        // a SessionStart of another generation does not release it
+        release_prompt(state, id, gen + 100, Instant::now());
+        assert_eq!(gated(), Some((Some(gen), true, false)));
+        // the SessionStart hook path (attention → bridge → launcher) releases this generation
+        let caller = {
+            let ws = state.ws.lock().unwrap();
+            let p = ws.pane_by_id(id).unwrap();
+            crate::control::Caller {
+                pane: p.id.clone(),
+                role: p.role.unwrap(),
+                tab: p.tab.clone(),
+                tab_name: ws.tabs[&p.tab].name.clone(),
+                team: None,
+                session_name: p.session_name.clone().unwrap(),
+            }
+        };
+        crate::attention::on_session_start(state, &caller, &serde_json::json!({}));
+        assert_eq!(gated(), Some((Some(gen), true, true)));
+        poll_prompts(state, Instant::now() + READY_TIMEOUT + Duration::from_secs(1));
+        assert_eq!(gated(), None, "typed once released");
+        state.pty.remove(id);
     }
 
     #[test]
