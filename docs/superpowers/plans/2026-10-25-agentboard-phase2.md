@@ -293,6 +293,41 @@ spikes/phase2/    # Task 1 버리는 스파이크 코드 (커밋은 하되 빌�
 
 ---
 
+### Task 14: 문서 탭 (마크다운 뷰어) — **Task 10 다음, Task 11 전에 실행**
+
+**Files:**
+- Create: `src/docview.js`(렌더·스크롤·검색·목차·링크 이력), `src/docview-logic.js`(순수: 링크 해석·이력·목차 추출·키 매핑), `tests/js/docview.test.mjs`, `src-tauri/src/docs.rs`
+- Modify: `package.json`·`scripts/vendor.mjs`(marked 11.0.0, mermaid 11.x 고정, katex 0.16.9(+폰트), highlight.js 11.9.0, DOMPurify 3.x 고정 — mdviewer와 같은 버전대, 모두 `src/vendor/`), `src-tauri/src/workspace.rs`(문서 탭), `src-tauri/src/lib.rs`(명령·감시), `src-tauri/tauri.conf.json`(CSP: `img-src 'self' data: asset: http://asset.localhost`, mermaid가 필요하면 `style-src 'unsafe-inline'` 유지), `src/pane.js`, `src/inbox.js`, `src/overlay-logic.js`(팔레트 "문서 열기"), `src/style.css`
+
+**Interfaces:**
+- Consumes: Task 3 `PaneKind::Applet { kind }`, Task 6 인박스 이슈 폴더, 1단계 팔레트·퍼지 검색(`fuzzy.js`)·포커스 규칙.
+- Produces:
+  - 문서 탭 = applet 창 하나짜리 탭: `PaneKind::Applet { kind: "doc" }` + `Pane.doc_path: Option<PathBuf>`(serde default). `WsCommand::OpenDoc { path, group: Option<GroupId> }` — 같은 경로가 열려 있으면 그 탭으로 SetFocus, 아니면 포커스 그룹에 새 탭(이름 = 파일명, 중복 시 1단계 규칙) 만들고 포커스(사용자 동작). `path`는 `workspaceRoot` 안의 기존 `.md` 파일만(정규화 후 접두사 검사, 심볼릭 링크 해석 후 재검사), 아니면 한국어 Err.
+  - Tauri 명령: `doc_read(path) -> {text, mtime}`, `doc_list_md(query?) -> Vec<rel path>`(workspaceRoot 아래, `.agentboard`·`node_modules`·`.git`·`target` 제외, 최대 5,000개), `doc_watch(paneId, path)`/`doc_unwatch` — 1초 주기 mtime 폴링 스레드 하나가 변경 시 `doc-changed {paneId}` 이벤트 **[설계자 판단: notify 크레이트 대신 폴링 — 의존성 최소]**. 이미지: Tauri asset 프로토콜을 `workspaceRoot/**`로 범위 제한해 켠다.
+  - 렌더: marked(GFM) → DOMPurify로 정화 → highlight.js → KaTeX auto-render → mermaid(문서 안 ```mermaid 블록). 상대 링크 `.md`는 같은 탭에서 열기(이력 push), `http(s)`는 opener 플러그인으로 시스템 브라우저, 그 외는 무시.
+  - 키(문서 창 포커스 시, 1단계 앱 단축키 우선): `j/k` 한 줄, `Space/Shift+Space` 한 화면, `g/G`, `/` 검색(1단계 프롬프트 재사용, `n/N`), `o` 목차 오버레이(↑↓ Enter), `[`/`]` 뒤로/앞으로, `r` 새로고침. 스크롤 위치는 자동 새로고침 시 유지.
+  - 여는 길: 인박스 상세(Task 10)에 이슈 폴더 `input/`·`output/` 파일 목록 섹션 — md 파일 선택 후 `Enter` → `OpenDoc`; 다른 파일은 경로만 표시. 팔레트 "문서 열기" → `doc_list_md` + `fuzzyFilter` → `OpenDoc`.
+  - 복원: 문서 탭은 `workspace.json`에 저장·복원(파일이 사라졌으면 탭에 "파일을 찾을 수 없습니다" 표시).
+- [ ] **Step 1: 실패하는 테스트**
+```rust
+#[test] fn open_doc_rejects_outside_root_and_non_md() {}
+#[test] fn open_doc_reuses_existing_tab() {}
+#[test] fn list_md_skips_excluded_dirs_and_caps() {}
+#[test] fn doc_tab_persists_and_restores() {}
+```
+```js
+test('relative md links resolve against current doc and stay inside root', () => {})
+test('history back/forward', () => {})
+test('toc extraction from headings incl. duplicates', () => {})
+test('sanitizer strips script and on* attributes', () => {}) // DOMPurify 설정 확인 (jsdom 없이 가능한 범위: 설정 객체 검증 + 문자열 사전 필터)
+test('key map: j/k/g/G/o/[ ]/r', () => {})
+```
+- [ ] **Step 2–4** — FAIL → 구현 → PASS
+- [ ] **Step 5: 수동 확인 항목** — `docs/spikes.md` "2단계 Task 14"에 "사용자 확인 필요": Mermaid·KaTeX·코드 하이라이트 렌더, 산출물 파일 수정 시 1–2초 안에 자동 새로고침, 인박스에서 열기, 팔레트에서 열기, 한글 파일명.
+- [ ] **Step 6: Commit** — `feat(ui): markdown document tabs (viewer from mdviewer)`
+
+---
+
 ### Task 11: 야간 정기 정리
 
 **Files:**
