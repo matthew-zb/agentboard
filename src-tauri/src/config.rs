@@ -9,6 +9,10 @@ const DEFAULT_TEMPLATES: [(&str, &str); 3] = [
     ("solo.json", include_str!("../defaults/templates/solo.json")),
     ("team-3.json", include_str!("../defaults/templates/team-3.json")),
 ];
+const DEFAULT_AGENTS: [(&str, &str); 2] = [
+    ("claude.json", include_str!("../defaults/agents/claude.json")),
+    ("cmd.json", include_str!("../defaults/agents/cmd.json")),
+];
 const DEFAULT_KEYBINDINGS: &str = include_str!("../defaults/keybindings.json");
 
 // ───────────────────────── errors ─────────────────────────
@@ -34,7 +38,7 @@ impl std::fmt::Display for ConfigError {
     }
 }
 
-fn sem_err(file: &Path, path: impl Into<String>, message: impl Into<String>) -> ConfigError {
+pub(crate) fn sem_err(file: &Path, path: impl Into<String>, message: impl Into<String>) -> ConfigError {
     ConfigError { file: file.to_path_buf(), line: 0, col: 0, json_path: Some(path.into()), message: message.into() }
 }
 
@@ -676,9 +680,13 @@ fn embedded_template(name: &str) -> Template {
 pub fn ensure_dotdir(root: &Path) -> Result<(), String> {
     let dot = root.join(".agentboard");
     let tdir = dot.join("templates");
+    let adir = dot.join("agents");
     std::fs::create_dir_all(&tdir).map_err(|e| format!("{}: {e}", tdir.display()))?;
+    std::fs::create_dir_all(&adir).map_err(|e| format!("{}: {e}", adir.display()))?;
     let mut files: Vec<(PathBuf, &str)> =
         DEFAULT_TEMPLATES.iter().map(|(n, c)| (tdir.join(n), *c)).collect();
+    files.extend(DEFAULT_AGENTS.iter().map(|(n, c)| (adir.join(n), *c)));
+    crate::profiles::ensure_powershell_profile(&adir);
     files.push((dot.join("keybindings.json"), DEFAULT_KEYBINDINGS));
     for (path, content) in files {
         if !path.exists() {
@@ -1026,6 +1034,18 @@ mod tests {
         assert_eq!(l.keybindings.0["app.palette"], "Alt+;");
     }
 
+    #[test]
+    fn fresh_root_loads_team3_without_unknown_agent_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let a = appdata_with_root(root.path());
+        let l = load_all(a.path());
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        assert!(l.templates.contains_key("team-3"));
+        for n in ["claude", "cmd", "powershell"] {
+            assert!(l.profiles.contains_key(n), "{n}");
+        }
+    }
+
     fn load_with(files: &[(&str, &str)]) -> Loaded {
         let root = tempfile::tempdir().unwrap();
         let a = appdata_with_root(root.path());
@@ -1122,7 +1142,8 @@ mod tests {
             assert!(l.templates.contains_key(&l.config.dispatcher.template));
             assert!(l.templates.contains_key(&l.config.default_template));
             assert_eq!(l.templates["dispatcher"].layout.leaves()[0].name, "dispatcher");
-            assert!(!l.errors.is_empty());
+            // a broken file is reported; a deleted one just falls back silently
+            assert_eq!(!l.errors.is_empty(), content.is_some(), "{:?}", l.errors);
         }
     }
 }

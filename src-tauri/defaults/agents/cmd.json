@@ -1,0 +1,10 @@
+{
+  "name": "cmd",
+  "level": "L0",
+  "cmd": "cmd.exe",
+  "args": [],
+  "env": {},
+  "ready": { "pattern": "^[A-Z]:\\\\.*>$" },
+  "submit": { "bracketedPaste": false, "key": "\r" },
+  "passthroughKeys": []
+}
