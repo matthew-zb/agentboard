@@ -79,7 +79,8 @@
 //!   are leaves (`handoff_done` takes the machine, releases it, then wakes). The scheduler
 //!   thread takes `loaded(read)`, `ws`, `last_input` and the machine one at a time (each
 //!   released) and performs its actions (`bridge::send` / `discard`, `execute`, the inbox,
-//!   the `nightly.json` write) with no lock held.
+//!   the `nightly.json` write) with no lock held. Its spawn-time map is a leaf too
+//!   (`spawn_pane` writes it after `spawn` returns; `run_effects` removes it for a gone pane).
 //! * `loaded(write)` (Task 8): taken only by the MCP tool `create_manager_tab`, alone — no other
 //!   lock held, none taken inside — around the atomic config.json append and the in-memory
 //!   `config.tabs` push (and their rollback). It is never taken under `ws`; `execute` runs
@@ -391,6 +392,7 @@ pub fn run_effects(state: &AppState, fx: Effects) {
             state.tokens.revoke(id);
             crate::attention::forget(state, id);
             crate::agentcfg::remove_run_files(&state.run_dir, id);
+            state.nightly.forget(id); // its spawn time (R24)
             state.docs.unwatch(id); // a closed document pane stops being polled
         } else {
             state.pty.kill(id);
@@ -470,6 +472,8 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
                     job.bind(gen);
                 }
             }
+            // R24: the nightly refresh skips sessions started after today's refresh time (leaf)
+            state.nightly.note_spawn(id, gen, chrono::Local::now().naive_local());
             // R5: a role session must report SessionStart for this generation in time (leaf lock)
             if pane.role.is_some() {
                 crate::attention::arm_trust(state, id, gen, Instant::now());
@@ -1058,6 +1062,8 @@ mod tests {
         assert_ne!(gen1, gen2, "a new process (fresh session)");
         assert_eq!(status(state, id), PaneStatus::Running);
         assert_eq!(job_gen(state, id), Some(Some(gen2)), "start prompt queued again, for the new generation only");
+        assert!(state.nightly.spawned_at(id, Some(gen2)).is_some(), "spawn time recorded for the nightly R24 check");
+        assert!(state.nightly.spawned_at(id, Some(gen1)).is_none(), "only the current generation's");
 
         // the killed process's late events change nothing
         assert!(!on_output(state, id, gen1, b"old"));

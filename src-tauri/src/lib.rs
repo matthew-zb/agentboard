@@ -686,6 +686,11 @@ pub fn run() {
             if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
                 if let Some(state) = app.try_state::<AppState>() {
                     state.saver.flush();
+                }
+            }
+            // only on the real exit: an ExitRequested may be vetoed (Task 17) and the app goes on
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(state) = app.try_state::<AppState>() {
                     state.nightly.stop(); // the scheduler thread ends at its next wake
                 }
             }

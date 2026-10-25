@@ -7,44 +7,56 @@
 //! # State machine ([`Nightly`], pure; time and the observed workspace are passed in)
 //!
 //! `Idle → Notifying → Waiting{pending, deadline} → Restarting → Idle`. [`Nightly::step`] runs
-//! the transitions that are due at `now` and returns the [`Action`]s to perform;
-//! `Notifying` and `Restarting` are passed through within one step (they only emit actions).
+//! the transitions that are due at `now` and returns the [`Action`]s to perform. `Notifying`
+//! is passed through within one step; `Restarting` lasts only while restarts are held (R25).
+//! A target is "live" when its status is `Running` or `Starting`.
 //!
-//! * **Start** (`Idle`): a time is configured, the last run date ≠ today (local), the local
-//!   time ≥ the configured time, and no retry is pending. If the dispatcher had a real
-//!   keystroke (`pty_write` → `AppState::last_input`, never UserPromptSubmit — R4) within
-//!   `nightlyQuietMin`, the run is postponed by [`RETRY_AFTER`] (5 min). Starting records the
-//!   date ([`Action::Record`] → `nightly.json`) **before** anything else, so a crash mid-run
-//!   never repeats the run that day (the app's own restart gives fresh sessions anyway).
-//! * **Notifying**: the targets are the standing panes whose process is `Running` now (exited
-//!   or failed panes stay as the user left them). Managers and the dispatcher ("workers") get
-//!   the save-and-report message naming the actual handover session (`@<session>`); handover
-//!   gets its own message later.
-//! * **Waiting**: `pending` = targets without `handoff_done` ([`Nightly::handoff`]).
-//!   handover is notified once every worker is done (or gone), or when half of
-//!   `nightlyTimeoutMin` has passed. A target that exited or was closed stops blocking.
-//!   Ends when nothing is pending or the deadline (monotonic clock) has passed — but never
-//!   while a target pane had a keystroke within `nightlyQuietMin` (a restart would throw away
-//!   what the user is typing); then it waits for the next tick.
-//! * **Restarting**: per target, in start order: not done → [`Action::Incomplete`] (an inbox
-//!   system item "야간 정리 미완료: <이름>" for its tab, the reason in `check`); still in the
-//!   model and running → [`Action::Restart`]. Closed panes are forgotten.
+//! * **Start** (`Idle`): a time is configured, it is a new day (no record, an earlier date, or
+//!   a record more than one day in the future), the local time ≥ the configured time, no
+//!   retry is pending, and no run started in this process within [`MIN_GAP`] (monotonic: a
+//!   wall-clock date correction cannot cause a second run the same real day).
+//!   - **R24**: if every live standing pane was spawned (launcher, this generation) at or after
+//!     today's time, the sessions are fresh already: the day is recorded, nothing else happens.
+//!   - If the dispatcher had a real keystroke (`pty_write` → `AppState::last_input`, never
+//!     UserPromptSubmit — R4) within `nightlyQuietMin`, the start is postponed by
+//!     [`RETRY_AFTER`] (5 min).
+//!   - Starting records the date ([`Action::Record`] → `nightly.json`) **before** anything
+//!     else, so a crash mid-run never repeats the run that day.
+//! * **Notifying**: targets = live standing panes (exited/failed ones stay as the user left
+//!   them). Each target is tied to its spawn generation (bound later for a starting pane).
+//!   Managers and the dispatcher ("workers") get the save-and-report message naming the actual
+//!   handover session (`@<session>`); handover gets its own message later.
+//! * **Waiting**: `pending` = targets without `handoff_done` ([`Nightly::handoff`]). handover is
+//!   notified once no worker blocks, or at half of `nightlyTimeoutMin`; its own `handoff_done`
+//!   before that message is not counted (`Handoff::NotYet`). A target that exited, was closed
+//!   or runs another generation (restarted meanwhile) stops blocking. Ends when nothing blocks
+//!   or the deadline (monotonic) has passed.
+//! * **Restarting** (first pass), per target in start order, if still in the model: drop its
+//!   undelivered nightly messages ([`Action::Discard`]); not done → [`Action::Incomplete`]
+//!   ("야간 정리 미완료: <이름>", owner = its tab, reason in `check`: timeout / exited /
+//!   restarted meanwhile); live and same generation → [`Action::Restart`] — unless the user
+//!   typed into it within `nightlyQuietMin`: then it is **held** (R25) and retried every tick
+//!   until quiet; after [`HOLD_CAP`] (60 min) it is left alone and gets [`Action::Held`]
+//!   ("야간 정리 보류: <이름>"). Other panes restart right away (per-pane). A held pane that
+//!   exits or is restarted meanwhile is dropped. `handoff_done` now answers `Closed`; a session
+//!   of another generation always gets `NotTarget`.
 //!
 //! Clock rules: "today" and "after the time" use local wall-clock time (chrono `Local`, already
-//! a dependency). App started after the time → that day's run happens once. PC asleep at the
-//! time → the run happens on wake if the date has not changed; if it has, the new day's run
-//! waits for its own time (a missed day is skipped). Wall-clock jumps backwards never repeat
-//! a run of a recorded date; a date that differs from the recorded one (also backwards) counts
-//! as a new day. Deadlines and the quiet/retry windows use `Instant` (immune to clock changes).
+//! a dependency). App started after the time → that day's run happens once unless R24 applies.
+//! PC asleep at the time → the run happens on wake if the date has not changed; if it has, the
+//! new day's run waits for its own time (a missed day is skipped). Deadlines, quiet, retry,
+//! hold and gap windows use `Instant` (immune to clock changes).
 //!
 //! # Runtime
 //!
 //! [`start`] runs one scheduler thread: every [`TICK`] (or when [`Runtime::wake`]d, e.g. by
 //! `handoff_done`) it [`observe`]s the app, calls `step` and [`perform`]s the actions; it ends
-//! on [`Runtime::stop`] (app exit). Locks: `loaded(read)`, `ws`, `last_input` and the
-//! machine lock (`AppState::nightly`, leaf) are taken one at a time and released before any
-//! action runs; actions (`bridge::send`, `launcher::execute`, the inbox, the file write) run
-//! with no lock held.
+//! on [`Runtime::stop`] (`RunEvent::Exit` only — a vetoed `ExitRequested` keeps it running).
+//! Locks: `loaded(read)`, `ws`, the PTY `panes` map (`current_gen`), `last_input`, the spawn-time
+//! map and the machine lock (`AppState::nightly`, leaves) are taken one at a time and released
+//! before any action runs; actions (`bridge::send` / `discard`, `launcher::execute`, the inbox,
+//! the file write) run with no lock held. `Restart` is re-checked when performed: the pane must
+//! still be `Running` with the observed generation, otherwise it is left alone.
 
 use crate::config::Config;
 use crate::control::{Caller, StateHost};
@@ -53,7 +65,7 @@ use crate::workspace::{PaneId, PaneStatus, TabId, Workspace, WsCommand};
 use crate::AppState;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -65,6 +77,10 @@ pub const TICK: Duration = Duration::from_secs(60);
 pub const RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 /// Every nightly message starts with this (lets a restart drop its undelivered ones).
 pub const MESSAGE_MARK: &str = "[AgentBoard] 야간 정리";
+/// R25: a restart held for a typing user is given up after this (the pane is left alone).
+pub const HOLD_CAP: Duration = Duration::from_secs(60 * 60);
+/// Minimum monotonic time between two run starts in one process (wall-clock corrections).
+pub const MIN_GAP: Duration = Duration::from_secs(6 * 60 * 60);
 /// File (under `%APPDATA%/agentboard`) with the last run date.
 pub const FILE_NAME: &str = "nightly.json";
 
@@ -103,10 +119,24 @@ pub struct Target {
     pub tab_name: String,
     /// Process status is `Running`.
     pub running: bool,
+    /// Process status is `Starting` (a spawn or restart in progress): live, like `running`.
+    pub starting: bool,
+    /// Current spawn generation (`PtyManager::current_gen`); `None` when not spawned.
+    pub gen: Option<u64>,
+    /// Local time the current generation was spawned (runtime only, R24); `None` = unknown.
+    pub spawned_at: Option<NaiveDateTime>,
+}
+
+impl Target {
+    /// Running or starting.
+    pub fn live(&self) -> bool {
+        self.running || self.starting
+    }
 }
 
 /// Standing role terminal panes (Dispatcher, Handover, Manager) of `ws`, any status. Team
 /// panes (Lead/Member), panes without a role and applets/documents are never targets.
+/// `gen` / `spawned_at` are left `None` ([`observe`] fills them from the runtime).
 pub fn targets(ws: &Workspace) -> Vec<Target> {
     ws.panes
         .values()
@@ -118,6 +148,9 @@ pub fn targets(ws: &Workspace) -> Vec<Target> {
             tab: p.tab.clone(),
             tab_name: ws.tabs.get(&p.tab).map(|t| t.name.clone()).unwrap_or_default(),
             running: p.status == PaneStatus::Running,
+            starting: p.status == PaneStatus::Starting,
+            gen: None,
+            spawned_at: None,
         })
         .collect()
 }
@@ -150,17 +183,24 @@ impl World {
 /// Work for the runtime (performed in order, with no lock held).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    /// Persist the date of the run that is starting (`nightly.json`).
+    /// Persist the date of the run that is starting (or skipped, R24) in `nightly.json`.
     Record(NaiveDate),
     /// `bridge::send` the text to the pane's session.
     Notify { pane: PaneId, text: String },
+    /// Drop the pane's undelivered nightly messages (`bridge::discard`), so neither a later
+    /// session gets the old request nor `QUEUE_TIMEOUT` adds a second inbox item.
+    Discard { pane: PaneId },
     /// Inbox system item "야간 정리 미완료: <name>" for `tab`, `reason` in `check`.
     Incomplete { pane: PaneId, tab: TabId, tab_name: String, name: String, reason: String },
-    /// `WsCommand::RestartPaneFresh` (after dropping the pane's undelivered nightly messages).
-    Restart { pane: PaneId },
+    /// Inbox system item "야간 정리 보류: <name>" (R25: restart given up after [`HOLD_CAP`]).
+    Held { pane: PaneId, tab: TabId, tab_name: String, name: String, reason: String },
+    /// `WsCommand::RestartPaneFresh`, only if the pane is still `Running` with generation `gen`
+    /// when performed (re-checked by [`perform`]).
+    Restart { pane: PaneId, gen: Option<u64> },
 }
 
-/// Phase of the machine (see module docs). `Notifying` / `Restarting` are transient.
+/// Phase of the machine (see module docs). `Notifying` is transient; `Restarting` lasts only
+/// while restarts are held for a typing user (R25).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Phase {
     Idle,
@@ -176,8 +216,14 @@ pub enum Handoff {
     Accepted { remaining: usize },
     /// This pane already reported in this run (idempotent).
     Already,
-    /// A run is in progress but this pane is not one of its targets.
+    /// A run is in progress but this session is not one of its targets (started after the
+    /// run took its targets, or already restarted by it).
     NotTarget,
+    /// handover called before its own nightly message: not recorded (it must first collect
+    /// the workers' reports).
+    NotYet,
+    /// The run is past its waiting phase (restarts in progress): nothing recorded.
+    Closed,
     /// No run in progress: nothing to do.
     NotRunning,
 }
@@ -193,7 +239,9 @@ impl Handoff {
                 "야간 정리 완료 신호를 받았습니다(남은 대상 {remaining}개). 모두 끝나거나 제한 시간이 지나면 새 세션으로 다시 시작됩니다."
             ),
             Handoff::Already => "이미 야간 정리 완료 신호를 받았습니다. 더 할 일은 없습니다.".into(),
-            Handoff::NotTarget => "이 세션은 이번 야간 정리 대상이 아닙니다(정리 시작 뒤에 실행됨). 아무 것도 하지 않았습니다.".into(),
+            Handoff::NotTarget => "이 세션은 이번 야간 정리 대상이 아닙니다(정리 시작 뒤에 실행되었거나 이미 새로 시작됨). 아무 것도 하지 않았습니다.".into(),
+            Handoff::NotYet => "아직 기록하지 않았습니다 — handover는 앱이 보내는 인덱스 갱신 요청([AgentBoard] 야간 정리 … 인덱스 문서)을 받고 포인터를 갱신한 뒤에 handoff_done을 호출하세요.".into(),
+            Handoff::Closed => "이번 야간 정리는 이미 마감되었습니다(모두 완료했거나 제한 시간이 지남). 아무 것도 하지 않았습니다.".into(),
             Handoff::NotRunning => "지금은 야간 정리 중이 아닙니다. 아무 것도 하지 않았습니다.".into(),
         }
     }
@@ -225,31 +273,61 @@ pub fn handover_message(index: &str) -> String {
 
 fn timeout_reason(timeout: Duration) -> String {
     format!(
-        "제한 시간 {}분 안에 handoff_done을 호출하지 않았습니다 — 작업 계획·진행 내역이 저장·보고되지 않았을 수 있습니다. 세션은 새 세션으로 다시 시작했습니다.",
+        "제한 시간 {}분 안에 handoff_done을 호출하지 않았습니다 — 작업 계획·진행 내역이 저장·보고되지 않았을 수 있습니다. 세션은 새 세션으로 다시 시작합니다(사용자가 그 창에 입력 중이면 입력이 멈춘 뒤).",
         timeout.as_secs() / 60
     )
 }
 
 const EXITED_REASON: &str =
     "야간 정리 중 세션이 끝나 handoff_done을 받지 못했습니다 — 창은 다시 시작하지 않았습니다(창에서 Enter로 다시 시작).";
+const RESPAWNED_REASON: &str =
+    "야간 정리 중 세션이 다시 시작되어(사용자 재시작 등) 이전 세션의 handoff_done을 받지 못했습니다 — 지금 세션은 이미 새 세션이라 다시 시작하지 않았습니다.";
+
+fn held_reason(cap: Duration) -> String {
+    format!(
+        "사용자가 이 창에 계속 입력 중이어서 재시작을 {}분 미뤘고, 작업을 끊지 않도록 이번 야간 정리에서는 다시 시작하지 않았습니다 — 필요하면 창을 직접 다시 시작하세요.",
+        cap.as_secs() / 60
+    )
+}
 
 // ───────────────────────── the machine ─────────────────────────
 
 /// Bookkeeping of the run in progress.
 #[derive(Debug, Clone)]
 struct Run {
-    /// Targets at start (running then), in start order.
+    /// Targets at start (live then), in start order. `gen` is the generation the run talks
+    /// to: taken at start for a running pane, bound later for one that was starting.
     targets: Vec<Target>,
     half: Instant,
     handover_notified: bool,
     /// Targets without `handoff_done` when the run moved to `Restarting`.
     not_done: BTreeSet<PaneId>,
+    /// The first `Restarting` pass ran (items, discards, restarts emitted).
+    closed: bool,
+    /// R25: panes whose restart waits for the user to stop typing, and since when.
+    held: BTreeMap<PaneId, Instant>,
+}
+
+impl Run {
+    /// The pane as observed now, if it is still the session this run talks to and live.
+    fn same<'w>(&self, w: &'w World, pane: &str) -> Option<&'w Target> {
+        let mine = self.targets.iter().find(|t| t.pane == pane)?;
+        w.target(pane).filter(|now| now.live() && !respawned(mine, now))
+    }
+}
+
+/// The pane now runs another generation than the run's (restarted during the run).
+fn respawned(mine: &Target, now: &Target) -> bool {
+    mine.gen.is_some() && now.gen.is_some() && mine.gen != now.gen
 }
 
 /// The nightly state machine (pure).
 #[derive(Debug, Clone)]
 pub struct Nightly {
     last_run: Option<NaiveDate>,
+    /// Monotonic start of the last run in this process: a wall-clock correction (wrong RTC
+    /// date fixed by NTP) cannot produce a second run within [`MIN_GAP`].
+    last_start: Option<Instant>,
     retry_at: Option<Instant>,
     phase: Phase,
     run: Option<Run>,
@@ -258,7 +336,7 @@ pub struct Nightly {
 impl Nightly {
     /// `last_run`: date from `nightly.json` (`None` = never ran / unreadable file).
     pub fn new(last_run: Option<NaiveDate>) -> Self {
-        Nightly { last_run, retry_at: None, phase: Phase::Idle, run: None }
+        Nightly { last_run, last_start: None, retry_at: None, phase: Phase::Idle, run: None }
     }
 
     pub fn phase(&self) -> &Phase {
@@ -277,26 +355,50 @@ impl Nightly {
         }
     }
 
-    /// `handoff_done` from `pane`.
-    pub fn handoff(&mut self, pane: &str) -> Handoff {
-        let (Phase::Waiting { pending, .. }, Some(run)) = (&mut self.phase, &self.run) else {
-            return Handoff::NotRunning;
-        };
-        if pending.remove(pane) {
-            Handoff::Accepted { remaining: pending.len() }
-        } else if run.targets.iter().any(|t| t.pane == pane) {
-            Handoff::Already
-        } else {
-            Handoff::NotTarget
+    /// `handoff_done` from `pane` whose current spawn generation is `gen`.
+    pub fn handoff(&mut self, pane: &str, gen: Option<u64>) -> Handoff {
+        let Nightly { phase, run, .. } = self;
+        let Some(run) = run.as_mut() else { return Handoff::NotRunning };
+        let Some(t) = run.targets.iter_mut().find(|t| t.pane == pane) else { return Handoff::NotTarget };
+        // R25: a session spawned after the run took this pane (e.g. already restarted by it)
+        // is not the one that was asked
+        match (t.gen, gen) {
+            (Some(a), Some(b)) if a != b => return Handoff::NotTarget,
+            (None, Some(b)) => t.gen = Some(b), // was starting at start: bind now
+            _ => {}
+        }
+        let is_handover = t.role == Role::Handover;
+        match phase {
+            Phase::Waiting { pending, .. } => {
+                if !pending.contains(pane) {
+                    Handoff::Already
+                } else if is_handover && !run.handover_notified {
+                    Handoff::NotYet
+                } else {
+                    pending.remove(pane);
+                    Handoff::Accepted { remaining: pending.len() }
+                }
+            }
+            Phase::Restarting => Handoff::Closed,
+            _ => Handoff::NotRunning,
         }
     }
 
     /// Whether a run should start at `w` (ignoring the dispatcher's keystrokes).
     fn due(&self, w: &World) -> bool {
         let Some(at) = w.settings.at else { return false };
-        self.last_run != Some(w.local.date())
+        let today = w.local.date();
+        // a new day: never ran, an earlier date, or a record more than a day in the future (a
+        // clock that once ran far ahead must not block the refresh); a record of today or
+        // tomorrow (clock set back a little) does not run again
+        let new_day = match self.last_run {
+            None => true,
+            Some(d) => d < today || d > today.succ_opt().unwrap_or(today),
+        };
+        new_day
             && w.local.time() >= at
             && self.retry_at.is_none_or(|r| w.mono >= r)
+            && self.last_start.is_none_or(|s| w.mono.saturating_duration_since(s) >= MIN_GAP)
     }
 
     /// Run every transition due at `w`; returns the actions to perform, in order.
@@ -308,20 +410,37 @@ impl Nightly {
                     if !self.due(w) {
                         break;
                     }
+                    let date = w.local.date();
+                    // R24: every live standing session was started after today's time — they
+                    // are fresh already; the day counts, nothing else happens
+                    let since = date.and_time(w.settings.at.expect("due checked it"));
+                    let live: Vec<&Target> = w.targets.iter().filter(|t| t.live()).collect();
+                    if !live.is_empty() && live.iter().all(|t| t.spawned_at.is_some_and(|s| s >= since)) {
+                        self.retry_at = None;
+                        self.last_run = Some(date);
+                        out.push(Action::Record(date));
+                        break;
+                    }
                     let dispatcher_typing =
                         w.targets.iter().any(|t| t.role == Role::Dispatcher && w.typed_recently(&t.pane));
                     if dispatcher_typing {
                         self.retry_at = Some(w.mono + RETRY_AFTER);
                         break;
                     }
-                    let date = w.local.date();
                     self.retry_at = None;
                     self.last_run = Some(date);
+                    self.last_start = Some(w.mono);
                     out.push(Action::Record(date));
                     self.phase = Phase::Notifying;
                 }
                 Phase::Notifying => {
-                    let targets: Vec<Target> = w.targets.iter().filter(|t| t.running).cloned().collect();
+                    let targets: Vec<Target> = w
+                        .targets
+                        .iter()
+                        .filter(|t| t.live())
+                        // a starting pane's generation is bound once it runs (or reports)
+                        .map(|t| Target { gen: if t.running { t.gen } else { None }, ..t.clone() })
+                        .collect();
                     if targets.is_empty() {
                         self.phase = Phase::Idle;
                         break;
@@ -338,20 +457,26 @@ impl Nightly {
                         targets,
                         handover_notified: false,
                         not_done: BTreeSet::new(),
+                        closed: false,
+                        held: BTreeMap::new(),
                     });
                     self.phase = Phase::Waiting { pending, deadline: w.mono + w.settings.timeout };
                 }
                 Phase::Waiting { pending, deadline } => {
                     let run = self.run.as_mut().expect("a run while waiting");
-                    // a target that exited or was closed no longer blocks (it stays not done)
-                    let live = |p: &PaneId| w.target(p).is_some_and(|t| t.running);
-                    let blocking: BTreeSet<&PaneId> = pending.iter().filter(|p| live(p)).collect();
+                    for t in run.targets.iter_mut().filter(|t| t.gen.is_none()) {
+                        if let Some(now) = w.target(&t.pane).filter(|n| n.running) {
+                            t.gen = now.gen;
+                        }
+                    }
+                    // a target that exited, was closed or restarted no longer blocks (not done)
+                    let blocking: BTreeSet<&PaneId> = pending.iter().filter(|p| run.same(w, p).is_some()).collect();
                     let worker = |p: &&PaneId| run.targets.iter().any(|t| &t.pane == *p && t.role != Role::Handover);
                     if !run.handover_notified && (!blocking.iter().any(worker) || w.mono >= run.half) {
                         run.handover_notified = true;
                         let text = handover_message(&w.settings.handover_index);
                         for t in run.targets.iter().filter(|t| t.role == Role::Handover) {
-                            if pending.contains(&t.pane) && live(&t.pane) {
+                            if pending.contains(&t.pane) && run.same(w, &t.pane).is_some() {
                                 out.push(Action::Notify { pane: t.pane.clone(), text: text.clone() });
                             }
                         }
@@ -359,32 +484,68 @@ impl Nightly {
                     if !blocking.is_empty() && w.mono < *deadline {
                         break;
                     }
-                    // never restart over what the user is typing: wait for a quiet tick
-                    if run.targets.iter().any(|t| live(&t.pane) && w.typed_recently(&t.pane)) {
-                        break;
-                    }
                     run.not_done = std::mem::take(pending);
                     self.phase = Phase::Restarting;
                 }
                 Phase::Restarting => {
-                    let run = self.run.take().expect("a run while restarting");
-                    for t in &run.targets {
-                        let Some(now) = w.target(&t.pane) else { continue }; // closed: forgotten
-                        if run.not_done.contains(&t.pane) {
-                            let reason = if now.running { timeout_reason(w.settings.timeout) } else { EXITED_REASON.to_string() };
-                            out.push(Action::Incomplete {
-                                pane: t.pane.clone(),
-                                tab: now.tab.clone(),
-                                tab_name: now.tab_name.clone(),
-                                name: now.name.clone(),
-                                reason,
-                            });
+                    let run = self.run.as_mut().expect("a run while restarting");
+                    if !run.closed {
+                        run.closed = true;
+                        for t in &run.targets {
+                            let Some(now) = w.target(&t.pane) else { continue }; // closed: forgotten
+                            out.push(Action::Discard { pane: t.pane.clone() });
+                            let renewed = respawned(t, now);
+                            if run.not_done.contains(&t.pane) {
+                                let reason = if renewed {
+                                    RESPAWNED_REASON.to_string()
+                                } else if !now.live() {
+                                    EXITED_REASON.to_string()
+                                } else {
+                                    timeout_reason(w.settings.timeout)
+                                };
+                                out.push(Action::Incomplete {
+                                    pane: t.pane.clone(),
+                                    tab: now.tab.clone(),
+                                    tab_name: now.tab_name.clone(),
+                                    name: now.name.clone(),
+                                    reason,
+                                });
+                            }
+                            if now.live() && !renewed {
+                                if w.typed_recently(&t.pane) {
+                                    // R25: never restart over what the user is typing
+                                    run.held.insert(t.pane.clone(), w.mono);
+                                } else {
+                                    out.push(Action::Restart { pane: t.pane.clone(), gen: now.gen });
+                                }
+                            }
                         }
-                        if now.running {
-                            out.push(Action::Restart { pane: t.pane.clone() });
+                    } else {
+                        let held: Vec<(PaneId, Instant)> = run.held.iter().map(|(p, s)| (p.clone(), *s)).collect();
+                        for (pane, since) in held {
+                            let Some(now) = run.same(w, &pane) else {
+                                run.held.remove(&pane); // closed, exited or restarted meanwhile
+                                continue;
+                            };
+                            if !w.typed_recently(&pane) {
+                                out.push(Action::Restart { pane: pane.clone(), gen: now.gen });
+                                run.held.remove(&pane);
+                            } else if w.mono.saturating_duration_since(since) >= HOLD_CAP {
+                                out.push(Action::Held {
+                                    pane: pane.clone(),
+                                    tab: now.tab.clone(),
+                                    tab_name: now.tab_name.clone(),
+                                    name: now.name.clone(),
+                                    reason: held_reason(HOLD_CAP),
+                                });
+                                run.held.remove(&pane);
+                            }
                         }
                     }
-                    self.phase = Phase::Idle;
+                    if run.held.is_empty() {
+                        self.run = None;
+                        self.phase = Phase::Idle;
+                    }
                     break;
                 }
             }
@@ -431,11 +592,20 @@ pub struct Runtime {
     wake: Mutex<bool>,
     cv: Condvar,
     stop: AtomicBool,
+    /// R24: local spawn time per pane and generation (set by the launcher; runtime only, not
+    /// persisted). Leaf lock.
+    spawns: Mutex<HashMap<PaneId, (u64, NaiveDateTime)>>,
 }
 
 impl Default for Runtime {
     fn default() -> Self {
-        Runtime { machine: Mutex::new(Nightly::new(None)), wake: Mutex::new(false), cv: Condvar::new(), stop: AtomicBool::new(false) }
+        Runtime {
+            machine: Mutex::new(Nightly::new(None)),
+            wake: Mutex::new(false),
+            cv: Condvar::new(),
+            stop: AtomicBool::new(false),
+            spawns: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -449,9 +619,10 @@ impl Runtime {
         self.machine.lock().unwrap().phase().clone()
     }
 
-    /// `handoff_done`: record (machine lock, released), then wake the scheduler.
-    pub fn handoff(&self, pane: &str) -> Handoff {
-        let r = self.machine.lock().unwrap().handoff(pane);
+    /// `handoff_done` from `pane` running generation `gen`: record (machine lock, released),
+    /// then wake the scheduler.
+    pub fn handoff(&self, pane: &str, gen: Option<u64>) -> Handoff {
+        let r = self.machine.lock().unwrap().handoff(pane, gen);
         if matches!(r, Handoff::Accepted { .. }) {
             self.wake();
         }
@@ -486,18 +657,39 @@ impl Runtime {
     fn set_last_run(&self, d: Option<NaiveDate>) {
         self.machine.lock().unwrap().set_last_run(d);
     }
+
+    /// The launcher spawned generation `gen` of `pane` at local time `at` (R24). Leaf lock.
+    pub fn note_spawn(&self, pane: &str, gen: u64, at: NaiveDateTime) {
+        self.spawns.lock().unwrap().insert(pane.to_string(), (gen, at));
+    }
+
+    /// The pane left the model.
+    pub fn forget(&self, pane: &str) {
+        self.spawns.lock().unwrap().remove(pane);
+    }
+
+    /// Spawn time of `pane` if it was recorded for generation `gen`.
+    pub fn spawned_at(&self, pane: &str, gen: Option<u64>) -> Option<NaiveDateTime> {
+        let g = gen?;
+        self.spawns.lock().unwrap().get(pane).filter(|(sg, _)| *sg == g).map(|(_, t)| *t)
+    }
 }
 
 /// The MCP tool `handoff_done` (roles are checked by `mcp_tools::call`: Dispatcher, Handover
 /// and Manager only). Always `Ok` — outside a run it is a harmless no-op with a message.
 pub fn handoff_done(state: &AppState, caller: &Caller) -> Result<Value, String> {
-    Ok(json!(state.nightly.handoff(&caller.pane).message()))
+    let gen = state.pty.current_gen(&caller.pane); // the caller's token belongs to the latest spawn
+    Ok(json!(state.nightly.handoff(&caller.pane, gen).message()))
 }
 
 /// Everything `step` needs, read from the app (locks one at a time, all released).
 pub fn observe(state: &AppState, local: NaiveDateTime, mono: Instant) -> World {
     let settings = Settings::from_config(&state.loaded.read().unwrap().config);
-    let targets = targets(&state.ws.lock().unwrap());
+    let mut targets = targets(&state.ws.lock().unwrap());
+    for t in &mut targets {
+        t.gen = state.pty.current_gen(&t.pane); // panes map lock, released
+        t.spawned_at = state.nightly.spawned_at(&t.pane, t.gen);
+    }
     let last_input = {
         let li = state.last_input.lock().unwrap();
         targets.iter().filter_map(|t| li.get(&t.pane).map(|i| (t.pane.clone(), *i))).collect()
@@ -521,20 +713,33 @@ pub fn perform(state: &AppState, file: Option<&Path>, actions: Vec<Action>) {
                     eprintln!("[agentboard] 야간 정리 알림 실패 ({pane}): {e}");
                 }
             }
-            Action::Incomplete { tab, tab_name, name, reason, .. } => {
-                let title = format!("야간 정리 미완료: {name}");
-                if let Err(e) = state.inbox.post_system(&tab, &tab_name, &title, vec![reason], Vec::new()) {
-                    eprintln!("[agentboard] 인박스 시스템 항목을 만들 수 없습니다: {e}");
-                }
-            }
-            Action::Restart { pane } => {
-                // a nightly message the old session never got must not reach the new one
+            Action::Discard { pane } => {
                 crate::bridge::discard(state, &pane, |t| t.starts_with(MESSAGE_MARK));
+            }
+            Action::Incomplete { tab, tab_name, name, reason, .. } => {
+                post_item(state, &tab, &tab_name, &format!("야간 정리 미완료: {name}"), reason);
+            }
+            Action::Held { tab, tab_name, name, reason, .. } => {
+                post_item(state, &tab, &tab_name, &format!("야간 정리 보류: {name}"), reason);
+            }
+            Action::Restart { pane, gen } => {
+                // re-checked now (minor 3): an exit or a user restart since the observation
+                // leaves the pane alone
+                let running = state.ws.lock().unwrap().pane_by_id(&pane).is_some_and(|p| p.status == PaneStatus::Running);
+                if !running || state.pty.current_gen(&pane) != gen {
+                    continue;
+                }
                 if let Err(e) = crate::launcher::execute(state, WsCommand::RestartPaneFresh { pane: pane.clone() }) {
                     eprintln!("[agentboard] 야간 정리 재시작 실패 ({pane}): {e}");
                 }
             }
         }
+    }
+}
+
+fn post_item(state: &AppState, tab: &str, tab_name: &str, title: &str, reason: String) {
+    if let Err(e) = state.inbox.post_system(tab, tab_name, title, vec![reason], Vec::new()) {
+        eprintln!("[agentboard] 인박스 시스템 항목을 만들 수 없습니다: {e}");
     }
 }
 
@@ -555,7 +760,7 @@ pub fn start<H: StateHost>(host: H, file: PathBuf) {
         }
         loop {
             let Some(state) = host.get() else {
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_secs(1)); // not managed yet (never in practice)
                 continue;
             };
             state.nightly.wait(TICK);
@@ -592,7 +797,17 @@ mod tests {
         }
     }
     fn tgt(pane: &str, role: Role) -> Target {
-        Target { pane: pane.into(), role, name: pane.into(), tab: format!("t-{pane}"), tab_name: pane.into(), running: true }
+        Target {
+            pane: pane.into(),
+            role,
+            name: pane.into(),
+            tab: format!("t-{pane}"),
+            tab_name: pane.into(),
+            running: true,
+            starting: false,
+            gen: Some(1),
+            spawned_at: None,
+        }
     }
     /// dispatcher `d`, handover `h`, Managers `m1`, `m2`.
     fn standing() -> Vec<Target> {
@@ -628,14 +843,21 @@ mod tests {
         a.iter().filter_map(|a| if let Action::Notify { pane, .. } = a { Some(pane.clone()) } else { None }).collect()
     }
     fn restarted(a: &[Action]) -> Vec<String> {
-        a.iter().filter_map(|a| if let Action::Restart { pane } = a { Some(pane.clone()) } else { None }).collect()
+        a.iter().filter_map(|a| if let Action::Restart { pane, .. } = a { Some(pane.clone()) } else { None }).collect()
     }
+    fn discarded(a: &[Action]) -> Vec<String> {
+        a.iter().filter_map(|a| if let Action::Discard { pane } = a { Some(pane.clone()) } else { None }).collect()
+    }
+    fn held(a: &[Action]) -> Vec<String> {
+        a.iter().filter_map(|a| if let Action::Held { pane, .. } = a { Some(pane.clone()) } else { None }).collect()
+    }
+    const DAY: u64 = 24 * 3600;
     fn incomplete(a: &[Action]) -> Vec<String> {
         a.iter().filter_map(|a| if let Action::Incomplete { pane, .. } = a { Some(pane.clone()) } else { None }).collect()
     }
     fn all_done(n: &mut Nightly, panes: &[&str]) {
         for p in panes {
-            assert!(matches!(n.handoff(p), Handoff::Accepted { .. }), "{p}");
+            assert!(matches!(n.handoff(p, Some(1)), Handoff::Accepted { .. }), "{p}");
         }
     }
 
@@ -663,10 +885,10 @@ mod tests {
         assert_eq!(n.phase(), &Phase::Idle);
 
         // the same day never again; the next day only after its own time
-        for (local, s) in [("2026-10-25 03:04", 300), ("2026-10-25 23:59", 400), ("2026-10-26 02:59", 500)] {
+        for (local, s) in [("2026-10-25 03:04", 300), ("2026-10-25 23:59", 21 * 3600), ("2026-10-26 02:59", DAY - 60)] {
             assert!(n.step(&c.w(local, s)).is_empty(), "{local}");
         }
-        let a = n.step(&c.w("2026-10-26 03:00", 600));
+        let a = n.step(&c.w("2026-10-26 03:00", DAY));
         assert_eq!(a.first(), Some(&Action::Record(day("2026-10-26"))));
 
         // app started (or PC woke up) after the time: that day's run happens once
@@ -675,9 +897,20 @@ mod tests {
         // … but not when nightly.json already says it ran today (crash mid-run, restart)
         let mut again = Nightly::new(Some(day("2026-10-25")));
         assert!(again.step(&c.w("2026-10-25 15:00", 0)).is_empty());
-        // a clock set back to an earlier date counts as a new day (differs from the record)
+        // a clock set back by a day does not repeat the recorded run (minor 4) …
         let mut back = Nightly::new(Some(day("2026-10-25")));
+        assert!(back.step(&c.w("2026-10-24 04:00", 0)).is_empty());
+        // … but a record far in the future (a clock that once ran ahead) does not block forever
         assert!(!back.step(&c.w("2026-10-20 04:00", 0)).is_empty());
+        // a wrong RTC date corrected forward the same real day: no second run within MIN_GAP
+        let mut rtc = Nightly::new(None);
+        rtc.step(&c.w("2026-10-24 04:00", 0));
+        all_done(&mut rtc, &["d", "m1", "m2"]);
+        rtc.step(&c.w("2026-10-24 04:01", 60));
+        all_done(&mut rtc, &["h"]);
+        assert_eq!(restarted(&rtc.step(&c.w("2026-10-24 04:01", 61))).len(), 4);
+        assert!(rtc.step(&c.w("2026-10-25 04:05", 3600)).is_empty(), "NTP fixed the date an hour later");
+        assert_eq!(rtc.step(&c.w("2026-10-25 10:00", 6 * 3600)).first(), Some(&Action::Record(day("2026-10-25"))));
         // switched off
         let mut c2 = Clock::new();
         c2.settings.at = None;
@@ -728,14 +961,17 @@ mod tests {
         c4.targets = ts.clone();
         let mut n = Nightly::new(None);
         let mut acts = n.step(&c4.w("2026-10-25 03:00", 0));
-        for t in &ts {
-            n.handoff(&t.pane);
+        for t in ts.iter().filter(|t| t.role != Role::Handover) {
+            assert!(matches!(n.handoff(&t.pane, None), Handoff::Accepted { .. }));
         }
         acts.extend(n.step(&c4.w("2026-10-25 03:01", 60)));
+        for t in ts.iter().filter(|t| t.role == Role::Handover) {
+            assert!(matches!(n.handoff(&t.pane, None), Handoff::Accepted { .. }));
+        }
         acts.extend(n.step(&c4.w("2026-10-25 03:02", 120)));
         assert_eq!(restarted(&acts).len(), ts.len());
         for a in &acts {
-            if let Action::Notify { pane, .. } | Action::Restart { pane } = a {
+            if let Action::Notify { pane, .. } | Action::Restart { pane, .. } | Action::Discard { pane } = a {
                 assert!(!team.contains(pane.as_str()), "team pane {pane} touched");
             }
         }
@@ -795,24 +1031,33 @@ mod tests {
         assert_eq!(restarted(&a), ["d", "h", "m1", "m2"]);
         assert_eq!(n.phase(), &Phase::Idle);
 
-        // (c) a keystroke in a target pane holds the restart (never kill what the user types)
+        // (c) a keystroke in a target pane holds only that pane's restart (R25)
         let mut c2 = Clock::new();
         let mut n = Nightly::new(None);
         n.step(&c2.w("2026-10-25 03:00", 0));
-        all_done(&mut n, &["d", "m1", "m2", "h"]);
+        all_done(&mut n, &["d", "m1", "m2"]);
+        n.step(&c2.w("2026-10-25 03:00", 1));
+        all_done(&mut n, &["h"]);
         c2.input.insert("m1".into(), c2.mono(50));
-        assert!(restarted(&n.step(&c2.w("2026-10-25 03:01", 60))).is_empty(), "held");
-        assert!(matches!(n.phase(), Phase::Waiting { .. }));
+        assert_eq!(restarted(&n.step(&c2.w("2026-10-25 03:01", 60))), ["d", "h", "m2"], "m1 held");
+        assert_eq!(n.phase(), &Phase::Restarting);
+        assert_eq!(n.handoff("m1", Some(1)), Handoff::Closed);
         let a = n.step(&c2.w("2026-10-25 03:11", 50 + 10 * 60));
-        assert_eq!(restarted(&a), ["d", "h", "m1", "m2"]);
+        assert_eq!(restarted(&a), ["m1"], "restarted once the user stopped");
+        assert_eq!(n.phase(), &Phase::Idle);
 
         // handoff replies: idempotent, harmless outside a run
-        assert_eq!(n.handoff("d"), Handoff::NotRunning);
+        assert_eq!(n.handoff("d", Some(1)), Handoff::NotRunning);
         let mut n = Nightly::new(None);
         n.step(&c.w("2026-10-25 03:00", 0));
-        assert_eq!(n.handoff("m1"), Handoff::Accepted { remaining: 3 });
-        assert_eq!(n.handoff("m1"), Handoff::Already);
-        assert_eq!(n.handoff("p99"), Handoff::NotTarget);
+        assert_eq!(n.handoff("m1", Some(1)), Handoff::Accepted { remaining: 3 });
+        assert_eq!(n.handoff("m1", Some(1)), Handoff::Already);
+        assert_eq!(n.handoff("p99", Some(1)), Handoff::NotTarget);
+        // a session of another generation (restarted since the run began) is not the one asked
+        assert_eq!(n.handoff("m2", Some(2)), Handoff::NotTarget);
+        // handover before its own message (minor 6): not recorded
+        assert_eq!(n.handoff("h", Some(1)), Handoff::NotYet);
+        assert!(matches!(n.phase(), Phase::Waiting { pending, .. } if pending.contains("h")));
     }
 
     #[test]
@@ -836,7 +1081,10 @@ mod tests {
         assert!(matches!(m2, Action::Incomplete { reason, .. } if reason.contains("세션이 끝나")));
         // the item comes before the restart of the same pane
         let pos = |want: &Action| a.iter().position(|x| x == want).unwrap();
-        assert!(pos(d) < pos(&Action::Restart { pane: "d".into() }));
+        assert!(pos(d) < pos(&Action::Restart { pane: "d".into(), gen: Some(1) }));
+        // undelivered nightly messages are dropped for every target still in the model,
+        // exited ones included (minor 1)
+        assert_eq!(discarded(&a), ["d", "m1", "m2"]);
     }
 
     #[test]
@@ -870,13 +1118,16 @@ mod tests {
         assert!(notified(&n.step(&c.w("2026-10-25 03:09", 10 * 60 - 1))).is_empty());
         assert_eq!(notified(&n.step(&c.w("2026-10-25 03:10", 10 * 60))), ["h"]);
 
-        // handover reported early by itself: not asked again
+        // handover reporting before its message is not counted: it is still asked (minor 6)
         let mut n = Nightly::new(None);
         n.step(&c.w("2026-10-25 03:00", 0));
-        all_done(&mut n, &["h", "d", "m1", "m2"]);
+        assert_eq!(n.handoff("h", Some(1)), Handoff::NotYet);
+        all_done(&mut n, &["d", "m1", "m2"]);
         let a = n.step(&c.w("2026-10-25 03:01", 60));
-        assert!(notified(&a).is_empty());
-        assert_eq!(restarted(&a).len(), 4);
+        assert_eq!(notified(&a), ["h"]);
+        assert!(restarted(&a).is_empty());
+        all_done(&mut n, &["h"]);
+        assert_eq!(restarted(&n.step(&c.w("2026-10-25 03:02", 120))).len(), 4);
 
         // no Manager / dispatcher running: handover is asked right away; no handover: the
         // workers' message says so
@@ -888,6 +1139,126 @@ mod tests {
         let a = Nightly::new(None).step(&c3.w("2026-10-25 03:00", 0));
         assert_eq!(text(&a, "m1"), worker_message(&[]));
         assert!(!text(&a, "m1").contains('@'));
+    }
+
+    #[test]
+    fn skips_when_every_session_started_after_the_time() {
+        // R24: app started at 08:00 → every standing session spawned after 03:00 today
+        let mut c = Clock::new();
+        c.targets.iter_mut().for_each(|t| t.spawned_at = Some(at("2026-10-25 08:00")));
+        c.targets[1].running = false; // an exited pane does not count either way
+        c.targets[1].spawned_at = Some(at("2026-10-24 08:00"));
+        let mut n = Nightly::new(Some(day("2026-10-24")));
+        assert_eq!(n.step(&c.w("2026-10-25 08:01", 0)), [Action::Record(day("2026-10-25"))]);
+        assert_eq!((n.phase(), n.last_run()), (&Phase::Idle, Some(day("2026-10-25"))));
+        assert!(n.step(&c.w("2026-10-25 09:00", 3600)).is_empty(), "the day counts as done");
+        // one live session older than today's time (or of unknown age): the run happens
+        for old in [Some(at("2026-10-25 02:59")), None] {
+            let mut c2 = Clock::new();
+            c2.targets.iter_mut().for_each(|t| t.spawned_at = Some(at("2026-10-25 08:00")));
+            c2.targets[2].spawned_at = old;
+            let a = Nightly::new(None).step(&c2.w("2026-10-25 08:01", 0));
+            assert_eq!(notified(&a), ["d", "m1", "m2"], "{old:?}");
+        }
+        // starting panes count as live (spawned now, so fresh)
+        let mut c3 = Clock::new();
+        c3.targets.iter_mut().for_each(|t| {
+            t.running = false;
+            t.starting = true;
+            t.spawned_at = Some(at("2026-10-25 08:00"));
+        });
+        assert_eq!(Nightly::new(None).step(&c3.w("2026-10-25 08:01", 0)), [Action::Record(day("2026-10-25"))]);
+    }
+
+    #[test]
+    fn typing_hold_is_capped_and_never_kills_user_work() {
+        // R25: the user keeps typing into m1 → after 60 min it is left alone + "보류" item
+        let mut c = Clock::new();
+        let mut n = Nightly::new(None);
+        n.step(&c.w("2026-10-25 03:00", 0));
+        let t0 = 20 * 60;
+        c.input.insert("m1".into(), c.mono(t0 - 1));
+        let a = n.step(&c.w("2026-10-25 03:20", t0));
+        assert_eq!(restarted(&a), ["d", "h", "m2"]);
+        assert_eq!(incomplete(&a), ["d", "h", "m1", "m2"], "nobody reported");
+        for k in 1..6 {
+            c.input.insert("m1".into(), c.mono(t0 + k * 600 - 1));
+            let a = n.step(&c.w("2026-10-25 04:00", t0 + k * 600));
+            assert!(a.is_empty(), "still typing after {k}0 min: {a:?}");
+        }
+        c.input.insert("m1".into(), c.mono(t0 + 3600 - 1));
+        let a = n.step(&c.w("2026-10-25 04:20", t0 + 3600));
+        assert_eq!(held(&a), ["m1"]);
+        assert!(restarted(&a).is_empty(), "never restarted over the user's work");
+        let Action::Held { tab, reason, .. } = &a[0] else { panic!("{a:?}") };
+        assert_eq!(tab, "t-m1");
+        assert!(reason.contains("60분"), "{reason}");
+        assert_eq!(n.phase(), &Phase::Idle);
+
+        // a held pane that the user restarts (or that exits) meanwhile is simply dropped
+        let mut c = Clock::new();
+        let mut n = Nightly::new(None);
+        n.step(&c.w("2026-10-25 03:00", 0));
+        c.input.insert("m1".into(), c.mono(t0 - 1));
+        n.step(&c.w("2026-10-25 03:20", t0));
+        c.targets.iter_mut().find(|t| t.pane == "m1").unwrap().gen = Some(2);
+        assert!(n.step(&c.w("2026-10-25 03:21", t0 + 60)).is_empty());
+        assert_eq!(n.phase(), &Phase::Idle);
+    }
+
+    #[test]
+    fn starting_and_restarted_panes_during_a_run() {
+        // minor 2: a pane starting at 03:00 is a target (generation bound once it runs)
+        let mut c = Clock::new();
+        let m2 = c.targets.iter_mut().find(|t| t.pane == "m2").unwrap();
+        m2.running = false;
+        m2.starting = true;
+        m2.gen = Some(7); // the old process of a queued restart, not the session we will talk to
+        let mut n = Nightly::new(None);
+        assert_eq!(notified(&n.step(&c.w("2026-10-25 03:00", 0))), ["d", "m1", "m2"]);
+        let m2 = c.targets.iter_mut().find(|t| t.pane == "m2").unwrap();
+        m2.running = true;
+        m2.starting = false;
+        m2.gen = Some(8);
+        n.step(&c.w("2026-10-25 03:01", 60));
+        assert_eq!(n.handoff("m2", Some(8)), Handoff::Accepted { remaining: 3 });
+
+        // a target the user restarts during the run (new generation): not blocking, its new
+        // session is not asked, an item says why, no second restart
+        let mut c = Clock::new();
+        let mut n = Nightly::new(None);
+        n.step(&c.w("2026-10-25 03:00", 0));
+        all_done(&mut n, &["d", "m2"]);
+        let m1 = c.targets.iter_mut().find(|t| t.pane == "m1").unwrap();
+        m1.gen = Some(2);
+        m1.running = false;
+        m1.starting = true;
+        assert_eq!(n.handoff("m1", Some(2)), Handoff::NotTarget);
+        let a = n.step(&c.w("2026-10-25 03:01", 60));
+        assert_eq!(notified(&a), ["h"], "m1 no longer blocks the handover");
+        all_done(&mut n, &["h"]);
+        let a = n.step(&c.w("2026-10-25 03:02", 120));
+        assert_eq!(restarted(&a), ["d", "h", "m2"]);
+        let r = a.iter().find_map(|a| match a {
+            Action::Incomplete { pane, reason, .. } if pane == "m1" => Some(reason.clone()),
+            _ => None,
+        });
+        assert!(r.unwrap().contains("다시 시작되어"));
+
+        // a pane in Starting at the deadline (same generation) is not reported as exited
+        let mut c = Clock::new();
+        let mut n = Nightly::new(None);
+        n.step(&c.w("2026-10-25 03:00", 0));
+        let d = c.targets.iter_mut().find(|t| t.pane == "d").unwrap();
+        d.running = false;
+        d.starting = true;
+        let a = n.step(&c.w("2026-10-25 03:20", 20 * 60));
+        let r = a.iter().find_map(|a| match a {
+            Action::Incomplete { pane, reason, .. } if pane == "d" => Some(reason.clone()),
+            _ => None,
+        });
+        assert!(!r.unwrap().contains("세션이 끝나"));
+        assert!(restarted(&a).contains(&"d".to_string()), "perform re-checks Running before restarting");
     }
 
     #[test]
@@ -934,8 +1305,18 @@ mod tests {
         fn drop_channel(&self, _: &str) {}
     }
 
-    #[test]
-    fn tick_notifies_records_and_restarts_fresh() {
+    /// A real AppState (no Tauri, no processes): dispatcher, handover, Manager `billing` with
+    /// team `a` (lead + member), every pane `Running`; effects stay queued in `rx`.
+    struct App {
+        state: AppState,
+        rx: std::sync::mpsc::Receiver<crate::workspace::Effects>,
+        ts: Vec<Target>,
+        team: Vec<PaneId>,
+        root: tempfile::TempDir,
+        appdata: tempfile::TempDir,
+    }
+
+    fn app() -> App {
         let root = tempfile::tempdir().unwrap();
         let appdata = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -976,6 +1357,50 @@ mod tests {
             Vec::new(),
             appdata.path().join("run"),
         );
+        App { state, rx, ts, team, root, appdata }
+    }
+
+    #[test]
+    fn perform_rechecks_restart_and_discards_for_exited_panes() {
+        let App { state, rx, ts, root, appdata: _appdata, .. } = app();
+        let m = ts.iter().find(|t| t.role == Role::Manager).unwrap().clone();
+        let d = ts.iter().find(|t| t.role == Role::Dispatcher).unwrap().clone();
+        // minor 3: generation or status changed since the step → no restart
+        perform(&state, None, vec![Action::Restart { pane: m.pane.clone(), gen: Some(42) }]);
+        assert!(rx.try_recv().is_err(), "another generation now: left alone");
+        state.ws.lock().unwrap().set_status(&m.pane, PaneStatus::Exited { code: 0 });
+        perform(&state, None, vec![Action::Restart { pane: m.pane.clone(), gen: None }]);
+        assert!(rx.try_recv().is_err(), "exited meanwhile: left alone");
+        perform(&state, None, vec![Action::Restart { pane: d.pane.clone(), gen: None }]);
+        let fx = rx.try_recv().expect("still running, same generation: restarted");
+        assert_eq!(fx.spawn, vec![(d.pane.clone(), true)]);
+        // minor 1: an exited pane's queued nightly message is dropped, other messages stay
+        crate::bridge::send(&state, &m.pane, &worker_message(&[])).unwrap();
+        crate::bridge::send(&state, &m.pane, "[AgentBoard] 인박스 지시 — x").unwrap();
+        perform(&state, None, vec![Action::Discard { pane: m.pane.clone() }]);
+        assert_eq!(state.bridge.queued(&m.pane), 1);
+        // the "보류" item (R25)
+        perform(
+            &state,
+            None,
+            vec![Action::Held { pane: m.pane.clone(), tab: m.tab.clone(), tab_name: m.tab_name.clone(), name: m.name.clone(), reason: "r".into() }],
+        );
+        let items = state.inbox.list(false).items;
+        assert_eq!(items[0].title, format!("야간 정리 보류: {}", m.name));
+        assert_eq!(items[0].owner_tab, m.tab);
+        // R24 spawn times: only for the recorded generation
+        state.nightly.note_spawn(&m.pane, 5, at("2026-10-25 08:00"));
+        assert_eq!(state.nightly.spawned_at(&m.pane, Some(5)), Some(at("2026-10-25 08:00")));
+        assert_eq!(state.nightly.spawned_at(&m.pane, Some(6)), None);
+        assert_eq!(state.nightly.spawned_at(&m.pane, None), None);
+        state.nightly.forget(&m.pane);
+        assert_eq!(state.nightly.spawned_at(&m.pane, Some(5)), None);
+        drop(root);
+    }
+
+    #[test]
+    fn tick_notifies_records_and_restarts_fresh() {
+        let App { state, rx, ts, team, root, appdata } = app();
         let file = appdata.path().join(FILE_NAME);
         let pane_of = |r: Role| ts.iter().find(|t| t.role == r).unwrap().clone();
         let (d, h, m) = (pane_of(Role::Dispatcher), pane_of(Role::Handover), pane_of(Role::Manager));
