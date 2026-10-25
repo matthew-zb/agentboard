@@ -133,26 +133,19 @@ struct RawPane {
 }
 
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum RawNode {
-    Pane {
-        pane: RawPane,
-    },
-    Split {
-        split: Dir,
-        #[serde(default)]
-        sizes: Option<Vec<f32>>,
-        children: Vec<RawNode>,
-        #[serde(default)]
-        slot: Option<String>,
-    },
+#[serde(deny_unknown_fields)]
+struct RawTemplate {
+    name: String,
+    layout: serde_json::Value,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTemplate {
-    name: String,
-    layout: RawNode,
+struct RawSplitRest {
+    #[serde(default)]
+    sizes: Option<Vec<f32>>,
+    #[serde(default)]
+    slot: Option<String>,
 }
 
 /// Percent sizes: equal when absent or mismatched, otherwise scaled to sum 100.
@@ -167,28 +160,63 @@ fn fit_sizes(sizes: Option<Vec<f32>>, n: usize) -> Vec<f32> {
     }
 }
 
-fn convert_node(n: RawNode) -> LayoutNode<PaneSpec> {
-    match n {
-        RawNode::Pane { pane: p } => LayoutNode::Leaf(PaneSpec {
-            name: p.name,
-            agent: p.agent,
-            args: p.args,
-            env: p.env,
-            cwd: p.cwd,
-            prompt: p.prompt,
-            focus: p.focus,
-        }),
-        RawNode::Split { split, sizes, children, slot } => {
-            let sizes = fit_sizes(sizes, children.len());
-            LayoutNode::Split { dir: split, sizes, children: children.into_iter().map(convert_node).collect(), slot }
+fn pane_spec(p: RawPane) -> PaneSpec {
+    PaneSpec { name: p.name, agent: p.agent, args: p.args, env: p.env, cwd: p.cwd, prompt: p.prompt, focus: p.focus }
+}
+
+/// Parse a layout node from JSON: a leaf (`{key: {...}}`) or a split. Errors carry a JSON path.
+fn parse_node<T>(
+    v: &serde_json::Value,
+    path: &str,
+    key: &str,
+    file: &Path,
+    leaf: &dyn Fn(&serde_json::Value, &str) -> Result<T, ConfigError>,
+) -> Result<LayoutNode<T>, ConfigError> {
+    let Some(obj) = v.as_object() else {
+        return Err(sem_err(file, path, "노드는 객체여야 함"));
+    };
+    match (obj.contains_key(key), obj.contains_key("split")) {
+        (true, true) => Err(sem_err(file, path, format!("노드에 '{key}'와 'split'을 함께 쓸 수 없음"))),
+        (false, false) => Err(sem_err(file, path, format!("노드에는 '{key}' 또는 'split'이 필요함"))),
+        (true, false) => {
+            if let Some(extra) = obj.keys().find(|k| k.as_str() != key) {
+                return Err(sem_err(file, path, format!("알 수 없는 필드 '{extra}'")));
+            }
+            leaf(&obj[key], &format!("{path}.{key}")).map(LayoutNode::Leaf)
+        }
+        (false, true) => {
+            let dir: Dir = serde_json::from_value(obj["split"].clone()).map_err(|e| {
+                sem_err(file, format!("{path}.split"), format!("split은 \"horizontal\" 또는 \"vertical\"이어야 함 ({e})"))
+            })?;
+            let mut rest = obj.clone();
+            rest.remove("split");
+            let children_v = rest.remove("children");
+            let rest: RawSplitRest = serde_json::from_value(serde_json::Value::Object(rest))
+                .map_err(|e| sem_err(file, path, format!("분할 노드 필드 오류: {e}")))?;
+            let Some(serde_json::Value::Array(arr)) = children_v else {
+                return Err(sem_err(file, format!("{path}.children"), "children은 배열이어야 함"));
+            };
+            let mut children = Vec::new();
+            for (i, c) in arr.iter().enumerate() {
+                children.push(parse_node(c, &format!("{path}.children[{i}]"), key, file, leaf)?);
+            }
+            let sizes = fit_sizes(rest.sizes, children.len());
+            Ok(LayoutNode::Split { dir, sizes, children, slot: rest.slot })
         }
     }
 }
 
 /// Parse a template file's text. Single-child splits are kept so `validate_template` can reject them.
 pub fn parse_template(text: &str, file: &Path) -> Result<Template, ConfigError> {
-    let raw: RawTemplate = serde_json::from_str(text).map_err(|e| located_json_error(file, &e))?;
-    Ok(Template { name: raw.name, layout: convert_node(raw.layout) })
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| located_json_error(file, &e))?;
+    let raw: RawTemplate =
+        serde_json::from_value(v).map_err(|e| sem_err(file, "$", format!("템플릿 형식 오류: {e}")))?;
+    let layout = parse_node(&raw.layout, "layout", "pane", file, &|v, p| {
+        serde_json::from_value::<RawPane>(v.clone())
+            .map(pane_spec)
+            .map_err(|e| sem_err(file, p, format!("창 정의 오류: {e}")))
+    })?;
+    Ok(Template { name: raw.name, layout })
 }
 
 fn is_absolute_like(p: &str) -> bool {
@@ -324,34 +352,6 @@ struct RawGroup {
 }
 
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum RawGroupNode {
-    Group {
-        group: RawGroup,
-    },
-    Split {
-        split: Dir,
-        #[serde(default)]
-        sizes: Option<Vec<f32>>,
-        children: Vec<RawGroupNode>,
-        #[serde(default)]
-        slot: Option<String>,
-    },
-}
-
-fn convert_group(n: RawGroupNode) -> LayoutNode<GroupSpec> {
-    match n {
-        RawGroupNode::Group { group } => LayoutNode::Leaf(GroupSpec { name: group.name, tabs: group.tabs }),
-        RawGroupNode::Split { split, sizes, children, slot } => LayoutNode::Split {
-            dir: split,
-            sizes: fit_sizes(sizes, children.len()),
-            children: children.into_iter().map(convert_group).collect(),
-            slot,
-        },
-    }
-}
-
-#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTab {
     name: String,
@@ -380,57 +380,92 @@ struct RawConfig {
     #[serde(default)]
     default_agent: Option<String>,
     #[serde(default)]
-    groups: Option<RawGroupNode>,
+    groups: Option<serde_json::Value>,
     #[serde(default)]
     default_group: Option<String>,
     #[serde(default)]
     tabs: Vec<RawTab>,
 }
 
-pub fn parse_config(text: &str, file: &Path) -> Result<Config, ConfigError> {
+/// Returns the parsed config plus errors for parts that were dropped (currently: a malformed
+/// `groups` layout). Syntax/type errors of the file itself are `Err` (located line:col).
+pub fn parse_config(text: &str, file: &Path) -> Result<(Config, Vec<ConfigError>), ConfigError> {
     let raw: RawConfig = serde_json::from_str(text).map_err(|e| located_json_error(file, &e))?;
     let d = Config::default();
+    let mut errs = Vec::new();
+    let groups = match raw.groups {
+        None => None,
+        Some(v) => match parse_node(&v, "groups", "group", file, &|v, p| {
+            serde_json::from_value::<RawGroup>(v.clone())
+                .map(|g| GroupSpec { name: g.name, tabs: g.tabs })
+                .map_err(|e| sem_err(file, p, format!("그룹 정의 오류: {e}")))
+        }) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                errs.push(e);
+                None
+            }
+        },
+    };
     let disp = raw.dispatcher.unwrap_or(RawDispatcher { agent: None, template: None });
-    Ok(Config {
+    let cfg = Config {
         dispatcher: DispatcherSpec {
             agent: disp.agent.or(d.dispatcher.agent),
             template: disp.template.unwrap_or(d.dispatcher.template),
         },
         default_template: raw.default_template.unwrap_or(d.default_template),
         default_agent: raw.default_agent.unwrap_or(d.default_agent),
-        groups: raw.groups.map(convert_group),
+        groups,
         default_group: raw.default_group,
         tabs: raw.tabs.into_iter().map(|t| TabSpec { name: t.name, dir: t.dir, template: t.template }).collect(),
-    })
+    };
+    Ok((cfg, errs))
 }
 
-pub fn validate_config(c: &Config, file: &Path) -> Vec<ConfigError> {
+/// Drop only the offending items (bad tabs; an invalid group layout) and report each as an error.
+pub fn sanitize_config(mut c: Config, file: &Path) -> (Config, Vec<ConfigError>) {
     let mut errs = Vec::new();
     let mut names = BTreeSet::new();
-    for (i, t) in c.tabs.iter().enumerate() {
+    let mut kept = Vec::new();
+    for (i, t) in std::mem::take(&mut c.tabs).into_iter().enumerate() {
         let p = format!("tabs[{i}]");
+        let before = errs.len();
         if t.name.trim().is_empty() {
             errs.push(sem_err(file, format!("{p}.name"), "탭 이름이 비어 있음"));
         } else if t.name == "dispatcher" {
             errs.push(sem_err(file, format!("{p}.name"), "'dispatcher'는 예약된 탭 이름임"));
-        } else if !names.insert(t.name.clone()) {
+        } else if names.contains(&t.name) {
             errs.push(sem_err(file, format!("{p}.name"), format!("탭 이름 '{}'이(가) 중복됨", t.name)));
         }
         if let Some(m) = check_relative(&t.dir) {
             errs.push(sem_err(file, format!("{p}.dir"), m));
         }
+        if errs.len() == before {
+            names.insert(t.name.clone());
+            kept.push(t);
+        }
     }
+    c.tabs = kept;
     if let Some(g) = &c.groups {
         let mut group_names = BTreeSet::new();
         let mut placed = BTreeSet::new();
+        let before = errs.len();
         walk_groups(g, "groups", file, &names, &mut group_names, &mut placed, &mut errs);
-        if let Some(dg) = &c.default_group {
+        if errs.len() != before {
+            c.groups = None;
+            c.default_group = None;
+        } else if let Some(dg) = &c.default_group {
             if !group_names.contains(dg) {
                 errs.push(sem_err(file, "defaultGroup", format!("그룹 '{dg}'이(가) groups에 없음")));
+                c.default_group = None;
             }
         }
     }
-    errs
+    (c, errs)
+}
+
+pub fn validate_config(c: &Config, file: &Path) -> Vec<ConfigError> {
+    sanitize_config(c.clone(), file).1
 }
 
 fn walk_groups(
@@ -632,6 +667,11 @@ pub struct Loaded {
     pub errors: Vec<ConfigError>,
 }
 
+fn embedded_template(name: &str) -> Template {
+    let (file, text) = DEFAULT_TEMPLATES.iter().find(|(n, _)| n.trim_end_matches(".json") == name).expect("embedded template");
+    parse_template(text, Path::new(file)).expect("embedded template is valid")
+}
+
 /// Create `.agentboard/` and copy embedded defaults — never overwrites existing files.
 pub fn ensure_dotdir(root: &Path) -> Result<(), String> {
     let dot = root.join(".agentboard");
@@ -701,16 +741,13 @@ pub fn load_all(appdata_dir: &Path) -> Loaded {
 
     // config
     let cfg_path = dot.join("config.json");
-    let config = match std::fs::read_to_string(&cfg_path) {
+    let mut config = match std::fs::read_to_string(&cfg_path) {
         Ok(text) => match parse_config(&text, &cfg_path) {
-            Ok(c) => {
-                let errs = validate_config(&c, &cfg_path);
-                if errs.is_empty() {
-                    c
-                } else {
-                    errors.extend(errs);
-                    Config::default()
-                }
+            Ok((c, perrs)) => {
+                errors.extend(perrs);
+                let (c, errs) = sanitize_config(c, &cfg_path);
+                errors.extend(errs);
+                c
             }
             Err(e) => {
                 errors.push(e);
@@ -723,19 +760,27 @@ pub fn load_all(appdata_dir: &Path) -> Loaded {
             Config::default()
         }
     };
-    // references from config to templates (non-fatal)
-    let mut refs: Vec<(String, &str)> = vec![
-        ("dispatcher.template".into(), config.dispatcher.template.as_str()),
-        ("defaultTemplate".into(), config.default_template.as_str()),
-    ];
-    for (i, t) in config.tabs.iter().enumerate() {
-        if let Some(n) = &t.template {
-            refs.push((format!("tabs[{i}].template"), n.as_str()));
+    // references from config to templates; missing ones are reported, never fatal
+    for (path, name) in [("dispatcher.template", &config.dispatcher.template), ("defaultTemplate", &config.default_template)] {
+        if !templates.contains_key(name) {
+            errors.push(sem_err(&cfg_path, path, format!("템플릿 '{name}'을(를) 찾을 수 없음 — 내장 기본값 사용")));
         }
     }
-    for (path, name) in refs {
-        if !templates.contains_key(name) {
-            errors.push(sem_err(&cfg_path, path, format!("템플릿 '{name}'을(를) 찾을 수 없음")));
+    for t in &config.tabs {
+        if let Some(n) = &t.template {
+            if !templates.contains_key(n) {
+                errors.push(sem_err(&cfg_path, format!("tabs[name={}].template", t.name), format!("템플릿 '{n}'을(를) 찾을 수 없음")));
+            }
+        }
+    }
+    // the Dispatcher tab and the default template must always be usable
+    for (slot, builtin) in [(0, "dispatcher"), (1, "solo")] {
+        let cur = if slot == 0 { &mut config.dispatcher.template } else { &mut config.default_template };
+        if !templates.contains_key(cur.as_str()) {
+            *cur = builtin.to_string();
+        }
+        if !templates.contains_key(builtin) && *cur == builtin {
+            templates.insert(builtin.to_string(), embedded_template(builtin));
         }
     }
 
@@ -866,7 +911,7 @@ mod tests {
 
     #[test]
     fn config_tab_names_unique_and_dispatcher_reserved() {
-        let c = parse_config(
+        let (c, _) = parse_config(
             r#"{"tabs":[{"name":"dispatcher","dir":"a"},{"name":"b","dir":"b"},{"name":"b","dir":"c"}]}"#,
             Path::new("config.json"),
         )
@@ -979,5 +1024,105 @@ mod tests {
         assert!(l.errors.iter().any(|e| e.file.ends_with("bad.json")));
         assert!(l.errors.iter().any(|e| e.file.ends_with("broken.json") && e.line > 0));
         assert_eq!(l.keybindings.0["app.palette"], "Alt+;");
+    }
+
+    fn load_with(files: &[(&str, &str)]) -> Loaded {
+        let root = tempfile::tempdir().unwrap();
+        let a = appdata_with_root(root.path());
+        ensure_dotdir(root.path()).unwrap();
+        let dot = root.path().join(".agentboard");
+        for (n, c) in files {
+            std::fs::write(dot.join(n), c).unwrap();
+        }
+        load_all(a.path())
+    }
+
+    #[test]
+    fn duplicate_tab_keeps_other_tabs() {
+        let l = load_with(&[("config.json", r#"{"tabs":[{"name":"a","dir":"a"},{"name":"a","dir":"b"},{"name":"c","dir":"c"}]}"#)]);
+        let names: Vec<_> = l.config.tabs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["a", "c"]);
+        assert_eq!(l.errors.iter().filter(|e| e.file.ends_with("config.json")).count(), 1);
+    }
+
+    #[test]
+    fn bad_group_ref_drops_groups_keeps_tabs() {
+        let l = load_with(&[(
+            "config.json",
+            r#"{"groups":{"split":"horizontal","children":[{"group":{"name":"g","tabs":["dispatcher"]}},{"group":{"name":"w","tabs":["nope"]}}]},
+                "defaultGroup":"w","tabs":[{"name":"a","dir":"a"}]}"#,
+        )]);
+        assert!(l.config.groups.is_none());
+        assert!(l.config.default_group.is_none());
+        assert_eq!(l.config.tabs.len(), 1);
+        assert!(l.errors.iter().any(|e| e.json_path.as_deref() == Some("groups.children[1].group.tabs[0]")));
+    }
+
+    #[test]
+    fn bad_default_group_dropped_alone() {
+        let l = load_with(&[(
+            "config.json",
+            r#"{"groups":{"group":{"name":"w","tabs":["a"]}},"defaultGroup":"zzz","tabs":[{"name":"a","dir":"a"}]}"#,
+        )]);
+        assert!(l.config.groups.is_some());
+        assert!(l.config.default_group.is_none());
+        assert_eq!(l.errors.iter().filter(|e| e.file.ends_with("config.json")).count(), 1, "{:?}", l.errors);
+    }
+
+    fn perr(src: &str) -> ConfigError {
+        parse_template(src, f()).unwrap_err()
+    }
+
+    #[test]
+    fn unknown_pane_field_names_field_and_path() {
+        let e = perr(r#"{"name":"x","layout":{"split":"horizontal","children":[{"pane":{"name":"a"}},{"pane":{"name":"b","focuss":true}}]}}"#);
+        assert_eq!(e.json_path.as_deref(), Some("layout.children[1].pane"));
+        assert!(e.message.contains("focuss"), "{}", e.message);
+    }
+
+    #[test]
+    fn split_typo_and_mixed_nodes_rejected() {
+        let e = perr(r#"{"name":"x","layout":{"split":"horizontal","size":[60,40],"children":[{"pane":{"name":"a"}},{"pane":{"name":"b"}}]}}"#);
+        assert_eq!(e.json_path.as_deref(), Some("layout"));
+        assert!(e.message.contains("size"), "{}", e.message);
+        let e = perr(r#"{"name":"x","layout":{"pane":{"name":"a"},"split":"horizontal","children":[]}}"#);
+        assert_eq!(e.json_path.as_deref(), Some("layout"));
+        let e = perr(r#"{"name":"x","layout":{"foo":1}}"#);
+        assert_eq!(e.json_path.as_deref(), Some("layout"));
+    }
+
+    #[test]
+    fn bad_split_direction_has_path() {
+        let e = perr(r#"{"name":"x","layout":{"split":"horiz","children":[{"pane":{"name":"a"}},{"pane":{"name":"b"}}]}}"#);
+        assert_eq!(e.json_path.as_deref(), Some("layout.split"));
+        assert!(e.to_string().contains("layout.split"));
+    }
+
+    #[test]
+    fn malformed_groups_layout_keeps_rest_of_config() {
+        let l = load_with(&[("config.json", r#"{"groups":{"split":"horiz","children":[]},"tabs":[{"name":"a","dir":"a"}]}"#)]);
+        assert!(l.config.groups.is_none());
+        assert_eq!(l.config.tabs.len(), 1);
+        assert!(l.errors.iter().any(|e| e.json_path.as_deref() == Some("groups.split")));
+    }
+
+    #[test]
+    fn missing_or_broken_dispatcher_template_falls_back_to_embedded() {
+        for content in [None, Some("{")] {
+            let root = tempfile::tempdir().unwrap();
+            let a = appdata_with_root(root.path());
+            ensure_dotdir(root.path()).unwrap();
+            let tp = root.path().join(".agentboard/templates");
+            match content {
+                None => std::fs::remove_file(tp.join("dispatcher.json")).unwrap(),
+                Some(c) => std::fs::write(tp.join("dispatcher.json"), c).unwrap(),
+            }
+            std::fs::remove_file(tp.join("solo.json")).unwrap();
+            let l = load_all(a.path());
+            assert!(l.templates.contains_key(&l.config.dispatcher.template));
+            assert!(l.templates.contains_key(&l.config.default_template));
+            assert_eq!(l.templates["dispatcher"].layout.leaves()[0].name, "dispatcher");
+            assert!(!l.errors.is_empty());
+        }
     }
 }
