@@ -85,3 +85,52 @@ test('attentionSet collects flagged pane ids', () => {
   assert.deepEqual([...attentionSet(bellWs(true))], ['b']);
   assert.deepEqual([...attentionSet(null)], []);
 });
+
+import { stepAttention, validRef } from '../../src/focus.js';
+
+const stepWs = (focusPane, attn, drop = []) => {
+  const w = {
+    groupLayout: { leaf: 'g1' },
+    groups: { g1: { id: 'g1', tabIds: ['t1', 't2', 't3'], activeTabId: focusPane } },
+    focus: { groupId: 'g1' },
+    tabs: {},
+    panes: {},
+  };
+  for (const [t, p] of [['t1', 'a'], ['t2', 'b'], ['t3', 'c']]) {
+    w.tabs[t] = { id: t, layout: { leaf: p }, lastFocusedPaneId: p };
+    w.panes[p] = { id: p, tab: t, attention: attn.includes(p) };
+  }
+  w.groups.g1.activeTabId = { a: 't1', b: 't2', c: 't3' }[focusPane];
+  for (const p of drop) {
+    delete w.panes[p];
+  }
+  return w;
+};
+
+test('stepAttention: jump, then return to origin', () => {
+  let r = stepAttention(stepWs('a', ['b']), null);
+  assert.equal(r.target.pane, 'b');
+  // b cleared its flag after focus; now at b with landed=b → back to a
+  r = stepAttention(stepWs('b', []), r.state);
+  assert.equal(r.target.pane, 'a');
+  assert.deepEqual(r.state.origin, null);
+});
+
+test('stepAttention: manual navigation drops the stale origin', () => {
+  let r = stepAttention(stepWs('a', ['b']), null);
+  // user walks to c by hand; no flags left → nothing to do (not a jump back to a)
+  r = stepAttention(stepWs('c', []), r.state);
+  assert.equal(r.target, null);
+  // new flag later starts a fresh round from c
+  r = stepAttention(stepWs('c', ['a']), r.state);
+  assert.equal(r.target.pane, 'a');
+  assert.equal(r.state.origin.pane, 'c');
+});
+
+test('stepAttention: closed origin is dropped silently', () => {
+  let r = stepAttention(stepWs('a', ['b']), null);
+  const w = stepWs('b', [], ['a']);
+  r = stepAttention(w, r.state);
+  assert.equal(r.target, null);
+  assert.equal(validRef(w, { group: 'g1', tab: 't1', pane: 'a' }), false);
+});

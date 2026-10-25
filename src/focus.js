@@ -46,6 +46,30 @@ export function nextAttention(order, current, attention, origin) {
   return { target: after || cands[0], origin: origin || current || null };
 }
 
+/** A PaneRef whose pane, tab and group all still exist and are consistent. */
+export function validRef(ws, ref) {
+  if (!ws || !ref) return false;
+  const p = ws.panes && ws.panes[ref.pane];
+  const t = ws.tabs && ws.tabs[ref.tab];
+  const g = ws.groups && ws.groups[ref.group];
+  return !!p && !!t && !!g && p.tab === ref.tab && g.tabIds.includes(ref.tab);
+}
+
+/**
+ * One Alt+a step with stale-state protection. `state = {origin, landed}`: `landed` is the pane the
+ * previous Alt+a jumped to; if the user has since moved elsewhere (or origin/target panes were
+ * closed) the origin is dropped and a fresh round starts from the current location.
+ * Returns `{target, state}` (target null = nothing to do).
+ */
+export function stepAttention(ws, state) {
+  const cur = currentRef(ws);
+  const st = state || { origin: null, landed: null };
+  const keep = st.landed && cur && st.landed.pane === cur.pane && validRef(ws, st.origin);
+  const r = nextAttention(paneOrder(ws), cur, attentionSet(ws), keep ? st.origin : null);
+  const target = validRef(ws, r.target) ? r.target : null;
+  return { target, state: { origin: target ? r.origin : null, landed: target } };
+}
+
 /** Pane ids that currently show attention. */
 export function attentionSet(ws) {
   return new Set(Object.values((ws && ws.panes) || {}).filter((p) => p.attention).map((p) => p.id));

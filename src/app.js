@@ -33,10 +33,8 @@ import {
   settleFocus,
   flash,
   focusLocation,
-  nextAttention,
-  paneOrder,
+  stepAttention,
   currentRef,
-  attentionSet,
   shouldFlagBell,
 } from './focus.js';
 import { leafIds } from './layout.js';
@@ -220,21 +218,23 @@ function openErrors() {
 
 // ---------------------------------------------------------------- attention (Task 15)
 
-let attentionOrigin = null; // where Alt+a started (returns there when nothing is left)
+let attentionState = { origin: null, landed: null }; // Alt+a round (see stepAttention)
+const bellInFlight = new Set(); // panes with a setAttention not yet answered
 
 /** Terminal bell: flag the pane. Never moves focus. */
 function onBell(paneId) {
   const ws = current && current.workspace;
-  if (!shouldFlagBell(ws, paneId, document.hasFocus())) return;
-  quiet(sendCmd({ type: 'setAttention', pane: paneId, on: true }));
+  if (bellInFlight.has(paneId) || !shouldFlagBell(ws, paneId, document.hasFocus())) return;
+  bellInFlight.add(paneId);
+  quiet(sendCmd({ type: 'setAttention', pane: paneId, on: true }).finally(() => bellInFlight.delete(paneId)));
 }
 
 registerCommand('pane.nextAttention', () =>
   enqueue(() => {
     const ws = current && current.workspace;
     if (!ws) return undefined;
-    const r = nextAttention(paneOrder(ws), currentRef(ws), attentionSet(ws), attentionOrigin);
-    attentionOrigin = r.origin;
+    const r = stepAttention(ws, attentionState);
+    attentionState = r.state;
     if (!r.target) return undefined;
     return execute([{ type: 'setFocus', group: r.target.group, tab: r.target.tab, pane: r.target.pane }]);
   }),
@@ -325,6 +325,7 @@ export function render(snap) {
 
   for (const id of staleIds(knownPaneIds(), ws.panes)) {
     disposePane(id);
+    bellInFlight.delete(id);
     pruneCopySessions();
     passthroughCache.delete(id);
   }
@@ -451,10 +452,13 @@ window.addEventListener('focus', () => {
   if (!overlayOpen()) applyFocus(current);
   // A bell that arrived while the window was unfocused flagged the focused pane; seeing it
   // again clears it (SetFocus on the already focused pane; focus does not move).
-  const ws = current && current.workspace;
-  const id = ws && focusedPaneId(ws);
-  if (id && ws.panes[id] && ws.panes[id].attention) {
+  // Everything is re-evaluated when the queued job runs: earlier key commands may have moved focus.
+  enqueue(() => {
+    if (overlayOpen()) return undefined;
+    const ws = current && current.workspace;
+    const id = ws && focusedPaneId(ws);
+    if (!id || !ws.panes[id] || !ws.panes[id].attention) return undefined;
     const r = currentRef(ws);
-    enqueue(() => execute([{ type: 'setFocus', group: r.group, tab: r.tab, pane: r.pane }]));
-  }
+    return execute([{ type: 'setFocus', group: r.group, tab: r.tab, pane: r.pane }]);
+  });
 });
