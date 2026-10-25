@@ -84,7 +84,7 @@ function open(build) {
       finish(null);
       return;
     }
-    cfg.setModal((e) => (done ? false : spec.onKey(e)));
+    if (!done) cfg.setModal((e) => (done ? false : spec.onKey(e))); // build may have finished
   });
 }
 
@@ -395,9 +395,9 @@ export function newTabWizard() {
       }).then((r) => (r ? r.value : null)),
     confirm,
     createDir: (name) => api.createDir(name),
-    pickTemplate: (list, def) =>
+    pickTemplate: (list, def, dir) =>
       listOverlay({
-        title: '새 탭 ② 템플릿',
+        title: `새 탭 ② 템플릿 — 폴더: ${dir}`,
         placeholder: '템플릿 이름',
         emptyText: '템플릿이 없습니다',
         compute: (q) => fuzzyRank(list, q).map((i) => ({ label: list[i], hint: list[i] === def ? '기본값' : '', value: list[i] })),

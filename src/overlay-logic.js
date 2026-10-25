@@ -23,14 +23,21 @@ export function checkDirName(name) {
 }
 
 /**
- * Wizard step ① choices: the fuzzy-filtered dirs, then — when the typed name is not an existing
- * dir (case-insensitive, as on Windows) — a `{dir: typed, create: true}` entry at the end.
+ * Wizard step ① choices (ruling R18; the list preselects the first entry):
+ * - typed name equals an existing dir (case-insensitive, as on Windows) → that dir first, then
+ *   the other fuzzy matches; no create entry;
+ * - otherwise, non-empty valid name → `{dir: typed, create: true}` first, then the fuzzy matches
+ *   (so Enter never silently picks a dir the name only fuzzy-matches);
+ * - invalid name → fuzzy matches, create entry last (picking it shows why it is invalid).
  */
 export function dirChoices(dirs, query) {
   const q = String(query ?? '').trim();
-  const out = fuzzyRank(dirs, q).map((i) => ({ dir: dirs[i], create: false }));
-  if (q && !dirs.some((d) => d.toLowerCase() === q.toLowerCase())) out.push({ dir: q, create: true });
-  return out;
+  const matches = fuzzyRank(dirs, q).map((i) => ({ dir: dirs[i], create: false }));
+  if (!q) return matches;
+  const exact = matches.findIndex((c) => c.dir.toLowerCase() === q.toLowerCase());
+  if (exact >= 0) return [matches[exact], ...matches.filter((_, i) => i !== exact)];
+  const create = { dir: q, create: true };
+  return checkDirName(q) ? [...matches, create] : [create, ...matches];
 }
 
 /** Templates with the configured default first (unknown default → unchanged). */
@@ -240,7 +247,7 @@ export function paletteItems(ws, { bindings = {}, has = () => true } = {}) {
  * switch), ends the flow with null. Resolves `{dir, template}` on success.
  *
  * deps: listDirs, listTemplates, defaultTemplate, pickDir(dirs) → choice|null,
- * confirm(msg) → bool, createDir(name), pickTemplate(list, defaultName|null) → name|null,
+ * confirm(msg) → bool, createDir(name), pickTemplate(list, defaultName|null, dir) → name|null,
  * createTab(cmd) → bool (false after toasting the error),
  * toast(msg), alive() → bool.
  */
@@ -273,7 +280,7 @@ export async function newTabFlow(d) {
       }
     }
     if (!d.alive()) return null;
-    const template = await d.pickTemplate(ordered, ordered[0] === def ? def : null);
+    const template = await d.pickTemplate(ordered, ordered[0] === def ? def : null, dir);
     if (template == null || !d.alive()) return null;
     if (await d.createTab({ type: 'createTab', name: dir, dir, template, group: null })) return { dir, template };
   }
@@ -293,7 +300,8 @@ export function groupMissing(list) {
 /**
  * Startup check (spec §4.2): for each missing folder ask
  * "'<dir>' 디렉토리가 없습니다. 만들까요?"; yes → createDir, then RestartPane for every pane of the
- * tabs using it; no → the panes stay Failed. Stops when `alive()` turns false.
+ * tabs using it; no → the panes stay Failed. Stops when `alive()` turns false (the app passes
+ * `() => true`: a tab/group switch only answers the open question "no", ruling R19).
  *
  * deps: missingDirs, confirm, createDir, panesOf(tabId) → ids, restart(ids), toast, alive.
  */

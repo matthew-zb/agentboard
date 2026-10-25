@@ -31,7 +31,6 @@ import {
   configureOverlays,
   overlayOpen,
   closeOverlays,
-  flowGuard,
   pickNumber,
   palette,
   prompt,
@@ -222,7 +221,7 @@ registerCommand('pane.breakToTab', () =>
 /** Spec §4.2: ask (one folder at a time) to create each missing workspace folder. */
 function checkMissingDirs() {
   return missingDirsFlow({
-    alive: flowGuard(),
+    alive: () => true, // R19: a tab/group switch closes the open question (→ no), not the flow
     missingDirs: () => api.missingDirs(),
     confirm,
     createDir: (name) => api.createDir(name),

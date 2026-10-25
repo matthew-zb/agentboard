@@ -70,16 +70,37 @@ test('checkDirName mirrors the backend rules', () => {
   for (const ok of ['api', 'my-project', '한글']) assert.equal(checkDirName(ok), null, ok);
 });
 
-test('dirChoices: fuzzy dirs plus a create entry for an unknown name', () => {
+test('dirChoices: empty query lists every dir in order', () => {
   const dirs = ['api', 'mdviewer', 'hoohootv'];
   assert.deepEqual(dirChoices(dirs, ''), dirs.map((dir) => ({ dir, create: false })));
-  assert.deepEqual(dirChoices(dirs, 'mv'), [
-    { dir: 'mdviewer', create: false },
-    { dir: 'mv', create: true },
+});
+
+test('dirChoices: an exact (case-insensitive) dir name comes first, no create entry (R18)', () => {
+  // 'api-old' scores higher for 'api'? it must not matter: the exact name is first
+  assert.deepEqual(dirChoices(['api-old', 'xapi', 'api'], 'api'), [
+    { dir: 'api', create: false },
+    { dir: 'api-old', create: false },
+    { dir: 'xapi', create: false },
   ]);
-  assert.deepEqual(dirChoices(dirs, ' newproj '), [{ dir: 'newproj', create: true }]);
-  // exact name (case-insensitive, Windows) → no create entry
-  assert.deepEqual(dirChoices(dirs, 'API'), [{ dir: 'api', create: false }]);
+  assert.deepEqual(dirChoices(['mdviewer', 'api'], 'API'), [{ dir: 'api', create: false }]);
+});
+
+test('dirChoices: a new name is first (preselected) even when it fuzzy-matches others (R18)', () => {
+  assert.deepEqual(dirChoices(['api-old', 'mdviewer'], 'api'), [
+    { dir: 'api', create: true },
+    { dir: 'api-old', create: false },
+  ]);
+  assert.deepEqual(dirChoices(['api', 'mdviewer', 'hoohootv'], 'mv'), [
+    { dir: 'mv', create: true },
+    { dir: 'mdviewer', create: false },
+  ]);
+  assert.deepEqual(dirChoices(['api'], ' newproj '), [{ dir: 'newproj', create: true }]);
+  // an invalid name never becomes the preselected entry
+  assert.deepEqual(dirChoices(['v1.2.3'], '..'), [
+    { dir: 'v1.2.3', create: false },
+    { dir: '..', create: true },
+  ]);
+  assert.deepEqual(dirChoices(['api'], 'a/b'), [{ dir: 'a/b', create: true }]);
 });
 
 test('templateOrder puts the default first', () => {
@@ -220,8 +241,9 @@ function fakeDeps(script) {
       log.push(['createDir', name]);
       if (script.createDirError) throw script.createDirError;
     },
-    pickTemplate: async (list) => {
+    pickTemplate: async (list, def, dir) => {
       log.push(['pickTemplate', list]);
+      d.templateArgs = [def, dir];
       return script.templates.shift() ?? null;
     },
     createTab: async (cmd) => {
@@ -236,6 +258,7 @@ function fakeDeps(script) {
 test('newTabFlow: existing dir → template → CreateTab{name: dir}', async () => {
   const d = fakeDeps({ dirPicks: [{ dir: 'api', create: false }], confirms: [], templates: ['solo'], creates: [true] });
   assert.deepEqual(await newTabFlow(d), { dir: 'api', template: 'solo' });
+  assert.deepEqual(d.templateArgs, ['solo', 'api']); // default hint + chosen dir for the step ② title
   assert.deepEqual(d.log, [
     ['pickDir', ['api', 'web']],
     ['pickTemplate', ['solo', 'dispatcher', 'team-3']],
@@ -325,4 +348,31 @@ test('missingDirsFlow: createDir error is toasted and the panes are not restarte
     toast: (m) => log.push(['toast', m]),
   });
   assert.deepEqual(log, [['toast', '폴더 이름에 / \\ : 는 쓸 수 없습니다']]);
+});
+
+test('missingDirsFlow with alive: () => true keeps asking after a cancelled question (R19)', async () => {
+  const log = [];
+  // the first confirm was closed by a tab switch (resolves false); the flow continues
+  const answers = [false, true];
+  await missingDirsFlow({
+    missingDirs: async () => [['t2', 'api'], ['t3', 'web']],
+    alive: () => true,
+    confirm: async (m) => (log.push(['confirm', m]), answers.shift()),
+    createDir: async (n) => log.push(['createDir', n]),
+    panesOf: (t) => ({ t2: ['p2'], t3: ['p5'] })[t],
+    restart: async (ids) => log.push(['restart', ids]),
+    toast: (m) => log.push(['toast', m]),
+  });
+  assert.deepEqual(log, [
+    ['confirm', "'api' 디렉토리가 없습니다. 만들까요?"],
+    ['confirm', "'web' 디렉토리가 없습니다. 만들까요?"],
+    ['createDir', 'web'],
+    ['restart', ['p5']],
+  ]);
+});
+
+test('app.js passes alive: () => true to the startup missing-dir flow (R19)', () => {
+  const src = readFileSync(new URL('../../src/app.js', import.meta.url), 'utf8');
+  const call = src.slice(src.indexOf('missingDirsFlow({'), src.indexOf('missingDirsFlow({') + 200);
+  assert.match(call, /alive: \(\) => true/);
 });
