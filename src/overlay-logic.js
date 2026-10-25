@@ -324,16 +324,29 @@ export async function missingDirsFlow(d) {
 }
 
 /**
+ * Key → answer of a Y/N confirm dialog: true (Y, or Enter when `enterYes`), false (N / Esc),
+ * null (ignored; also every auto-repeat, so a held Enter from the previous step cannot answer).
+ */
+export function confirmKey(e, { enterYes = true } = {}) {
+  if (e.repeat) return null;
+  if (e.code === 'KeyY') return true;
+  if (enterYes && (e.code === 'Enter' || e.code === 'NumpadEnter')) return true;
+  if (e.code === 'KeyN' || e.code === 'Escape') return false;
+  return null;
+}
+
+/**
  * Window close request (spec §8): ask only when agents are running. `st.busy` guards against a
  * second close request while the dialog is open. Resolves true when the app was told to exit.
- * deps: { runningCount(), confirm(msg), exit() }
+ * deps: { runningCount(), confirm(msg, opts), exit() }
  */
 export async function closeFlow(st, deps) {
   if (st.busy) return false;
   st.busy = true;
   try {
     const n = await deps.runningCount();
-    if (n > 0 && !(await deps.confirm(`실행 중인 에이전트 ${n}개를 종료하고 닫을까요?`))) return false;
+    // keyboard Y/N only (spec §8): Enter must not close the app with running agents
+    if (n > 0 && !(await deps.confirm(`실행 중인 에이전트 ${n}개를 종료하고 닫을까요?`, { enterYes: false }))) return false;
     await deps.exit();
     return true;
   } finally {

@@ -4,7 +4,7 @@
 // Pure logic lives in overlay-logic.js / fuzzy.js. No top-level DOM access (Node-importable).
 import * as api from './api.js';
 import { fuzzyRank } from './fuzzy.js';
-import { PICK_TIMEOUT_MS, TOAST_MS, pickerKey, listMove, dirChoices, newTabFlow } from './overlay-logic.js';
+import { PICK_TIMEOUT_MS, TOAST_MS, pickerKey, listMove, dirChoices, newTabFlow, confirmKey } from './overlay-logic.js';
 
 const cfg = {
   /** router.pushModal(fn) -> token / router.popModal(token): a stack, copy mode may sit below. */
@@ -305,7 +305,8 @@ export function prompt(title, initial = '') {
 // ---------------------------------------------------------------- dialogs
 
 /** Y / Enter = yes (true), N / Esc = no (false). Closing it any other way → false. */
-export function confirm(message) {
+/** Y/N dialog → bool. `enterYes: false` makes Enter do nothing (only Y confirms). */
+export function confirm(message, opts = {}) {
   return open((finish, onCleanup) => {
     const { back, box } = dialog('ov-confirm', () => finish(false));
     onCleanup(() => back.remove());
@@ -322,9 +323,8 @@ export function confirm(message) {
       cancelValue: false,
       onKey(e) {
         if (document.activeElement !== box) box.focus();
-        if (e.repeat) return true; // a held Enter from the previous step must not answer
-        if (e.code === 'KeyY' || isEnter(e)) finish(true);
-        else if (e.code === 'KeyN' || e.code === 'Escape') finish(false);
+        const answer = confirmKey(e, opts); // null for auto-repeat: a held Enter must not answer
+        if (answer !== null) finish(answer);
         return true;
       },
     };

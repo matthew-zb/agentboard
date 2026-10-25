@@ -186,7 +186,7 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
 기본 키가 없는(팔레트 전용) 명령: `pane.breakToTab`
 <!-- KEYTABLE:END -->
 
-앱 종료(창 닫기)는 실행 중인 에이전트가 있으면 `Y`/`Enter`(종료) 또는 `N`/`Esc`(취소)로 확인합니다.
+앱 종료(창 닫기)는 실행 중인 에이전트가 있으면 `Y`(종료) 또는 `N`/`Esc`(취소)로 확인합니다. 실수로 닫히지 않도록 `Enter`는 이 확인 창에서 아무 동작도 하지 않습니다.
 
 의도적으로 비워 둔 키: Claude Code가 쓰는 `Alt+B/F/D/Y/V/M/P/T/O`, `Alt+↑/↓`, `Ctrl+` 단일 글자 전부, `Ctrl+Enter`, `Shift+Tab`, `Ctrl+V`, 그리고 Windows 전역 키(`Alt+Tab/F4/Space/Esc`, `Ctrl+Shift+Esc`, Win 조합).
 
@@ -196,10 +196,11 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
 - AltGr 자판(유럽 배열)에서는 `Ctrl+Alt`가 AltGr입니다. 한글/영문 자판은 영향이 없습니다.
 - `Alt+Shift`는 Windows 입력 언어 전환 키지만 글자 키와 함께 누르면 동작하지 않는 것으로 설계했습니다(실제 동작은 수동 확인 대상, `docs/spikes.md` S5).
 - 앱이 가로챈 키는 창 안 프로그램에 전달되지 않습니다(예: PSReadLine의 `Alt+h`). 필요하면 프로필 `passthroughKeys`로 해제하세요.
+- 창 안에서 실행한 GUI 프로그램(예: `code .`로 새로 띄운 VS Code, `claude /login`이 새로 띄운 브라우저)도 AgentBoard의 Job Object(`KILL_ON_JOB_CLOSE`)에 속하므로 **AgentBoard를 종료하면 함께 종료됩니다**. 계속 쓸 프로그램은 AgentBoard 밖에서 실행하세요.
 
 ## Claude Code 터미널 벨 설정
 
-권한 승인 대기 등을 AgentBoard가 ⚠로 표시하려면 Claude Code가 터미널 벨(BEL)을 울려야 합니다. Claude Code에서 `/config` → 알림 채널(notification channel)을 **terminal bell**로 설정하세요(설정 값 `preferredNotifChannel: "terminal_bell"`). 이후 비활성 탭의 창이 벨을 울리면 창 헤더·탭 바·상태 표시줄에 ⚠가 뜨고, 포커스는 옮겨지지 않습니다. `Alt+a`로 해당 창으로 이동하고, 다시 누르면 원래 위치로 돌아옵니다.
+권한 승인 대기 등을 AgentBoard가 ⚠로 표시하려면 Claude Code가 터미널 벨(BEL)을 울려야 합니다. Claude Code에서 `/config` → 알림 채널(notification channel)을 **terminal bell**로 설정하세요(설정 값 `preferredNotifChannel: "terminal_bell"`). 이후 비활성 탭의 창이 벨을 울리면 창 헤더와 탭 바에 ⚠가 뜨고, 포커스는 옮겨지지 않습니다. `Alt+a`로 해당 창으로 이동하고, 다시 누르면 원래 위치로 돌아옵니다.
 
 ## 로드맵
 

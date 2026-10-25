@@ -17,6 +17,7 @@ import {
   groupMissing,
   missingDirsFlow,
   closeFlow,
+  confirmKey,
 } from '../../src/overlay-logic.js';
 
 const leaf = (id) => ({ leaf: id });
@@ -421,4 +422,30 @@ test('closeFlow: a second request while the dialog is open is ignored; busy clea
   assert.equal(await first, false);
   await assert.rejects(closeFlow(st, { ...deps, runningCount: async () => 0, exit: async () => { throw new Error('x'); } }));
   assert.equal(st.busy, false);
+});
+
+test('confirmKey: Y yes, N/Esc no; Enter is yes by default, ignored with enterYes:false', () => {
+  const k = (code, extra = {}) => ({ code, repeat: false, ...extra });
+  assert.equal(confirmKey(k('KeyY')), true);
+  assert.equal(confirmKey(k('KeyN')), false);
+  assert.equal(confirmKey(k('Escape')), false);
+  assert.equal(confirmKey(k('Enter')), true);
+  assert.equal(confirmKey(k('NumpadEnter')), true);
+  assert.equal(confirmKey(k('KeyA')), null);
+  assert.equal(confirmKey(k('KeyY', { repeat: true })), null);
+  const strict = { enterYes: false };
+  assert.equal(confirmKey(k('Enter'), strict), null);
+  assert.equal(confirmKey(k('NumpadEnter'), strict), null);
+  assert.equal(confirmKey(k('KeyY'), strict), true);
+  assert.equal(confirmKey(k('KeyN'), strict), false);
+});
+
+test('closeFlow: the exit confirm does not accept Enter (spec §8: Y/N)', async () => {
+  const opts = [];
+  await closeFlow({ busy: false }, {
+    runningCount: async () => 1,
+    confirm: async (_m, o) => { opts.push(o); return false; },
+    exit: async () => {},
+  });
+  assert.deepEqual(opts, [{ enterYes: false }]);
 });
