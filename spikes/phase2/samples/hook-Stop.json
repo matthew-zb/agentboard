@@ -1,0 +1,41 @@
+{
+  "event": "Stop",
+  "pid": 176456,
+  "ppid": 175644,
+  "env": {
+    "CLAUDE_CODE_MESSAGING_SOCKET": "\\\\.\\pipe\\LOCAL\\cc-msg-ddf372df3d56749467a65f20fa96bf57",
+    "CLAUDE_CODE_MESSAGING_TOKEN": "<redacted>",
+    "CLAUDE_PROJECT_DIR": "C:/Users/<user>/AppData/Local/Temp/claude/C--workspace/<session-id>/scratchpad/p1",
+    "CLAUDE_ENV_FILE": null,
+    "CLAUDE_CODE_SESSION_ID": "<session-id>",
+    "CLAUDE_EFFORT": "medium"
+  },
+  "envNames": [
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_EFFORT",
+    "CLAUDE_PID",
+    "CLAUDE_PROJECT_DIR"
+  ],
+  "stdin": {
+    "session_id": "<session-id>",
+    "transcript_path": "C:\\Users\\<user>\\.claude\\projects\\C--Users-<user>-AppData-Local-Temp-claude-C--workspace-<session-id>-scratchpad-p1\\<session-id>.jsonl",
+    "cwd": "C:\\Users\\<user>\\AppData\\Local\\Temp\\claude\\C--workspace\\<session-id>\\scratchpad\\p1",
+    "prompt_id": "<session-id>",
+    "permission_mode": "default",
+    "effort": {
+      "level": "medium"
+    },
+    "hook_event_name": "Stop",
+    "stop_hook_active": false,
+    "last_assistant_message": "GOT: pipe-hello-7731",
+    "background_tasks": [],
+    "session_crons": []
+  }
+}
