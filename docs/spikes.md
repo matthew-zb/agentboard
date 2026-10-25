@@ -601,3 +601,16 @@ control.rs 구현 지침: `server/discover`에는 **정확히 HTTP 200 + JSON-RP
 5. **입력 중 연기**: 시각 직전부터 dispatcher 입력란에 글자를 쳐 둔다. `nightlyQuietMin`(기본 10분) 동안은 시작하지 않고 5분 간격으로 다시 확인하는지(`nightly.json`이 갱신되지 않음). 재시작 직전에 어떤 대상 창에 입력하면 그 창만 재시작이 미뤄지고(나머지는 바로 재시작) 입력이 멈추면 재시작되는지. 60분 넘게 계속 입력하면 그 창은 재시작되지 않고 인박스에 "야간 정리 보류: <세션 이름>" 항목이 생기는지.
 6. **하루 1회 / 앱 재시작**: 정리가 끝난 뒤 같은 날 앱을 껐다 켜도 다시 돌지 않는지. 시각이 지난 뒤 앱을 처음 켜면(그날 기록 없음) 상시 세션이 모두 방금 새로 떴으므로 정리 메시지 없이 그날이 기록만 되는지(R24, `nightly.json` 확인). 시각 전에 켜 둔 앱은 시각에 정상으로 도는지. `"nightlyRefresh": null`이면 돌지 않는지.
 7. **handoff_done 응답**: 야간 정리가 아닐 때 Manager에게 `handoff_done`을 부르게 하면 "지금은 야간 정리 중이 아닙니다…"만 돌아오고 아무 일도 없는지. 팀 리드가 부르면 권한 오류(한국어)인지.
+
+## 2단계 Task 12 — 시작·복원·자동 실행·환경 점검 수동 확인 (사용자 확인 필요, 미실시)
+
+자동 테스트는 복원 규칙(`restore_plan`: 팀 창·팀 영역 제거와 레이아웃 정리, `teamSeq` 초기화, config 기준 역할 재도출, 상시 창만 시작 프롬프트 재주입, role 없는 탭은 1단계 그대로), 환경 항목 계산(버전 비교, 건너뛰기, required 거부, 사용자 정의 check 시간 초과 시 프로세스 트리 종료), `env_skip`/`env_set_source`의 config.json 원자적 갱신(다른 키·순서 보존), 자동 실행 레지스트리 왕복(테스트 키), 새 탭 마법사 흐름을 본다. 아래는 실제 앱으로 확인할 항목이다.
+
+1. **재시작 복원**: Manager 탭에서 팀(리드 + 팀원 2)을 채용한 뒤 앱을 끄고 켠다. 팀 창과 팀 영역이 사라지고 Manager 창이 원래 크기로 돌아왔는지, dispatcher·handover·Manager 창에 시작 프롬프트가 다시 들어가는지(새 세션), role 없는 탭은 프롬프트 없이 예전처럼 뜨는지. `teams/<팀>/brief.md`·`roster.md`는 그대로인지(Task 13 이후: Manager가 진행 중인 팀을 다시 채용하는지).
+2. **config 기준 역할**: 앱을 끈 상태에서 `config.json` `tabs`의 Manager 항목 하나를 지우거나 `role`을 빼고 켠다. 그 탭이 일반 탭으로(프롬프트 주입 없이) 복원되는지. 반대로 일반 탭 항목에 `"role": "manager"`를 넣고 켜면(이름·dir 같음) Manager로 바뀌고 시작 프롬프트가 들어가는지.
+3. **자동 실행**: 커맨드 팔레트(`app.palette`)에 "로그인 시 자동 실행 켜기"(현재: 꺼짐)가 보이는지. 켜면 `reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v AgentBoard`에 따옴표로 감싼 exe 경로가 있는지, 팔레트 항목이 "끄기"(현재: 켜짐)로 바뀌는지. 로그아웃·로그인 후 앱이 뜨는지(설치본으로 확인). 끄면 값이 사라지는지. **확인 뒤 반드시 꺼 둘 것.**
+4. **환경 점검 표시**: 시작 후 몇 초 안에 상태 표시줄에 실패 항목만 `[환경: holla 없음]`처럼 작게 보이는지(holla 미설치 시 빨간 강조, 마우스를 올리면 상세·조치). `PATH`에서 Git을 빼고(또는 `CLAUDE_CODE_GIT_BASH_PATH`를 없는 파일로) 켜면 `Git 없음`이 보이는지. dispatcher가 `env_skip("git-bash")`를 부르면 `Git 없음(건너뜀)`으로 바뀌고(강조 없음) config.json에 `"envSkip": ["git-bash"]`가 추가되는지. `env_skip("holla")`는 한국어 오류로 거부되는지.
+5. **폴더 신뢰 항목**: 처음 쓰는 폴더의 Manager 탭을 만들고 폴더 신뢰 질문에 답하지 않은 채 30초 기다린다. 상태 표시줄에 `<탭> 폴더 신뢰`가 보이고, 그 창으로 가서 ⚠가 지워져도 항목은 남는지, 질문에 답하면(SessionStart) 사라지는지.
+6. **source 기록**: dispatcher에게 holla 설치를 안내받을 때 저장소 주소를 묻는지, 주소를 주면 `env_set_source`로 config.json `envRequire`에 `source`가 기록되는지(`envRequire`가 없던 config에는 기본 holla 항목이 함께 써짐), `ftp://`·공백이 든 주소는 거부되는지. 설치 명령은 사용자 승인 후에만 실행되는지.
+7. **새 탭 마법사 역할**: 새 탭 → 폴더 → "Manager"를 고르면 템플릿 단계 없이 Manager 탭이 현재 그룹에 열리고 포커스를 받는지, config.json `tabs`에 `role: manager`로 추가되는지, 앱을 껐다 켜도 Manager로 복원되는지. "일반"을 고르면 예전처럼 템플릿을 고르는지.
+8. **창 깜박임**: 시작할 때와 `env_status` 호출 때 콘솔 창이 잠깐이라도 뜨지 않는지(`claude --version`, `holla slack version`은 창 없이 실행).

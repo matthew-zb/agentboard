@@ -197,9 +197,11 @@ const NOT_LISTED = new Set(['app.palette', 'pane.breakToTab']);
  * Palette entries `{label, hint?, action}` for the workspace. `bindings` = id → key string (null =
  * unbound); `has(id)` = a handler is registered. Actions:
  * `{type:'command', id}` | `{type:'ws', cmds}` | `{type:'rename', tab}` | `{type:'errors'}` |
- * `{type:'sidebar'}` | `{type:'openDoc'}` (pick a workspace .md file → OpenDoc).
+ * `{type:'sidebar'}` | `{type:'openDoc'}` (pick a workspace .md file → OpenDoc) |
+ * `{type:'autostart', on}` (login autostart; listed only when `autostart` — the current state,
+ * true/false — is known).
  */
-export function paletteItems(ws, { bindings = {}, has = () => true } = {}) {
+export function paletteItems(ws, { bindings = {}, has = () => true, autostart = null } = {}) {
   const out = [];
   const c = chain(ws);
   const groupOrder = leafIds(ws.groupLayout).filter((id) => ws.groups[id]);
@@ -209,6 +211,8 @@ export function paletteItems(ws, { bindings = {}, has = () => true } = {}) {
   out.push({ label: '설정 오류 보기', action: { type: 'errors' } });
   out.push({ label: '문서 열기', hint: 'md 파일', action: { type: 'openDoc' } });
   out.push({ label: '사이드바 토글', action: { type: 'sidebar' } });
+  if (autostart === true) out.push({ label: '로그인 시 자동 실행 끄기', hint: '현재: 켜짐', action: { type: 'autostart', on: false } });
+  if (autostart === false) out.push({ label: '로그인 시 자동 실행 켜기', hint: '현재: 꺼짐', action: { type: 'autostart', on: true } });
 
   const ids = [...new Set(Object.keys(bindings))];
   for (const id of ids) {
@@ -251,14 +255,19 @@ export function paletteItems(ws, { bindings = {}, has = () => true } = {}) {
 // ---------------------------------------------------------------- flows
 
 /**
- * New-tab wizard (spec §6.3): ① dir (unknown name → confirm → createDir) → ② template (default
- * first) → ③ CreateTab{name: dir, dir, template}. A failed creation (e.g. duplicate tab name;
- * `createTab` resolves false after toasting the error), a declined / invalid / failed dir creation
- * go back to ①. Esc at any step, or `alive()` turning false (an overlay closed by a tab/group
- * switch), ends the flow with null. Resolves `{dir, template}` on success.
+ * New-tab wizard (spec §6.3, Task 12 role choice): ① dir (unknown name → confirm → createDir) →
+ * ② role (`pickRole(dir)` → 'plain' | 'manager' | null; without `pickRole` always plain) →
+ * plain: ③ template (default first) → CreateTab{name: dir, dir, template};
+ * manager: `createManager({name: dir, dir})` — the backend's config-persisting Manager path
+ * (template `manager` if present, else defaultTemplate; R2).
+ * A failed creation (e.g. duplicate tab name; `createTab` / `createManager` resolve false after
+ * toasting the error), a declined / invalid / failed dir creation go back to ①. Esc at any step,
+ * or `alive()` turning false (an overlay closed by a tab/group switch), ends the flow with null.
+ * Resolves `{dir, template}` (plain) or `{dir, role: 'manager'}` on success.
  *
  * deps: listDirs, listTemplates, defaultTemplate, pickDir(dirs) → choice|null,
- * confirm(msg) → bool, createDir(name), pickTemplate(list, defaultName|null, dir) → name|null,
+ * confirm(msg) → bool, createDir(name), pickRole?(dir) → 'plain'|'manager'|null,
+ * createManager?({name, dir}) → bool, pickTemplate(list, defaultName|null, dir) → name|null,
  * createTab(cmd) → bool (false after toasting the error),
  * toast(msg), alive() → bool.
  */
@@ -291,6 +300,12 @@ export async function newTabFlow(d) {
       }
     }
     if (!d.alive()) return null;
+    const role = d.pickRole ? await d.pickRole(dir) : 'plain';
+    if (role == null || !d.alive()) return null;
+    if (role === 'manager') {
+      if (await d.createManager({ name: dir, dir })) return { dir, role: 'manager' };
+      continue;
+    }
     const template = await d.pickTemplate(ordered, ordered[0] === def ? def : null, dir);
     if (template == null || !d.alive()) return null;
     if (await d.createTab({ type: 'createTab', name: dir, dir, template, group: null })) return { dir, template };
@@ -363,4 +378,29 @@ export async function closeFlow(st, deps) {
   } finally {
     st.busy = false;
   }
+}
+
+// ---------------------------------------------------------------- environment (Task 12)
+
+/** Short status-bar label of an environment item id (env_status ids are stable). */
+export function envItemLabel(id) {
+  if (id === 'claude-version') return 'Claude 버전';
+  if (id === 'git-bash') return 'Git 없음';
+  if (id.startsWith('folder-trust:')) return `${id.slice('folder-trust:'.length)} 폴더 신뢰`;
+  return `${id} 없음`;
+}
+
+/**
+ * Status-bar flag for the environment check (`env_status` items; null while unknown): only
+ * failing items, e.g. `[환경: Git 없음(건너뜀), holla 없음]`. `highlight` when a failing item is
+ * not skipped and either required or the Claude version (spec: version too old = error).
+ * `title` lists detail and fix per failing item. null when everything is fine.
+ */
+export function envStatusFlag(items) {
+  const bad = (Array.isArray(items) ? items : []).filter((i) => i && !i.ok);
+  if (!bad.length) return null;
+  const parts = bad.map((i) => `${envItemLabel(String(i.id))}${i.skipped ? '(건너뜀)' : ''}`);
+  const highlight = bad.some((i) => !i.skipped && (i.required || i.id === 'claude-version'));
+  const title = bad.map((i) => `${i.id}: ${i.detail || ''}${i.fix ? ` — 조치: ${i.fix}` : ''}${i.skipped ? ' (건너뜀)' : ''}`).join('\n');
+  return { text: `[환경: ${parts.join(', ')}]`, highlight, title };
 }

@@ -37,6 +37,9 @@ pub const PERMISSIONS: &[(&str, &[Role])] = &[
     ("handoff_done", &[M, D, H]),
     ("create_manager_tab", &[D]),
     ("need_user", &[D, H, M, L, Mb]),
+    ("env_status", &[D, H, M, L, Mb]),
+    ("env_skip", &[D]),
+    ("env_set_source", &[D]),
 ];
 
 /// Whether `role` may call `tool` (per [`PERMISSIONS`]; unknown tools: no).
@@ -212,6 +215,34 @@ fn implemented() -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
         },
+        ToolDef {
+            name: "env_status",
+            description: "환경 점검 결과를 돌려줍니다: 항목마다 id, ok, detail(상태), why(필요 이유), missingFeatures(없으면 빠지는 기능), fix(설치·조치 방법), skipped, required, source. id: claude-version, git-bash, folder-trust:<탭>, 그리고 config.json envRequire의 사용자 정의 항목(기본 holla). 앱은 아무것도 설치하지 않습니다 — 설치·변경은 사용자 승인 후에만 하세요.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "env_skip",
+            description: "사용자가 '필요 없다'고 한 점검 항목을 config.json envSkip에 기록해 다시 묻지 않게 합니다(그 기능만 빠지고 앱은 계속 동작). required 항목은 건너뛸 수 없습니다.",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "item": { "type": "string", "description": "항목 id (env_status의 id)" } },
+                "required": ["item"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "env_set_source",
+            description: "사용자 정의 점검 항목(envRequire)의 설치 저장소 주소(source)를 config.json에 기록합니다. http(s) 주소만 됩니다. source가 비어 있으면 사용자에게 주소를 물어 이 도구로 기록한 뒤, 사용자 승인을 받아 설치하세요.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "item": { "type": "string", "description": "envRequire 항목 id (예: holla)" },
+                    "url": { "type": "string", "description": "저장소 주소 (http:// 또는 https://)" }
+                },
+                "required": ["item", "url"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -263,6 +294,9 @@ pub fn call(state: &AppState, caller: &Caller, name: &str, args: Value) -> Resul
         "dismiss_team" => dismiss_team(state, caller, &args),
         "create_manager_tab" => create_manager_tab(state, caller, &args),
         "need_user" => crate::attention::need_user(state, caller, &args),
+        "env_status" => Ok(json!({ "items": crate::envcheck::status(state) })),
+        "env_skip" => env_skip(state, &args),
+        "env_set_source" => env_set_source(state, &args),
         _ => Err(format!("알 수 없는 도구입니다: {name}")),
     }
 }
@@ -621,6 +655,18 @@ fn create_manager_tab(state: &AppState, _caller: &Caller, args: &Value) -> Resul
     let name = req_str(args, "name")?;
     let dir = req_str(args, "dir")?;
     let template = opt_str(args, "template")?;
+    create_manager_tab_with(state, name, dir, template, false)
+}
+
+/// The new-tab wizard's "Manager" choice (Task 12): the same checks and config.json entry as
+/// `create_manager_tab`, but a user action — the tab opens in the focused group and takes the
+/// focus (`CreateTab{group: None}`). Template: `manager` if present, else defaultTemplate (R2).
+pub fn create_manager_tab_ui(state: &AppState, name: String, dir: String) -> Result<Value, String> {
+    create_manager_tab_with(state, name, dir, None, true)
+}
+
+/// `focused`: place in the focused group and focus it (UI) instead of the background (MCP, R12).
+fn create_manager_tab_with(state: &AppState, name: String, dir: String, template: Option<String>, focused: bool) -> Result<Value, String> {
     cap_chars("name", &name, NAME_MAX)?;
     cap_chars("dir", &dir, PATH_MAX)?;
     if dir.trim().is_empty() {
@@ -668,9 +714,13 @@ fn create_manager_tab(state: &AppState, _caller: &Caller, args: &Value) -> Resul
         let ws = state.ws.lock().unwrap();
         let leaves = ws.group_layout.leaves();
         let by_name = default_group.and_then(|n| leaves.iter().find(|g| ws.groups[*g].name == n).cloned());
-        let g = by_name
-            .or_else(|| leaves.iter().find(|g| **g != ws.focus.group_id).cloned())
-            .unwrap_or_else(|| ws.focus.group_id.clone());
+        let g = if focused {
+            ws.focus.group_id.clone()
+        } else {
+            by_name
+                .or_else(|| leaves.iter().find(|g| **g != ws.focus.group_id).cloned())
+                .unwrap_or_else(|| ws.focus.group_id.clone())
+        };
         let n = ws.groups[&g].name.clone();
         (g, n)
     };
@@ -678,7 +728,7 @@ fn create_manager_tab(state: &AppState, _caller: &Caller, args: &Value) -> Resul
         name: name.clone(),
         dir: dir.clone(),
         template: Some(tpl.clone()),
-        group: Some(group.clone()),
+        group: if focused { None } else { Some(group.clone()) },
         role: Some(Role::Manager),
     };
     // dry run: refuse before anything is written (name/dir rules, template, group)
@@ -720,6 +770,74 @@ fn create_manager_tab(state: &AppState, _caller: &Caller, args: &Value) -> Resul
     Ok(reply(&id, &group_name, false))
 }
 
+// ───────────────────────── environment (Task 12) ─────────────────────────
+
+/// Every id `env_skip` accepts right now (built-ins, folder-trust items, custom items).
+fn known_env_ids(state: &AppState) -> Vec<String> {
+    let mut ids: Vec<String> = config::ENV_BUILTIN_IDS.iter().map(|s| s.to_string()).collect();
+    {
+        let ws = state.ws.lock().unwrap();
+        for t in ws.tabs.values() {
+            if ws.standing_pane(&t.id).is_some() {
+                ids.push(format!("{}{}", config::ENV_TRUST_PREFIX, t.name));
+            }
+        }
+    }
+    ids.extend(state.loaded.read().unwrap().config.env_require.iter().map(|e| e.id.clone()));
+    ids
+}
+
+/// `env_skip(item)` (Dispatcher): record the item in config.json `envSkip` (other keys kept)
+/// and in the loaded config. Required custom items are refused. Idempotent.
+fn env_skip(state: &AppState, args: &Value) -> Result<Value, String> {
+    let item = req_str(args, "item")?;
+    cap_chars("item", &item, NAME_MAX + config::ENV_TRUST_PREFIX.len())?;
+    let required = state.loaded.read().unwrap().config.env_require.iter().any(|e| e.id == item && e.required);
+    if required {
+        return Err(format!("'{item}'은(는) 필수 항목이라 건너뛸 수 없습니다 — 해결될 때까지 사용자에게 설치·조치를 안내하세요"));
+    }
+    if !known_env_ids(state).contains(&item) {
+        return Err(format!("알 수 없는 점검 항목입니다: {item} — env_status의 id를 쓰세요"));
+    }
+    let root = state.loaded.read().unwrap().settings.workspace_root.clone();
+    let _cfg = config::CONFIG_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let mut l = state.loaded.write().unwrap();
+        config::add_env_skip(&config::config_path(&root), &item)?;
+        if !l.config.env_skip.contains(&item) {
+            l.config.env_skip.push(item.clone());
+        }
+    }
+    state.ui.env_changed();
+    Ok(json!(format!("'{item}' 점검을 건너뛰도록 config.json envSkip에 기록했습니다. 이 항목의 기능만 빠지고 다시 묻지 않습니다.")))
+}
+
+/// `env_set_source(item, url)` (Dispatcher): the repository URL (http(s) only) of a custom
+/// `envRequire` item, written to config.json (the default list is written out first when the
+/// file has no `envRequire`) and to the loaded config.
+fn env_set_source(state: &AppState, args: &Value) -> Result<Value, String> {
+    let item = req_str(args, "item")?;
+    let url = req_str(args, "url")?.trim().to_string();
+    config::check_source_url(&url)?;
+    let (root, defaults) = {
+        let l = state.loaded.read().unwrap();
+        if !l.config.env_require.iter().any(|e| e.id == item) {
+            return Err(format!("'{item}'은(는) config.json envRequire의 사용자 정의 항목이 아닙니다"));
+        }
+        (l.settings.workspace_root.clone(), l.config.env_require.clone())
+    };
+    let _cfg = config::CONFIG_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let mut l = state.loaded.write().unwrap();
+        config::set_env_source(&config::config_path(&root), &item, &url, &defaults)?;
+        if let Some(e) = l.config.env_require.iter_mut().find(|e| e.id == item) {
+            e.source = Some(url.clone());
+        }
+    }
+    state.ui.env_changed();
+    Ok(json!(format!("'{item}'의 설치 저장소를 {url} 로 기록했습니다. 설치는 사용자 승인을 받은 뒤에 하세요.")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,13 +863,16 @@ mod tests {
             names(Role::Manager),
             [
                 "inbox_post", "inbox_note", "inbox_propose_close", "inbox_list", "issue_create", "hire_lead", "dismiss",
-                "dismiss_team", "list_team", "handoff_done", "need_user"
+                "dismiss_team", "list_team", "handoff_done", "need_user", "env_status"
             ]
         );
-        assert_eq!(names(Role::Dispatcher), ["inbox_list", "handoff_done", "create_manager_tab", "need_user"]);
-        assert_eq!(names(Role::Lead), ["inbox_list", "hire_member", "dismiss", "dismiss_team", "list_team", "need_user"]);
-        assert_eq!(names(Role::Handover), ["inbox_list", "handoff_done", "need_user"]);
-        assert_eq!(names(Role::Member), ["inbox_list", "need_user"]);
+        assert_eq!(
+            names(Role::Dispatcher),
+            ["inbox_list", "handoff_done", "create_manager_tab", "need_user", "env_status", "env_skip", "env_set_source"]
+        );
+        assert_eq!(names(Role::Lead), ["inbox_list", "hire_member", "dismiss", "dismiss_team", "list_team", "need_user", "env_status"]);
+        assert_eq!(names(Role::Handover), ["inbox_list", "handoff_done", "need_user", "env_status"]);
+        assert_eq!(names(Role::Member), ["inbox_list", "need_user", "env_status"]);
     }
 
     // ── team tools · create_manager_tab (Task 8) ──
@@ -1090,5 +1211,160 @@ mod tests {
         assert_eq!(here(&ws), before);
         let v: Value = serde_json::from_str(&f.config_text()).unwrap();
         assert_eq!(v["tabs"][0], json!({"name":"w","dir":"solo-work","role":"manager","template":"solo"}));
+    }
+
+    // ── environment tools (Task 12) ──
+
+    /// Cached probe results so `env_status` never runs real processes in tests.
+    fn inject_probes(f: &Fx, checks: &[(&str, crate::envcheck::CheckOutcome)]) {
+        f.state.env.set(crate::envcheck::ProbeResults {
+            at: std::time::Instant::now(),
+            claude: Ok("2.1.310 (Claude Code)".into()),
+            git_bash: Err("Git for Windows(git)를 PATH에서 찾을 수 없습니다".into()),
+            checks: checks.iter().map(|(c, o)| (c.to_string(), o.clone())).collect(),
+        });
+    }
+
+    const ENV_CONFIG: &str = r#"{
+  "nightlyRefresh": "04:30",
+  "tabs": [{"name": "billing", "role": "manager", "dir": "billing"}],
+  "envRequire": [
+    {"id": "holla", "check": "holla slack version", "fix": "설치", "why": "슬랙", "required": true, "source": ""},
+    {"id": "opt", "check": "opt --version", "fix": "", "why": "선택", "required": false}
+  ],
+  "defaultGroup": "main"
+}
+"#;
+
+    #[test]
+    fn env_status_for_every_role() {
+        let f = fx(ENV_CONFIG);
+        f.brief("billing/teams/a/brief.md");
+        f.call("billing", "hire_lead", json!({"team":"a","brief_path":"teams/a/brief.md"})).unwrap();
+        f.call("billing-a-lead", "hire_member", json!({})).unwrap();
+        inject_probes(&f, &[("holla slack version", crate::envcheck::CheckOutcome::Exit(1)), ("opt --version", crate::envcheck::CheckOutcome::Ok)]);
+        for who in ["dispatcher", "billing", "billing-a-lead", "billing-a-m1"] {
+            let r = f.call(who, "env_status", json!({})).unwrap();
+            let ids: Vec<&str> = r["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect();
+            assert_eq!(ids, ["claude-version", "git-bash", "folder-trust:dispatcher", "folder-trust:billing", "holla", "opt"], "{who}");
+        }
+        let r = f.call("billing", "env_status", json!({})).unwrap();
+        let holla = &r["items"][4];
+        assert_eq!(holla["ok"], false);
+        assert_eq!(holla["required"], true);
+        assert_eq!(holla["source"], Value::Null, "no source yet → the dispatcher asks the user");
+        assert_eq!(holla["missingFeatures"], "슬랙");
+        assert_eq!(r["items"][1]["fix"], "winget install --id Git.Git -e");
+        assert_eq!(r["items"][0]["ok"], true);
+    }
+
+    #[test]
+    fn env_skip_persists_and_keeps_other_config_keys() {
+        let f = fx(ENV_CONFIG);
+        inject_probes(&f, &[]);
+        let before = f.config_text();
+        // dispatcher only
+        let e = f.call("billing", "env_skip", json!({"item":"git-bash"})).unwrap_err();
+        assert!(e.contains("env_skip 도구를 쓸 수 없습니다"), "{e}");
+        // unknown items are refused, nothing written
+        let e = f.call("dispatcher", "env_skip", json!({"item":"nope"})).unwrap_err();
+        assert!(e.contains("알 수 없는 점검 항목"), "{e}");
+        assert_eq!(f.config_text(), before);
+
+        f.call("dispatcher", "env_skip", json!({"item":"git-bash"})).unwrap();
+        f.call("dispatcher", "env_skip", json!({"item":"folder-trust:billing"})).unwrap();
+        f.call("dispatcher", "env_skip", json!({"item":"git-bash"})).unwrap(); // idempotent
+        let text = f.config_text();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["envSkip"], json!(["git-bash", "folder-trust:billing"]));
+        // every other key kept, in order
+        assert_eq!(v["nightlyRefresh"], "04:30");
+        assert_eq!(v["envRequire"][0]["source"], "");
+        assert_eq!(v["tabs"][0]["name"], "billing");
+        let pos = |k: &str| text.find(k).unwrap();
+        assert!(pos("nightlyRefresh") < pos("\"tabs\"") && pos("\"tabs\"") < pos("envRequire") && pos("envRequire") < pos("defaultGroup"));
+        assert!(pos("defaultGroup") < pos("envSkip"), "new key appended at the end");
+        // the loaded config and the items follow at once; the file reloads cleanly
+        assert_eq!(f.state.loaded.read().unwrap().config.env_skip, ["git-bash", "folder-trust:billing"]);
+        let r = f.call("dispatcher", "env_status", json!({})).unwrap();
+        assert_eq!(r["items"][1]["skipped"], true);
+        let reloaded = load_all(&f.appdata);
+        assert!(reloaded.errors.is_empty(), "{:?}", reloaded.errors);
+        assert_eq!(reloaded.config.env_skip, ["git-bash", "folder-trust:billing"]);
+    }
+
+    #[test]
+    fn custom_required_item_cannot_be_skipped() {
+        let f = fx(ENV_CONFIG);
+        inject_probes(&f, &[]);
+        let before = f.config_text();
+        let e = f.call("dispatcher", "env_skip", json!({"item":"holla"})).unwrap_err();
+        assert!(e.contains("필수 항목") && e.contains("건너뛸 수 없습니다"), "{e}");
+        assert_eq!(f.config_text(), before, "nothing written");
+        assert!(f.state.loaded.read().unwrap().config.env_skip.is_empty());
+        // an optional custom item can be skipped
+        f.call("dispatcher", "env_skip", json!({"item":"opt"})).unwrap();
+        let r = f.call("dispatcher", "env_status", json!({})).unwrap();
+        let by_id = |id: &str| r["items"].as_array().unwrap().iter().find(|i| i["id"] == id).unwrap().clone();
+        assert_eq!(by_id("opt")["skipped"], true);
+        assert_eq!(by_id("holla")["skipped"], false);
+    }
+
+    #[test]
+    fn env_set_source_validates_url_and_persists() {
+        // no envRequire key: the default (holla) list is written out with the source
+        let cfg = "{\n  \"nightlyRefresh\": \"04:30\",\n  \"tabs\": []\n}\n";
+        let f = fx(cfg);
+        for bad in ["", "ftp://example.com/x", "javascript:alert(1)", "https://", "https://a b/c", "https://user@host/x", "file:///C:/x", "https://h/\"x"] {
+            let e = f.call("dispatcher", "env_set_source", json!({"item":"holla","url":bad})).unwrap_err();
+            assert!(e.chars().any(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c)), "{bad}: {e}");
+            assert_eq!(f.config_text(), cfg, "{bad}");
+        }
+        // custom items only
+        let e = f.call("dispatcher", "env_set_source", json!({"item":"git-bash","url":"https://h/x"})).unwrap_err();
+        assert!(e.contains("사용자 정의 항목이 아닙니다"), "{e}");
+
+        let url = "https://github.com/example-org/holla";
+        f.call("dispatcher", "env_set_source", json!({"item":"holla","url":url})).unwrap();
+        let text = f.config_text();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["nightlyRefresh"], "04:30");
+        assert_eq!(v["tabs"], json!([]));
+        let h = &v["envRequire"][0];
+        assert_eq!(h["id"], "holla");
+        assert_eq!(h["check"], "holla slack version");
+        assert_eq!(h["required"], true);
+        assert_eq!(h["source"], url);
+        assert!(text.find("nightlyRefresh").unwrap() < text.find("envRequire").unwrap());
+        assert_eq!(f.state.loaded.read().unwrap().config.env_require[0].source.as_deref(), Some(url));
+        let reloaded = load_all(&f.appdata);
+        assert!(reloaded.errors.is_empty(), "{:?}", reloaded.errors);
+        assert_eq!(reloaded.config.env_require[0].source.as_deref(), Some(url));
+        // an existing envRequire list is edited in place (other items untouched)
+        let f = fx(ENV_CONFIG);
+        f.call("dispatcher", "env_set_source", json!({"item":"opt","url":"http://intranet.example/opt.git"})).unwrap();
+        let v: Value = serde_json::from_str(&f.config_text()).unwrap();
+        assert_eq!(v["envRequire"][1]["source"], "http://intranet.example/opt.git");
+        assert_eq!(v["envRequire"][0]["source"], "");
+        let e = f.call("billing", "env_set_source", json!({"item":"opt","url":"https://h/x"})).unwrap_err();
+        assert!(e.contains("env_set_source 도구를 쓸 수 없습니다"), "{e}");
+    }
+
+    #[test]
+    fn wizard_manager_tab_persists_config_and_takes_focus() {
+        let f = fx(r#"{"tabs":[]}"#);
+        std::fs::create_dir_all(f.root.join("sales")).unwrap();
+        let r = create_manager_tab_ui(&f.state, "sales".into(), "sales".into()).unwrap();
+        assert_eq!(r["existing"], false, "{r}");
+        let ws = f.state.ws.lock().unwrap().clone();
+        let t = ws.tabs.values().find(|t| t.name == "sales").unwrap();
+        assert_eq!(t.role, Some(Role::Manager));
+        // user action: the new tab is the focused group's active tab
+        assert_eq!(ws.groups[&ws.focus.group_id].active_tab_id, t.id);
+        // no manager template shipped yet → defaultTemplate, not written to config (R2)
+        let v: Value = serde_json::from_str(&f.config_text()).unwrap();
+        assert_eq!(v["tabs"][0], json!({"name":"sales","dir":"sales","role":"manager"}));
+        // a missing folder is refused (the wizard creates it first)
+        assert!(create_manager_tab_ui(&f.state, "x".into(), "nope".into()).is_err());
     }
 }

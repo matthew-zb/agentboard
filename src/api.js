@@ -209,3 +209,25 @@ export function docOpenUrl(url) {
 export function docImage(doc, src) {
   return invoke('doc_image', { doc, src });
 }
+
+// ---------------------------------------------------------------- startup / environment (Task 12)
+
+/** Environment check items (cached; null until the first check after start finished). */
+export function envStatus() {
+  return invoke('env_status');
+}
+
+/** Whether AgentBoard starts at login. */
+export function autostartGet() {
+  return invoke('autostart_get');
+}
+
+/** Turn starting at login on/off; resolves to the new state. */
+export function autostartSet(on) {
+  return invoke('autostart_set', { on: !!on });
+}
+
+/** New-tab wizard "Manager": tab + config.json entry (same path as MCP create_manager_tab). */
+export function createManagerTab(name, dir) {
+  return invoke('create_manager_tab', { name, dir });
+}

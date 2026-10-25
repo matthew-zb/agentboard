@@ -413,6 +413,12 @@ pub struct Config {
     pub nightly_quiet_min: u32,
     /// handover index document, relative to workspaceRoot (`None` = `HANDOVER.md`).
     pub handover_index: Option<String>,
+    /// Environment check items the user chose to skip (`envSkip`, Task 12). Required custom
+    /// items are never treated as skipped even when listed here.
+    pub env_skip: Vec<String>,
+    /// Custom environment check items (`envRequire`, Task 12). Absent key → [`default_env_require`]
+    /// (the holla item); an explicit `[]` → none.
+    pub env_require: Vec<EnvRequire>,
     /// Indices (in `tabs`) that `parse_config` already reported invalid; `sanitize_config`
     /// drops them silently so later JSON paths keep the file's numbering.
     pub(crate) rejected_tabs: BTreeSet<usize>,
@@ -465,6 +471,8 @@ impl Default for Config {
             nightly_timeout_min: DEFAULT_NIGHTLY_TIMEOUT_MIN,
             nightly_quiet_min: DEFAULT_NIGHTLY_QUIET_MIN,
             handover_index: None,
+            env_skip: Vec::new(),
+            env_require: default_env_require(),
             rejected_tabs: BTreeSet::new(),
         }
     }
@@ -525,6 +533,10 @@ struct RawConfig {
     nightly_quiet_min: Option<u32>,
     #[serde(default)]
     handover_index: Option<String>,
+    #[serde(default)]
+    env_skip: Option<serde_json::Value>,
+    #[serde(default)]
+    env_require: Option<serde_json::Value>,
 }
 
 /// Distinguishes an explicit `null` from an absent field (used with `#[serde(default)]`).
@@ -618,6 +630,14 @@ pub fn parse_config(text: &str, file: &Path) -> Result<(Config, Vec<ConfigError>
         };
         tabs.push(TabSpec { name: t.name, dir: t.dir, template: t.template, role });
     }
+    let env_skip = match &raw.env_skip {
+        None => Vec::new(),
+        Some(v) => parse_env_skip(v, file, &mut errs),
+    };
+    let env_require = match &raw.env_require {
+        None => default_env_require(),
+        Some(v) => parse_env_require(v, file, &mut errs),
+    };
     let cfg = Config {
         dispatcher: DispatcherSpec {
             agent: disp.agent.or(d.dispatcher.agent),
@@ -633,6 +653,8 @@ pub fn parse_config(text: &str, file: &Path) -> Result<(Config, Vec<ConfigError>
         nightly_timeout_min,
         nightly_quiet_min: raw.nightly_quiet_min.unwrap_or(DEFAULT_NIGHTLY_QUIET_MIN),
         handover_index,
+        env_skip,
+        env_require,
         rejected_tabs,
     };
     Ok((cfg, errs))
@@ -778,6 +800,257 @@ fn write_file_atomic(path: &Path, text: &str) -> Result<(), String> {
             let _ = std::fs::remove_file(&tmp);
             format!("config.json을 쓸 수 없습니다 — {e}")
         })
+}
+
+// ───────────────────────── envRequire / envSkip (Task 12) ─────────────────────────
+
+/// One custom environment check (`config.json` `envRequire[]`): `check` runs through the shell
+/// (exit code 0 = fine, 10 s timeout, see `envcheck`). `source` is the repository URL the
+/// dispatcher installs from (http(s) only; `None` = not known yet — the dispatcher asks the user
+/// and records it with `env_set_source`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvRequire {
+    pub id: String,
+    pub check: String,
+    pub fix: String,
+    pub why: String,
+    pub required: bool,
+    pub source: Option<String>,
+}
+
+/// Built-in environment check ids (`envcheck`); custom ids may not reuse them.
+pub const ENV_BUILTIN_IDS: [&str; 2] = ["claude-version", "git-bash"];
+/// Prefix of the per-tab folder-trust item ids (`folder-trust:<tab name>`).
+pub const ENV_TRUST_PREFIX: &str = "folder-trust:";
+/// Longest custom id / check command / source URL (characters).
+pub const ENV_ID_MAX: usize = 64;
+pub const ENV_TEXT_MAX: usize = 1000;
+
+/// The default `envRequire` (used when config.json has no `envRequire` key): holla, required by
+/// handover's Slack checks. No default `source`: the repository may be private (ledger R12).
+pub fn default_env_require() -> Vec<EnvRequire> {
+    vec![EnvRequire {
+        id: "holla".into(),
+        check: "holla slack version".into(),
+        fix: "source의 GitHub 저장소로 holla(@circlesac/holla)를 설치한 뒤 `holla slack auth`로 슬랙 로그인".into(),
+        why: "handover의 슬랙 확인에 필요".into(),
+        required: true,
+        source: None,
+    }]
+}
+
+/// `envRequire[]` entry as written to config.json (`source` always present, "" = unknown).
+pub fn env_require_json(e: &EnvRequire) -> serde_json::Value {
+    serde_json::json!({
+        "id": e.id,
+        "check": e.check,
+        "fix": e.fix,
+        "why": e.why,
+        "required": e.required,
+        "source": e.source.clone().unwrap_or_default(),
+    })
+}
+
+/// A repository URL for `source` / `env_set_source`: `http://` or `https://`, a host, no
+/// whitespace / control / quote characters, no credentials (`@` before the path), ≤ 1000 chars.
+pub fn check_source_url(url: &str) -> Result<(), String> {
+    if url.chars().count() > ENV_TEXT_MAX {
+        return Err(format!("주소가 너무 깁니다(최대 {ENV_TEXT_MAX}자)"));
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>' | '`' | '\\')) {
+        return Err("주소에 공백·제어 문자·따옴표를 쓸 수 없습니다".into());
+    }
+    let lower = url.to_ascii_lowercase();
+    let rest = if let Some(r) = lower.strip_prefix("https://") {
+        r
+    } else if let Some(r) = lower.strip_prefix("http://") {
+        r
+    } else {
+        return Err("http:// 또는 https:// 주소만 쓸 수 있습니다".into());
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err("주소에 호스트가 없습니다".into());
+    }
+    if authority.contains('@') {
+        return Err("주소에 사용자 정보(@)를 넣을 수 없습니다".into());
+    }
+    Ok(())
+}
+
+fn parse_env_skip(v: &serde_json::Value, file: &Path, errs: &mut Vec<ConfigError>) -> Vec<String> {
+    let Some(arr) = v.as_array() else {
+        errs.push(sem_err(file, "envSkip", "문자열 배열이어야 함 — 무시함"));
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (i, x) in arr.iter().enumerate() {
+        match x.as_str() {
+            Some(s) if !s.trim().is_empty() => {
+                if !out.iter().any(|o| o == s) {
+                    out.push(s.to_string());
+                }
+            }
+            _ => errs.push(sem_err(file, format!("envSkip[{i}]"), "비어 있지 않은 문자열이어야 함 — 무시함")),
+        }
+    }
+    out
+}
+
+fn parse_env_require(v: &serde_json::Value, file: &Path, errs: &mut Vec<ConfigError>) -> Vec<EnvRequire> {
+    let Some(arr) = v.as_array() else {
+        errs.push(sem_err(file, "envRequire", "배열이어야 함 — 사용자 정의 점검 항목 없이 시작함"));
+        return Vec::new();
+    };
+    let mut out: Vec<EnvRequire> = Vec::new();
+    'items: for (i, x) in arr.iter().enumerate() {
+        let p = format!("envRequire[{i}]");
+        let Some(obj) = x.as_object() else {
+            errs.push(sem_err(file, &p, "객체여야 함 — 이 항목은 무시함"));
+            continue;
+        };
+        for k in obj.keys() {
+            if !["id", "check", "fix", "why", "required", "source"].contains(&k.as_str()) {
+                errs.push(sem_err(file, format!("{p}.{k}"), "알 수 없는 필드 — 이 항목은 무시함"));
+                continue 'items;
+            }
+        }
+        let text = |k: &str, req: bool| -> Result<String, String> {
+            match obj.get(k) {
+                None | Some(serde_json::Value::Null) if !req => Ok(String::new()),
+                None | Some(serde_json::Value::Null) => Err("필수 필드가 없음".into()),
+                Some(serde_json::Value::String(s)) => Ok(s.clone()),
+                Some(_) => Err("문자열이어야 함".into()),
+            }
+        };
+        let mut fields = BTreeMap::new();
+        for (k, req) in [("id", true), ("check", true), ("fix", false), ("why", false), ("source", false)] {
+            match text(k, req) {
+                Ok(s) if s.chars().any(char::is_control) => {
+                    errs.push(sem_err(file, format!("{p}.{k}"), "제어 문자(줄바꿈 등)를 쓸 수 없음 — 이 항목은 무시함"));
+                    continue 'items;
+                }
+                Ok(s) if s.chars().count() > ENV_TEXT_MAX => {
+                    errs.push(sem_err(file, format!("{p}.{k}"), format!("너무 김(최대 {ENV_TEXT_MAX}자) — 이 항목은 무시함")));
+                    continue 'items;
+                }
+                Ok(s) => {
+                    fields.insert(k, s);
+                }
+                Err(m) => {
+                    errs.push(sem_err(file, format!("{p}.{k}"), format!("{m} — 이 항목은 무시함")));
+                    continue 'items;
+                }
+            }
+        }
+        let required = match obj.get("required") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(_) => {
+                errs.push(sem_err(file, format!("{p}.required"), "true 또는 false여야 함 — 이 항목은 무시함"));
+                continue;
+            }
+        };
+        let id = fields.remove("id").unwrap_or_default();
+        let id_bad = if id.is_empty() || id.chars().count() > ENV_ID_MAX {
+            Some(format!("id는 1~{ENV_ID_MAX}자여야 함"))
+        } else if !id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+            Some("id는 영문·숫자·'-'·'_'·'.'만 쓸 수 있음".into())
+        } else if ENV_BUILTIN_IDS.contains(&id.as_str()) {
+            Some(format!("'{id}'은(는) 기본 점검 항목 id라 쓸 수 없음"))
+        } else if out.iter().any(|e| e.id == id) {
+            Some(format!("id '{id}'이(가) 중복됨"))
+        } else {
+            None
+        };
+        if let Some(m) = id_bad {
+            errs.push(sem_err(file, format!("{p}.id"), format!("{m} — 이 항목은 무시함")));
+            continue;
+        }
+        let check = fields.remove("check").unwrap_or_default();
+        if check.trim().is_empty() {
+            errs.push(sem_err(file, format!("{p}.check"), "점검 명령이 비어 있음 — 이 항목은 무시함"));
+            continue;
+        }
+        let source = fields.remove("source").unwrap_or_default();
+        if !source.is_empty() {
+            if let Err(m) = check_source_url(&source) {
+                errs.push(sem_err(file, format!("{p}.source"), format!("{m} — 이 항목은 무시함")));
+                continue;
+            }
+        }
+        out.push(EnvRequire {
+            id,
+            check,
+            fix: fields.remove("fix").unwrap_or_default(),
+            why: fields.remove("why").unwrap_or_default(),
+            required,
+            source: (!source.is_empty()).then_some(source),
+        });
+    }
+    out
+}
+
+/// Read-modify-write config.json as a JSON value (every other key and its order kept; written
+/// atomically). `edit` returns whether it changed anything (`false` → nothing is written,
+/// `Unchanged`). A missing file starts as `{}`. Callers hold [`CONFIG_WRITE`].
+fn edit_config_json(
+    path: &Path,
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<bool, String>,
+) -> Result<ConfigEdit, String> {
+    let prev = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("config.json을 읽을 수 없습니다 — {e}")),
+    };
+    let mut root: serde_json::Value = match &prev {
+        Some(text) => serde_json::from_str(text).map_err(|e| format!("config.json을 해석할 수 없어 바꾸지 않았습니다 — {e}"))?,
+        None => serde_json::json!({}),
+    };
+    let obj = root.as_object_mut().ok_or("config.json의 최상위가 객체가 아니어서 바꾸지 않았습니다")?;
+    if !edit(obj)? {
+        return Ok(ConfigEdit::Unchanged);
+    }
+    let mut text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    text.push('\n');
+    write_file_atomic(path, &text)?;
+    Ok(ConfigEdit::Written(prev))
+}
+
+/// Add `id` to `envSkip` of the config.json at `path` (already listed → `Unchanged`).
+pub fn add_env_skip(path: &Path, id: &str) -> Result<ConfigEdit, String> {
+    edit_config_json(path, |obj| {
+        let skip = obj.entry("envSkip").or_insert_with(|| serde_json::json!([]));
+        let arr = skip.as_array_mut().ok_or("config.json의 envSkip이 배열이 아니어서 바꾸지 않았습니다")?;
+        if arr.iter().any(|v| v.as_str() == Some(id)) {
+            return Ok(false);
+        }
+        arr.push(id.into());
+        Ok(true)
+    })
+}
+
+/// Set `source` of `envRequire` item `id` in the config.json at `path`. Without an
+/// `envRequire` key the defaults (`defaults`, i.e. what the app was using) are written out
+/// first, so the item exists in the file. The URL must already be checked.
+pub fn set_env_source(path: &Path, id: &str, url: &str, defaults: &[EnvRequire]) -> Result<ConfigEdit, String> {
+    edit_config_json(path, |obj| {
+        let list = obj
+            .entry("envRequire")
+            .or_insert_with(|| serde_json::Value::Array(defaults.iter().map(env_require_json).collect()));
+        let arr = list.as_array_mut().ok_or("config.json의 envRequire가 배열이 아니어서 바꾸지 않았습니다")?;
+        let item = arr
+            .iter_mut()
+            .find(|v| v.get("id").and_then(|i| i.as_str()) == Some(id))
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| format!("config.json의 envRequire에 '{id}' 항목이 없습니다"))?;
+        if item.get("source").and_then(|s| s.as_str()) == Some(url) {
+            return Ok(false);
+        }
+        item.insert("source".into(), url.into());
+        Ok(true)
+    })
 }
 
 pub fn validate_config(c: &Config, file: &Path) -> Vec<ConfigError> {

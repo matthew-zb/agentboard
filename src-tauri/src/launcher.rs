@@ -88,7 +88,14 @@
 //!   change the model only through `execute`. `config::CONFIG_WRITE` (static Mutex) is
 //!   outermost: `create_manager_tab` holds it across append → `execute` → rollback and takes
 //!   `loaded(write)` / `ws` only inside it, one at a time; nothing takes it while holding an
-//!   app lock.
+//!   app lock. Task 12: `env_skip` / `env_set_source` (MCP, dispatcher) take `CONFIG_WRITE`,
+//!   then `loaded(write)` alone around the atomic config.json edit and the in-memory update,
+//!   then emit `env-changed` after releasing both. The new-tab wizard's Manager choice
+//!   (`create_manager_tab` Tauri command) runs the same code path as the MCP tool.
+//! * Environment check (envcheck.rs, Task 12): `AppState::env` (probe results) and its
+//!   refresh lock are leaves; the probe processes run holding only the refresh lock. Reading
+//!   items takes `ws` (clone, released), `loaded(read)`, and `trust` → PtyManager `panes`
+//!   (`attention::trust_timed_out`), never nested with another app lock.
 //! * Never call `PtyManager::spawn/kill/remove/write/resize/attach_with` while holding `ws`,
 //!   `loaded` or `prompts`: spawn/kill/write can block, and the PTY threads call back into
 //!   the sink (`output` -> prompts, `exited` -> ws).

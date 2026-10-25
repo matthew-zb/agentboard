@@ -1,9 +1,11 @@
 pub mod agentcfg;
 pub mod attention;
+pub mod autostart;
 pub mod bridge;
 pub mod config;
 pub mod control;
 pub mod docs;
+pub mod envcheck;
 pub mod hookcli;
 pub mod inbox;
 pub mod issues;
@@ -56,6 +58,9 @@ pub trait Ui: Send + Sync {
     fn inbox_changed(&self, _version: u64) {}
     /// Emit `doc-changed` (`{"paneId": id}`): the pane's watched document changed (Task 14).
     fn doc_changed(&self, _pane: &str) {}
+    /// Emit `env-changed` (no payload): environment check results or the skip list changed
+    /// (Task 12; the status bar re-reads `env_status`).
+    fn env_changed(&self) {}
 }
 
 /// Lock order: see the module docs of `launcher`.
@@ -98,6 +103,8 @@ pub struct AppState {
     pub trust: Mutex<HashMap<PaneId, attention::Trust>>,
     /// Watched documents of document panes (Task 14). Leaf lock.
     pub docs: docs::DocWatch,
+    /// Environment check probe results (Task 12, `envcheck`). Leaf locks.
+    pub env: envcheck::EnvCache,
 }
 
 impl AppState {
@@ -140,6 +147,7 @@ impl AppState {
             last_input: Mutex::new(HashMap::new()),
             trust: Mutex::new(HashMap::new()),
             docs: docs::DocWatch::new(),
+            env: envcheck::EnvCache::new(),
         }
     }
 }
@@ -235,7 +243,14 @@ impl Ui for AppSink {
     fn doc_changed(&self, pane: &str) {
         let _ = self.app.emit(docs::DOC_CHANGED, DocChanged { pane_id: pane.to_string() });
     }
+
+    fn env_changed(&self) {
+        let _ = self.app.emit(ENV_CHANGED, ());
+    }
 }
+
+/// Event: environment check results / skip list changed (Task 12).
+pub const ENV_CHANGED: &str = "env-changed";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -567,6 +582,60 @@ fn start_doc_watcher(app: AppHandle) {
     });
 }
 
+// ───────── startup · autostart · environment (Task 12) ─────────
+
+/// Environment check items from the cached probe results (status bar); `None` until the first
+/// check after start finished (`env-changed` follows). Never runs the probes itself.
+#[tauri::command]
+fn env_status(state: State<'_, AppState>) -> Option<Vec<envcheck::EnvItem>> {
+    envcheck::current(&state)
+}
+
+/// Whether AgentBoard starts at login (HKCU Run value).
+#[tauri::command]
+fn autostart_get() -> Result<bool, String> {
+    autostart::is_enabled()
+}
+
+/// Turn starting at login on/off; returns the new state.
+#[tauri::command]
+fn autostart_set(on: bool) -> Result<bool, String> {
+    if on {
+        autostart::enable()?;
+    } else {
+        autostart::disable()?;
+    }
+    autostart::is_enabled()
+}
+
+/// New-tab wizard, role "Manager": same path as MCP `create_manager_tab` (config.json entry,
+/// so it survives a restart), but the tab opens in the focused group with the focus.
+#[tauri::command]
+async fn create_manager_tab(app: AppHandle, name: String, dir: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        mcp_tools::create_manager_tab_ui(&state, name, dir)
+    })
+    .await
+    .map_err(|e| format!("탭을 만드는 작업이 중단되었습니다 — {e}"))?
+}
+
+/// Restore a loaded workspace.json (spec §9 rules, `persist::restore_plan`). A plan that does not
+/// validate (should not happen) falls back to a fresh start from config with a startup error.
+fn restore_or_fresh(ws: Workspace, loaded: &Loaded, startup_errors: &mut Vec<String>) -> (Workspace, Effects) {
+    let (mut ws, fx) = persist::restore_plan(ws, loaded);
+    match ws.normalize_and_validate() {
+        Ok(()) => (ws, fx),
+        Err(e) => {
+            eprintln!("[agentboard] 복원 규칙 적용 실패: {e}");
+            startup_errors.push(format!("저장된 작업 상태를 복원할 수 없어 초기 배치로 시작했습니다 — {e}"));
+            let ws = Workspace::from_config(loaded);
+            let fx = launcher::initial_effects(&ws);
+            (ws, fx)
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -603,6 +672,10 @@ pub fn run() {
             doc_unwatch,
             doc_open_url,
             doc_image,
+            env_status,
+            autostart_get,
+            autostart_set,
+            create_manager_tab,
         ])
         .setup(|app| {
             // load_all = load_settings + ensure_dotdir (incl. powershell profile) + load
@@ -612,10 +685,7 @@ pub fn run() {
             let mut startup_errors = Vec::new();
             let mut saving = true;
             let (ws, initial) = match persist::load(&ws_path) {
-                Ok(Some(mut ws)) => {
-                    let fx = persist::prepare_restored(&mut ws);
-                    (ws, fx)
-                }
+                Ok(Some(ws)) => restore_or_fresh(ws, &loaded, &mut startup_errors),
                 Ok(None) => {
                     let ws = Workspace::from_config(&loaded);
                     let fx = launcher::initial_effects(&ws);
@@ -672,6 +742,15 @@ pub fn run() {
             nightly::start(app.handle().clone(), appdata.join(nightly::FILE_NAME));
             // spawning happens on the launcher thread: window creation is not blocked
             launcher::start(app.handle(), rx, initial);
+            // environment check (Task 12): probes run off the UI thread; `env-changed` when done
+            let handle = app.handle().clone();
+            let _ = std::thread::Builder::new().name("envcheck".into()).spawn(move || {
+                if let Some(state) = handle.try_state::<AppState>() {
+                    let items = envcheck::refresh(&state);
+                    let bad: Vec<&str> = items.iter().filter(|i| !i.ok).map(|i| i.id.as_str()).collect();
+                    eprintln!("[agentboard] envcheck: items={} failing={bad:?}", items.len());
+                }
+            });
 
             if let Some(w) = app.get_webview_window("main") {
                 webview::disable_browser_accelerators(&w);

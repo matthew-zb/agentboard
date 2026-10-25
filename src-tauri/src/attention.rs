@@ -40,6 +40,9 @@ pub enum Trust {
     Armed { gen: u64, deadline: Instant },
     /// SessionStart seen for this generation.
     Started { gen: u64 },
+    /// The timer ran out and the warning was raised for this generation (Task 12's
+    /// `folder-trust:<tab>` item reads it). A later SessionStart / respawn replaces it.
+    TimedOut { gen: u64 },
 }
 
 /// SessionStart (wraps the bridge's handler) and Notification. Call after
@@ -110,6 +113,16 @@ pub fn arm_trust(state: &AppState, pane: &str, gen: u64, now: Instant) {
     t.insert(pane.to_string(), Trust::Armed { gen, deadline: now + TRUST_TIMEOUT });
 }
 
+/// Whether `pane`'s current process missed its SessionStart deadline (warning raised, no
+/// SessionStart since). Takes `trust`, released, then the PtyManager `panes` map.
+pub fn trust_timed_out(state: &AppState, pane: &str) -> bool {
+    let timed_out = match state.trust.lock().unwrap().get(pane) {
+        Some(Trust::TimedOut { gen }) => *gen,
+        _ => return false,
+    };
+    state.pty.current_gen(pane) == Some(timed_out)
+}
+
 /// The pane left the model: drop its timer.
 pub fn forget(state: &AppState, pane: &str) {
     state.trust.lock().unwrap().remove(pane);
@@ -146,6 +159,11 @@ pub fn poll_trust(state: &AppState, now: Instant) -> usize {
         }
         if flag_trust(state, &pane, gen) {
             flagged += 1;
+            // remembered for the environment check, unless SessionStart came meanwhile
+            let mut t = state.trust.lock().unwrap();
+            if t.get(&pane).is_none() {
+                t.insert(pane.clone(), Trust::TimedOut { gen });
+            }
         }
     }
     flagged
@@ -336,10 +354,21 @@ mod tests {
         assert_eq!(f.att(&f.pane), (false, None));
         assert_eq!(poll_trust(&f.state, t0 + TRUST_TIMEOUT), 1);
         assert_eq!(f.att(&f.pane), (true, Some(TRUST_REASON.into())));
+        assert!(trust_timed_out(&f.state, &f.pane), "the env check sees the timeout");
         assert_eq!(poll_trust(&f.state, t0 + TRUST_TIMEOUT * 3), 0, "flagged once");
+        // focusing the pane clears the ⚠ but not the env item (trust still unanswered)
+        f.focus(&f.pane);
+        assert!(trust_timed_out(&f.state, &f.pane));
+        // a respawn re-arms: the old timeout no longer counts
+        let gen2 = f.spawn(&f.pane);
+        assert!(!trust_timed_out(&f.state, &f.pane));
+        arm_trust(&f.state, &f.pane, gen2, t0);
+        assert_eq!(poll_trust(&f.state, t0 + TRUST_TIMEOUT), 1);
+        assert!(trust_timed_out(&f.state, &f.pane));
         // a late SessionStart answers the warning
         f.session_start();
         assert_eq!(f.att(&f.pane), (false, None));
+        assert!(!trust_timed_out(&f.state, &f.pane));
     }
 
     #[test]

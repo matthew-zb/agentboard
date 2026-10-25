@@ -641,6 +641,107 @@ impl Workspace {
         Effects { spawn: self.panes.keys().map(|id| (id.clone(), false)).collect(), kill: Vec::new() }
     }
 
+    /// Restore rules (spec §9, Task 12) for a workspace loaded from workspace.json; config is the
+    /// source of truth for which tabs carry a role. Returns the spawn effects.
+    ///
+    /// 1. Runtime state reset ([`Workspace::reset_runtime_state`]).
+    /// 2. Roles re-derived from `loaded.config` (phase-1 files have none; config may have changed):
+    ///    the Dispatcher tab is always `Dispatcher`; another tab takes the role of the config tab
+    ///    with the **same name and dir** (`manager` / `handover`, or none). A tab with no such
+    ///    entry (removed from config, or its dir changed) becomes a plain phase-1 tab.
+    /// 3. Team panes (lead / member) are dropped with their columns (leaves removed, layouts
+    ///    normalized: no single-child splits, an auto-made team area collapses into the Manager
+    ///    pane) and every `team_seq` is cleared — Managers re-hire from `teams/*/brief.md`.
+    ///    Team docs on disk are not touched. A tab left with no pane at all is removed.
+    /// 4. In a role tab the standing pane keeps its place: the pane that already had the
+    ///    standing role, else the terminal pane named like the template's focus (or first
+    ///    terminal) pane, else the first terminal pane in layout order. It gets the role and
+    ///    `session_name` = the current tab name (a fresh session, so a renamed tab's name is
+    ///    used now); its prompt is re-read from the template pane of the same name when the
+    ///    template still has one. Every other pane gets no role / session name.
+    /// 5. Effects: every pane is spawned; standing role panes with `inject = true` (new session +
+    ///    start prompt, as at first start), all others without injection (phase-1 restore).
+    ///    Applets (inbox, documents) get the usual no-process spawn.
+    pub fn restore_roles(&mut self, loaded: &Loaded) -> Effects {
+        self.reset_runtime_state();
+        let cfg = &loaded.config;
+        // 2. tab roles from config
+        for t in self.tabs.values_mut() {
+            t.role = if t.is_dispatcher {
+                Some(Role::Dispatcher)
+            } else {
+                cfg.tabs.iter().find(|s| s.name == t.name && s.dir == t.dir).and_then(|s| s.role)
+            };
+            t.team_seq.clear();
+        }
+        // a handover tab's workspace must be the root (config guarantees dir "" for it)
+        // 3. drop team panes
+        let team: Vec<PaneId> =
+            self.panes.values().filter(|p| p.team.is_some() || matches!(p.role, Some(Role::Lead | Role::Member))).map(|p| p.id.clone()).collect();
+        for id in &team {
+            let tab = self.panes[id].tab.clone();
+            self.panes.remove(id);
+            let Some(t) = self.tabs.get_mut(&tab) else { continue };
+            match t.layout.remove_leaf(id) {
+                Some(None) => {
+                    self.detach_tab(&tab);
+                }
+                _ => {
+                    t.layout.normalize();
+                    let leaves = t.layout.leaves();
+                    if !leaves.contains(&t.last_focused_pane_id) {
+                        t.last_focused_pane_id = leaves[0].clone();
+                    }
+                    if t.maximized_pane_id.as_ref().is_some_and(|m| !leaves.contains(m)) {
+                        t.maximized_pane_id = None;
+                    }
+                }
+            }
+        }
+        if !self.groups.contains_key(&self.focus.group_id) {
+            self.focus.group_id = self.group_layout.leaves()[0].clone();
+        }
+        if self.group_maximized.as_ref().is_some_and(|g| !self.groups.contains_key(g)) {
+            self.group_maximized = None;
+        }
+        self.sanitize_last_location();
+        // 4. standing panes
+        let mut standing: BTreeSet<PaneId> = BTreeSet::new();
+        let tab_ids: Vec<TabId> = self.tabs.keys().cloned().collect();
+        for tid in tab_ids {
+            let t = &self.tabs[&tid];
+            let (role, name, leaves) = (t.role, t.name.clone(), t.layout.leaves());
+            let tpl = loaded.templates.get(&t.template);
+            let pick = role.and_then(|_| {
+                let terminal = |p: &&PaneId| self.panes.get(*p).is_some_and(|p| !p.kind.is_applet());
+                let had = leaves.iter().filter(terminal).find(|p| self.panes[*p].role.is_some_and(|r| r.is_standing()));
+                let by_tpl = tpl.and_then(|tpl| {
+                    let specs = tpl.layout.leaves();
+                    let s = specs.iter().find(|s| s.focus && s.applet.is_none()).or_else(|| specs.iter().find(|s| s.applet.is_none()))?;
+                    leaves.iter().filter(terminal).find(|p| self.panes[*p].name == s.name)
+                });
+                had.or(by_tpl).or_else(|| leaves.iter().find(terminal)).cloned()
+            });
+            for pid in &leaves {
+                let Some(p) = self.panes.get_mut(pid) else { continue };
+                if Some(pid) == pick.as_ref() {
+                    p.role = role;
+                    p.session_name = role.map(|r| session_name(&name, r, None, 0));
+                    if let Some(spec) = tpl.and_then(|tpl| tpl.layout.leaves().into_iter().find(|s| s.name == p.name && s.applet.is_none())) {
+                        p.prompt = spec.prompt.clone();
+                    }
+                    standing.insert(pid.clone());
+                } else {
+                    p.role = None;
+                    p.session_name = None;
+                }
+                p.team = None;
+            }
+        }
+        // 5. effects
+        Effects { spawn: self.panes.keys().map(|id| (id.clone(), standing.contains(id))).collect(), kill: Vec::new() }
+    }
+
     /// Panes whose process is alive (`starting` or `running`). Applets have no process.
     pub fn running_count(&self) -> usize {
         self.panes
@@ -3337,7 +3438,8 @@ mod tests {
         // the document vanishing does not break the restore (the tab shows "not found")
         std::fs::remove_file(tmp.path().join("billing/issues/x/output/보고서.md")).unwrap();
         let mut back = crate::persist::load(&file).unwrap().unwrap();
-        let fx = crate::persist::prepare_restored(&mut back);
+        let fx = crate::persist::prepare_restored(&mut back, &l);
+        assert_eq!(back.clone().normalize_and_validate(), Ok(()));
         assert!(fx.spawn.contains(&(pid.clone(), false)));
         assert_eq!(back.panes[&pid].doc_path, ws.panes[&pid].doc_path);
         assert_eq!(back.panes[&pid].kind, ws.panes[&pid].kind);

@@ -206,13 +206,13 @@ fn tools_list_is_filtered_by_role() {
     assert_eq!(
         tool_names(&fx, &m),
         [
-            "dismiss", "dismiss_team", "handoff_done", "hire_lead", "inbox_list", "inbox_note", "inbox_post",
-            "inbox_propose_close", "issue_create", "list_team", "need_user"
+            "dismiss", "dismiss_team", "env_status", "handoff_done", "hire_lead", "inbox_list", "inbox_note",
+            "inbox_post", "inbox_propose_close", "issue_create", "list_team", "need_user"
         ]
     );
-    assert_eq!(tool_names(&fx, &d), ["create_manager_tab", "handoff_done", "inbox_list", "need_user"]);
-    assert_eq!(tool_names(&fx, &l), ["dismiss", "dismiss_team", "hire_member", "inbox_list", "list_team", "need_user"]);
-    assert_eq!(tool_names(&fx, &mb), ["inbox_list", "need_user"]);
+    assert_eq!(tool_names(&fx, &d), ["create_manager_tab", "env_set_source", "env_skip", "env_status", "handoff_done", "inbox_list", "need_user"]);
+    assert_eq!(tool_names(&fx, &l), ["dismiss", "dismiss_team", "env_status", "hire_member", "inbox_list", "list_team", "need_user"]);
+    assert_eq!(tool_names(&fx, &mb), ["env_status", "inbox_list", "need_user"]);
 
     // tool defs are complete MCP tool objects
     let r = rpc(fx.addr, Some(&m), json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).json();

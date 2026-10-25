@@ -16,9 +16,12 @@ const cfg = {
   restoreFocus() {},
   /** Send CreateTab; resolves true on success, false after the error was toasted. */
   createTab: async () => false,
+  /** Wizard "Manager": resolves true on success, false after toasting the error. */
+  createManager: async () => false,
 };
 
-/** `{pushModal(fn) → token, popModal(token), restoreFocus(), createTab(cmd) → Promise<bool>}` (set by app.js). */
+/** `{pushModal(fn) → token, popModal(token), restoreFocus(), createTab(cmd) → Promise<bool>,
+ * createManager({name, dir}) → Promise<bool>}` (set by app.js). */
 export function configureOverlays(c) {
   Object.assign(cfg, c);
 }
@@ -439,7 +442,8 @@ export function toast(message, kind = '') {
 
 // ---------------------------------------------------------------- new-tab wizard
 
-/** ① workspace dir (fuzzy; unknown name → create) → ② template → ③ CreateTab. Esc cancels. */
+/** ① workspace dir (fuzzy; unknown name → create) → ② role (일반 / Manager) → ③ template →
+ * CreateTab (Manager: config-persisting backend path, no template step). Esc cancels. */
 export function newTabWizard() {
   return newTabFlow({
     alive: flowGuard(),
@@ -460,9 +464,15 @@ export function newTabWizard() {
       }).then((r) => (r ? r.value : null)),
     confirm,
     createDir: (name) => api.createDir(name),
+    pickRole: (dir) =>
+      choose(`새 탭 ② 역할 — 폴더: ${dir}`, [
+        { label: '일반', hint: '템플릿을 골라 에이전트 탭을 엽니다', value: 'plain' },
+        { label: 'Manager', hint: '상시업무 Manager 탭 — config.json에 기록되어 재시작 후에도 유지', value: 'manager' },
+      ]),
+    createManager: (req) => cfg.createManager(req),
     pickTemplate: (list, def, dir) =>
       listOverlay({
-        title: `새 탭 ② 템플릿 — 폴더: ${dir}`,
+        title: `새 탭 ③ 템플릿 — 폴더: ${dir}`,
         placeholder: '템플릿 이름',
         emptyText: '템플릿이 없습니다',
         compute: (q) => fuzzyRank(list, q).map((i) => ({ label: list[i], hint: list[i] === def ? '기본값' : '', value: list[i] })),

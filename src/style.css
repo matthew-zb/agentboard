@@ -83,6 +83,8 @@ body.dragging-v, body.dragging-v * { cursor: row-resize !important; user-select:
 .status-attn .attn-tab:hover { text-decoration: underline; }
 .flag.sync { color: var(--accent); font-weight: 600; }
 .flag.errors { color: var(--warn); cursor: pointer; }
+.flag.env { color: var(--muted); font-size: 11px; cursor: help; }
+.flag.env.env-error { color: #ff6b6b; font-weight: 600; }
 
 /* ---- sidebar ---- */
 #sidebar { flex: 0 0 220px; overflow: auto; background: var(--chrome); border-right: 1px solid var(--line); font-size: 12px; user-select: none; }
