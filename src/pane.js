@@ -94,6 +94,39 @@ export function syncTargets(ws, paneId) {
     .map((q) => q.id);
 }
 
+const REPLY_PATTERNS = [
+  /^\x1b\[\??\d+;\d+R$/, // CPR
+  /^\x1b\[[?>]\d*(;\d+)*c$/, // DA1 / DA2
+  /^\x1b\[[IO]$/, // focus in/out (DECSET 1004)
+  /^\x1b\[<\d+;\d+;\d+[Mm]$/, // SGR mouse
+  /^\x1b\[M[\s\S]{3}$/, // X10 mouse
+  /^\x1b[\]P][\s\S]*(\x07|\x1b\\)$/, // OSC / DCS responses
+  /^\x1b\[\??\d*n$/, // DSR status
+  /^\x1b\[\??\d+(;\d+)*\$y$/, // DECRPM
+  /^\x1b\[\d+(;\d+)+t$/, // window-size reports
+];
+
+/** True when `data` (from term.onData) is xterm's own answer/report, not user input. */
+export function isTerminalReply(data) {
+  return typeof data === 'string' && data.startsWith('\x1b') && REPLY_PATTERNS.some((r) => r.test(data));
+}
+
+/**
+ * Panes to write `data` typed/pasted in `sourceId` to. Terminal replies go to the source only;
+ * user input also goes to the other `targets` (each once) unless they are not live
+ * (`suppressInput`), in copy mode (`inputBlocked`) or missing. `entryOf(id) -> entry|undefined`.
+ */
+export function fanoutIds(sourceId, targets, data, entryOf) {
+  if (!targets || !targets.length || isTerminalReply(data)) return [sourceId];
+  const out = [sourceId];
+  for (const t of new Set(targets)) {
+    if (t === sourceId) continue;
+    const te = entryOf(t);
+    if (te && !te.suppressInput && !te.inputBlocked) out.push(t);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- runtime
 
 const entries = new Map();
@@ -228,17 +261,9 @@ function createEntry(id) {
       return;
     }
     if (e.suppressInput) return;
-    // Sync input: one write per Running pane of the tab (the source included). Other panes'
-    // onData is not involved, so there is no echo loop.
-    const targets = hooks.syncTargets(id);
-    if (targets && targets.length) {
-      for (const t of targets) {
-        const te = entries.get(t);
-        if (t === id || (te && !te.suppressInput)) toPty(t, d);
-      }
-      return;
-    }
-    toPty(id, d);
+    // Sync input: user input is written once per Running pane of the tab (source included);
+    // terminal replies stay with the source pane. No echo loop: other panes' onData is not involved.
+    for (const t of fanoutIds(id, hooks.syncTargets(id), d, (x) => entries.get(x))) toPty(t, d);
   };
   term.onData(input);
   term.onBinary((d) => {

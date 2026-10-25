@@ -271,3 +271,31 @@ test('syncTargets: every running pane of the tab exactly once, no other tabs', (
   assert.deepEqual([...t].sort(), ['a', 'b']);
   assert.equal(new Set(t).size, t.length);
 });
+
+// ---- Task 14 fix round 1: terminal replies stay local; fan-out filter
+import { isTerminalReply, fanoutIds } from '../../src/pane.js';
+
+test('isTerminalReply: xterm answers are replies', () => {
+  for (const d of ['\x1b[12;40R', '\x1b[?12;40R', '\x1b[?1;2c', '\x1b[>0;276;0c', '\x1b[I', '\x1b[O', '\x1b[<0;10;5M', '\x1b[<0;10;5m', '\x1b[M !!', '\x1b]10;rgb:ffff/ffff/ffff\x07', '\x1b]11;rgb:0000/0000/0000\x1b\\', '\x1bP1$r0m\x1b\\', '\x1b[0n', '\x1b[?1;1$y', '\x1b[8;24;80t']) {
+    assert.equal(isTerminalReply(d), true, JSON.stringify(d));
+  }
+});
+
+test('isTerminalReply: user input is not a reply', () => {
+  for (const d of ['a', '한글', '\r', '\x1b[A', '\x1b[B', '\x1b', '\x03', '\x7f', '\x1b[3~', '\x1b[200~ls\x1b[201~', '\x1b[200~\x1b[I\x1b[201~', 'ls -la\r', '\x1bb']) {
+    assert.equal(isTerminalReply(d), false, JSON.stringify(d));
+  }
+  assert.equal(isTerminalReply(null), false);
+});
+
+test('fanoutIds: input goes to source + eligible targets once; replies to source only', () => {
+  const ents = {
+    a: {}, b: {}, c: { suppressInput: true }, d: { inputBlocked: true },
+  };
+  const of = (id) => ents[id];
+  assert.deepEqual(fanoutIds('a', ['a', 'b', 'c', 'd', 'x', 'b'], 'x', of), ['a', 'b']);
+  assert.deepEqual(fanoutIds('a', ['a', 'b'], '\x1b[I', of), ['a']);
+  assert.deepEqual(fanoutIds('a', null, 'x', of), ['a']);
+  assert.deepEqual(fanoutIds('a', [], 'x', of), ['a']);
+  assert.deepEqual(fanoutIds('a', ['b'], '\x1b[200~paste\x1b[201~', of), ['a', 'b']);
+});
