@@ -1,6 +1,6 @@
 [package]
 name = "agentboard"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -9,13 +9,20 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-opener = "2"
 tauri-plugin-clipboard-manager = "2"
+# R30: one app instance (a second launch focuses the first); exact pin
+tauri-plugin-single-instance = "=2.5.4"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 portable-pty = "0.9"
 regex = "1"
 which = "8"
 dirs = "6"
+getrandom = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
+tokio = { version = "1", features = ["net", "rt", "macros", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 win32job = "2"
@@ -24,6 +31,7 @@ windows = "0.62"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "io-util"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

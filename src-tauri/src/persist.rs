@@ -5,6 +5,7 @@
 //! its snapshot closure takes `ws` only to clone. Callers notify the saver without holding
 //! any lock that the snapshot closure needs in a conflicting order (notify is a channel send).
 
+use crate::config::Loaded;
 use crate::workspace::{Effects, Workspace};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -122,10 +123,31 @@ pub fn load(path: &Path) -> Result<Option<Workspace>, LoadError> {
     }
 }
 
-/// Restored workspace -> runtime reset; every pane is spawned without prompt injection (R14:
-/// the model is only touched through `Workspace::reset_runtime_state`).
-pub fn prepare_restored(ws: &mut Workspace) -> Effects {
-    ws.reset_runtime_state()
+/// Restore plan (spec §9, Task 12) for a workspace loaded from workspace.json: runtime reset,
+/// roles re-derived from the current config, team panes / team areas dropped, standing role
+/// panes respawned as new sessions with their start prompt, everything else as in phase 1. The
+/// model is only touched through `Workspace::restore_roles` (see there for the exact rules).
+/// The result passes `normalize_and_validate`; callers still check and fall back to a fresh
+/// start if it does not.
+/// The third value lists Korean messages for config role tabs that could not be added (R27,
+/// shown as startup errors).
+pub fn restore_plan(mut ws: Workspace, loaded: &Loaded) -> (Workspace, Effects, Vec<String>) {
+    let (fx, errors) = ws.restore_roles(loaded);
+    (ws, fx, errors)
+}
+
+/// In-place form of [`restore_plan`] (messages dropped).
+pub fn prepare_restored(ws: &mut Workspace, loaded: &Loaded) -> Effects {
+    ws.restore_roles(loaded).0
+}
+
+/// Move `path` to `<path>.bak` (replacing an older one) before a fresh start would overwrite a
+/// workspace.json that loaded but could not be restored. `Ok` also when there is no file.
+pub fn move_to_bak(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::rename(path, sibling(path, ".bak")).map_err(|e| format!("작업 상태 파일을 백업할 수 없습니다: {} — {e}", path.display()))
 }
 
 enum Msg {
@@ -214,9 +236,11 @@ impl Saver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ensure_dotdir, load_all, Loaded};
+    use crate::config::{ensure_dotdir, load_all};
     use crate::layout::{Dir, LayoutNode};
-    use crate::workspace::{Counters, Location, PaneStatus, WsCommand};
+    use crate::roles::Role;
+    use crate::workspace::{Counters, Location, PaneKind, PaneStatus, WsCommand};
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -248,11 +272,11 @@ mod tests {
         let p = api.layout.leaves()[1].clone();
         ws.apply(WsCommand::SplitPane { pane: p.clone(), dir: Dir::Vertical }, l).unwrap();
         ws.apply(
-            WsCommand::CreateTab { name: "web".into(), dir: "web".into(), template: Some("solo".into()), group: None },
+            WsCommand::CreateTab { name: "web".into(), dir: "web".into(), template: Some("solo".into()), group: None, role: None },
             l,
         )
         .unwrap();
-        ws.apply(WsCommand::SetAttention { pane: p.clone(), on: true }, l).unwrap();
+        ws.apply(WsCommand::SetAttention { pane: p.clone(), on: true, reason: None }, l).unwrap();
         ws.set_status(&p, PaneStatus::Exited { code: 2 });
         ws.set_prompt_warning(&p, true);
         ws
@@ -431,24 +455,361 @@ mod tests {
         // the next id is fresh
         let mut b = back.clone();
         b.apply(
-            WsCommand::CreateTab { name: "z".into(), dir: "z".into(), template: Some("solo".into()), group: None },
+            WsCommand::CreateTab { name: "z".into(), dir: "z".into(), template: Some("solo".into()), group: None, role: None },
             &l,
         )
         .unwrap();
         assert_eq!(b.tabs.len(), back.tabs.len() + 1);
     }
 
+    /// A workspace.json written by phase 1 (no kind/role/team/sessionName on panes, no role on
+    /// tabs) loads, and the new fields take their defaults.
     #[test]
-    fn restored_panes_respawn_without_prompt() {
+    fn phase1_workspace_json_still_loads() {
+        let phase1 = r#"{
+          "groupLayout": {"leaf": "g1"},
+          "groups": {"g1": {"id": "g1", "name": "main", "tabIds": ["t1", "t2"], "activeTabId": "t1"}},
+          "tabs": {
+            "t1": {"id": "t1", "name": "dispatcher", "dir": "", "template": "dispatcher", "isDispatcher": true,
+                   "workspace": "C:/workspace", "layout": {"leaf": "p1"}, "lastFocusedPaneId": "p1",
+                   "maximizedPaneId": null, "syncInput": false},
+            "t2": {"id": "t2", "name": "api", "dir": "api", "template": "solo", "isDispatcher": false,
+                   "workspace": "C:/workspace/api",
+                   "layout": {"split": "horizontal", "sizes": [50, 50], "children": [{"leaf": "p2"}, {"leaf": "p3"}]},
+                   "lastFocusedPaneId": "p2", "maximizedPaneId": null, "syncInput": true}
+          },
+          "panes": {
+            "p1": {"id": "p1", "name": "dispatcher", "tab": "t1", "agent": "claude", "args": [], "env": {},
+                   "cwd": "C:/workspace", "prompt": null, "status": {"state": "running"}, "attention": false,
+                   "promptWarning": false},
+            "p2": {"id": "p2", "name": "main", "tab": "t2", "agent": "claude", "args": ["--x"], "env": {"A": "1"},
+                   "cwd": "C:/workspace/api", "prompt": "hi", "status": {"state": "exited", "code": 1},
+                   "attention": true, "promptWarning": false},
+            "p3": {"id": "p3", "name": "pane-1", "tab": "t2", "agent": "cmd", "args": [], "env": {},
+                   "cwd": "C:/workspace/api", "prompt": null, "status": {"state": "starting"}, "attention": false,
+                   "promptWarning": true}
+          },
+          "focus": {"groupId": "g1"},
+          "lastLocation": null,
+          "groupMaximized": null,
+          "counters": {"group": 1, "tab": 2, "pane": 3}
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(path(&dir), phase1).unwrap();
+        let ws = load(&path(&dir)).unwrap().expect("phase-1 file loads");
+        assert_eq!(ws.tabs.len(), 2);
+        assert!(ws.tabs.values().all(|t| t.role.is_none()));
+        for p in ws.panes.values() {
+            assert_eq!(p.kind, PaneKind::Terminal, "{}", p.id);
+            assert_eq!((p.role, p.team.clone(), p.session_name.clone()), (None, None, None), "{}", p.id);
+        }
+        assert_eq!(ws.panes["p2"].args, ["--x"]);
+        // saving writes the new fields; the result round-trips
+        save_atomic(&path(&dir), &ws).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path(&dir)).unwrap()).unwrap();
+        assert_eq!(v["panes"]["p1"]["kind"], serde_json::json!({"type": "terminal"}));
+        assert_eq!(load(&path(&dir)).unwrap().unwrap(), ws);
+
+        // phase-2 invariants are checked on load
+        let base: serde_json::Value = serde_json::from_str(phase1).unwrap();
+        let cases: [(&str, fn(&mut serde_json::Value)); 2] = [
+            ("applet with a role", |v| {
+                v["panes"]["p3"]["kind"] = serde_json::json!({"type": "applet", "kind": "inbox"});
+                v["panes"]["p3"]["agent"] = serde_json::json!("");
+                v["panes"]["p3"]["role"] = serde_json::json!("member");
+            }),
+            ("duplicate sessionName", |v| {
+                v["panes"]["p2"]["sessionName"] = serde_json::json!("s");
+                v["panes"]["p3"]["sessionName"] = serde_json::json!("s");
+            }),
+        ];
+        for (name, f) in cases {
+            let mut v = base.clone();
+            f(&mut v);
+            std::fs::write(path(&dir), v.to_string()).unwrap();
+            let r = load(&path(&dir));
+            assert!(matches!(r, Err(LoadError::Corrupt(_))), "{name}: {r:?}");
+        }
+    }
+
+    // ───────── restore rules (Task 12) ─────────
+
+    const MGR_TPL: &str = r#"{"name":"mgr","layout":{"split":"horizontal","sizes":[70,30],"children":[
+        {"pane":{"name":"manager","focus":true,"prompt":"시작 리뷰를 하세요"}},
+        {"pane":{"name":"shell","agent":"cmd"}}]}}"#;
+
+    /// Loaded config `config` (+ template `mgr`); the temp root lives as long as the guard.
+    fn loaded_with(config: &str) -> (Loaded, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let appdata = tempfile::tempdir().unwrap();
+        let s = serde_json::json!({ "workspaceRoot": root.path().to_string_lossy() });
+        std::fs::write(appdata.path().join("settings.json"), s.to_string()).unwrap();
+        ensure_dotdir(root.path()).unwrap();
+        std::fs::write(root.path().join(".agentboard/templates/mgr.json"), MGR_TPL).unwrap();
+        std::fs::write(root.path().join(".agentboard/config.json"), config).unwrap();
+        let l = load_all(appdata.path());
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        (l, root)
+    }
+
+    const ROLE_CONFIG: &str = r#"{"tabs":[
+        {"name":"billing","role":"manager","dir":"billing","template":"mgr"},
+        {"name":"handover","role":"handover","dir":""},
+        {"name":"api","dir":"api","template":"team-3"}]}"#;
+
+    fn tab_id(ws: &Workspace, name: &str) -> String {
+        ws.tabs.values().find(|t| t.name == name).unwrap_or_else(|| panic!("no tab {name}")).id.clone()
+    }
+
+    /// Through workspace.json, as at a real restart.
+    fn reload(ws: &Workspace) -> Workspace {
+        let dir = tempfile::tempdir().unwrap();
+        save_atomic(&path(&dir), ws).unwrap();
+        load(&path(&dir)).unwrap().unwrap()
+    }
+
+    fn assert_no_degenerate_splits(n: &LayoutNode<String>) {
+        if let LayoutNode::Split { children, sizes, .. } = n {
+            assert!(children.len() >= 2, "single-child split: {n:?}");
+            assert_eq!(sizes.len(), children.len());
+            children.iter().for_each(assert_no_degenerate_splits);
+        }
+    }
+
+    #[test]
+    fn restore_plan_drops_team_panes_and_reinjects_prompts() {
+        let (l, _root) = loaded_with(ROLE_CONFIG);
+        let mut ws = Workspace::from_config(&l);
+        let billing = tab_id(&ws, "billing");
+        let before_layout = ws.tabs[&billing].layout.clone();
+        for (team, role) in [("a", Role::Lead), ("a", Role::Member), ("a", Role::Member), ("b", Role::Lead)] {
+            ws.apply(WsCommand::AddTeamPane { tab: billing.clone(), team: team.into(), role, prompt: Some("팀".into()) }, &l).unwrap();
+        }
+        // a team pane focused and maximized
+        let m1 = ws.panes.values().find(|p| p.session_name.as_deref() == Some("billing-a-m1")).unwrap().id.clone();
+        ws.tabs.get_mut(&billing).unwrap().last_focused_pane_id = m1.clone();
+        ws.tabs.get_mut(&billing).unwrap().maximized_pane_id = Some(m1);
+        assert_eq!(ws.tabs[&billing].team_seq.get("a"), Some(&2));
+        assert_eq!(ws.panes.values().filter(|p| p.team.is_some()).count(), 4);
+        let saved = reload(&ws);
+
+        let (back, fx, errs) = restore_plan(saved, &l);
+        assert!(errs.is_empty(), "{errs:?}");
+        // team panes and areas gone, layout back to the template's, teamSeq reset
+        assert!(back.panes.values().all(|p| p.team.is_none() && !matches!(p.role, Some(Role::Lead | Role::Member))));
+        assert_eq!(back.tabs[&billing].layout, before_layout, "team area collapsed into the Manager pane");
+        assert!(back.tabs.values().all(|t| t.team_seq.is_empty()));
+        for t in back.tabs.values() {
+            assert_no_degenerate_splits(&t.layout);
+        }
+        let mgr = back.standing_pane(&billing).unwrap();
+        assert_eq!(back.tabs[&billing].last_focused_pane_id, mgr, "focus falls back to the Manager");
+        assert_eq!(back.tabs[&billing].maximized_pane_id, None);
+        // standing panes: new session + start prompt; everything else as in phase 1
+        let inject: BTreeMap<String, bool> = fx.spawn.iter().cloned().collect();
+        assert_eq!(inject.len(), back.panes.len(), "every pane is spawned");
+        assert!(fx.kill.is_empty());
+        let standing: Vec<(String, Option<Role>, Option<String>)> = back
+            .panes
+            .values()
+            .filter(|p| inject[&p.id])
+            .map(|p| (back.tabs[&p.tab].name.clone(), p.role, p.session_name.clone()))
+            .collect();
+        assert_eq!(
+            standing,
+            [
+                ("dispatcher".to_string(), Some(Role::Dispatcher), Some("dispatcher".to_string())),
+                ("billing".to_string(), Some(Role::Manager), Some("billing".to_string())),
+                ("handover".to_string(), Some(Role::Handover), Some("handover".to_string())),
+            ]
+        );
+        assert_eq!(back.panes[&mgr].prompt.as_deref(), Some("시작 리뷰를 하세요"));
+        let api = tab_id(&back, "api");
+        assert!(back.panes.values().filter(|p| p.tab == api).all(|p| !inject[&p.id] && p.role.is_none()));
+        assert!(back.panes.values().all(|p| p.status == PaneStatus::Starting && !p.attention));
+        let mut v = back.clone();
+        assert_eq!(v.normalize_and_validate(), Ok(()));
+        // the restored workspace hires again from scratch (member numbers restart)
+        let mut again = back;
+        again.apply(WsCommand::AddTeamPane { tab: billing.clone(), team: "a".into(), role: Role::Lead, prompt: None }, &l).unwrap();
+        again.apply(WsCommand::AddTeamPane { tab: billing.clone(), team: "a".into(), role: Role::Member, prompt: None }, &l).unwrap();
+        assert!(again.panes.values().any(|p| p.session_name.as_deref() == Some("billing-a-m1")));
+    }
+
+    #[test]
+    fn non_role_tabs_restore_as_phase1() {
         let l = loaded();
-        let mut ws = busy(&l);
-        let fx = prepare_restored(&mut ws);
-        assert_eq!(fx.spawn.len(), ws.panes.len());
-        assert!(fx.spawn.iter().all(|(_, inject)| !*inject));
+        let ws = reload(&busy(&l));
+        let (back, fx, errs) = restore_plan(ws.clone(), &l);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(fx.spawn.len(), back.panes.len());
         assert!(fx.kill.is_empty());
         let ids: Vec<_> = fx.spawn.iter().map(|(p, _)| p.clone()).collect();
-        assert_eq!(ids, ws.panes.keys().cloned().collect::<Vec<_>>());
-        assert!(ws.panes.values().all(|p| p.status == PaneStatus::Starting && !p.attention && !p.prompt_warning));
+        assert_eq!(ids, back.panes.keys().cloned().collect::<Vec<_>>());
+        for (id, inject) in &fx.spawn {
+            let p = &back.panes[id];
+            let t = &back.tabs[&p.tab];
+            if t.is_dispatcher {
+                assert!(*inject && p.role == Some(Role::Dispatcher), "{id}");
+            } else {
+                // plain tabs: no role, no prompt injection, everything else as saved
+                assert!(!*inject && p.role.is_none() && p.session_name.is_none() && t.role.is_none(), "{id}");
+                let mut old = ws.panes[id].clone();
+                old.status = PaneStatus::Starting;
+                old.clear_attention();
+                old.prompt_warning = false;
+                assert_eq!(p, &old, "{id}");
+            }
+        }
+        // layout, focus, groups untouched
+        assert_eq!(back.group_layout, ws.group_layout);
+        assert_eq!(back.groups, ws.groups);
+        assert_eq!(back.focus, ws.focus);
+        for (tid, t) in &ws.tabs {
+            assert_eq!(back.tabs[tid].layout, t.layout, "{tid}");
+        }
+        assert!(back.panes.values().all(|p| p.status == PaneStatus::Starting && !p.attention && !p.prompt_warning && p.attention_reason.is_none()));
+    }
+
+    /// Phase-1 workspace.json (no roles at all) + a phase-2 config: roles come from config.
+    #[test]
+    fn restore_rederives_roles_from_config() {
+        let (l, root) = loaded_with(ROLE_CONFIG);
+        let r = root.path().to_string_lossy().replace('\\', "/");
+        let phase1 = format!(
+            r#"{{
+          "groupLayout": {{"leaf": "g1"}},
+          "groups": {{"g1": {{"id": "g1", "name": "main", "tabIds": ["t1", "t2", "t3", "t4"], "activeTabId": "t2"}}}},
+          "tabs": {{
+            "t1": {{"id": "t1", "name": "dispatcher", "dir": "", "template": "dispatcher", "isDispatcher": true,
+                   "workspace": "{r}", "layout": {{"leaf": "p1"}}, "lastFocusedPaneId": "p1",
+                   "maximizedPaneId": null, "syncInput": false}},
+            "t2": {{"id": "t2", "name": "billing", "dir": "billing", "template": "mgr", "isDispatcher": false,
+                   "workspace": "{r}/billing",
+                   "layout": {{"split": "horizontal", "sizes": [70, 30], "children": [{{"leaf": "p2"}}, {{"leaf": "p3"}}]}},
+                   "lastFocusedPaneId": "p3", "maximizedPaneId": null, "syncInput": false}},
+            "t3": {{"id": "t3", "name": "ops", "dir": "ops", "template": "mgr", "isDispatcher": false,
+                   "workspace": "{r}/ops",
+                   "layout": {{"split": "horizontal", "sizes": [70, 30], "children": [{{"leaf": "p4"}}, {{"leaf": "p5"}}]}},
+                   "lastFocusedPaneId": "p4", "maximizedPaneId": null, "syncInput": false}},
+            "t4": {{"id": "t4", "name": "handover", "dir": "elsewhere", "template": "solo", "isDispatcher": false,
+                   "workspace": "{r}/elsewhere", "layout": {{"leaf": "p6"}}, "lastFocusedPaneId": "p6",
+                   "maximizedPaneId": null, "syncInput": false}}
+          }},
+          "panes": {{
+            "p1": {{"id": "p1", "name": "dispatcher", "tab": "t1", "agent": "claude", "args": [], "env": {{}},
+                   "cwd": "{r}", "prompt": null, "status": {{"state": "running"}}, "attention": false, "promptWarning": false}},
+            "p2": {{"id": "p2", "name": "shell", "tab": "t2", "agent": "cmd", "args": [], "env": {{}},
+                   "cwd": "{r}/billing", "prompt": null, "status": {{"state": "running"}}, "attention": false, "promptWarning": false}},
+            "p3": {{"id": "p3", "name": "manager", "tab": "t2", "agent": "claude", "args": [], "env": {{}},
+                   "cwd": "{r}/billing", "prompt": "옛 프롬프트", "status": {{"state": "running"}}, "attention": true, "promptWarning": false}},
+            "p4": {{"id": "p4", "name": "manager", "tab": "t3", "agent": "claude", "args": [], "env": {{}},
+                   "cwd": "{r}/ops", "prompt": "옛 프롬프트", "status": {{"state": "running"}}, "attention": false, "promptWarning": false}},
+            "p5": {{"id": "p5", "name": "shell", "tab": "t3", "agent": "cmd", "args": [], "env": {{}},
+                   "cwd": "{r}/ops", "prompt": null, "status": {{"state": "running"}}, "attention": false, "promptWarning": false}},
+            "p6": {{"id": "p6", "name": "main", "tab": "t4", "agent": "claude", "args": [], "env": {{}},
+                   "cwd": "{r}/elsewhere", "prompt": null, "status": {{"state": "running"}}, "attention": false, "promptWarning": false}}
+          }},
+          "focus": {{"groupId": "g1"}}, "lastLocation": null, "groupMaximized": null,
+          "counters": {{"group": 1, "tab": 4, "pane": 6}}
+        }}"#
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(path(&dir), phase1).unwrap();
+        let ws = load(&path(&dir)).unwrap().unwrap();
+        let (back, fx, errs) = restore_plan(ws, &l);
+        // config's handover tab is not added: the plain tab "handover" (other dir) keeps the name
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("'handover'") && errs[0].contains("같은 이름"), "{errs:?}");
+        assert_eq!(back.tabs.values().filter(|t| t.name == "handover").count(), 1);
+        let inject: BTreeMap<String, bool> = fx.spawn.iter().cloned().collect();
+        let role = |p: &str| (back.panes[p].role, back.panes[p].session_name.clone(), inject[p]);
+        // dispatcher: always; the template's pane by name
+        assert_eq!(back.tabs["t1"].role, Some(Role::Dispatcher));
+        assert_eq!(role("p1"), (Some(Role::Dispatcher), Some("dispatcher".into()), true));
+        // billing: config says manager (same name + dir) → the template's focus pane (by name,
+        // not layout position), prompt re-read from the template
+        assert_eq!(back.tabs["t2"].role, Some(Role::Manager));
+        assert_eq!(role("p3"), (Some(Role::Manager), Some("billing".into()), true));
+        assert_eq!(role("p2"), (None, None, false));
+        assert_eq!(back.panes["p3"].prompt.as_deref(), Some("시작 리뷰를 하세요"));
+        // ops: not in config → plain phase-1 tab, saved prompt kept
+        assert_eq!(back.tabs["t3"].role, None);
+        assert_eq!(role("p4"), (None, None, false));
+        assert_eq!(back.panes["p4"].prompt.as_deref(), Some("옛 프롬프트"));
+        // "handover" with a different dir than config → plain as well
+        assert_eq!(back.tabs["t4"].role, None);
+        assert_eq!(role("p6"), (None, None, false));
+        let mut v = back.clone();
+        assert_eq!(v.normalize_and_validate(), Ok(()));
+
+        // the role disappears from config later: the saved Manager tab (with a team) turns plain
+        let mut with_team = back.clone();
+        with_team.apply(WsCommand::AddTeamPane { tab: "t2".into(), team: "x".into(), role: Role::Lead, prompt: None }, &l).unwrap();
+        let (l2, _root2) = loaded_with(r#"{"tabs":[{"name":"billing","dir":"billing","template":"mgr"}]}"#);
+        let (plain, fx, _) = restore_plan(reload(&with_team), &l2);
+        assert_eq!(plain.tabs["t2"].role, None);
+        assert!(plain.panes.values().filter(|p| p.tab == "t2").all(|p| p.role.is_none() && p.session_name.is_none() && p.team.is_none()));
+        assert_eq!(plain.tabs["t2"].layout, back.tabs["t2"].layout);
+        assert!(fx.spawn.iter().filter(|(p, _)| plain.panes[p].tab == "t2").all(|(_, i)| !*i));
+        let mut v = plain.clone();
+        assert_eq!(v.normalize_and_validate(), Ok(()));
+    }
+
+    /// R27: config role tabs missing from workspace.json are added at restore (defaultGroup,
+    /// in the background); a name already used by a plain tab is refused with a message.
+    #[test]
+    fn restore_adds_missing_config_role_tabs() {
+        let (l, _root) = loaded_with(ROLE_CONFIG);
+        let mut ws = Workspace::from_config(&l);
+        // the user closed billing and handover (before R27 their config entries stayed)
+        for name in ["billing", "handover"] {
+            let t = tab_id(&ws, name);
+            ws.apply(WsCommand::CloseTab { tab: t }, &l).unwrap();
+        }
+        // and created a plain tab named "handover" in another folder
+        ws.apply(WsCommand::CreateTab { name: "handover".into(), dir: "ho".into(), template: Some("solo".into()), group: None, role: None }, &l)
+            .unwrap();
+        let saved = reload(&ws);
+        let (back, fx, errs) = restore_plan(saved.clone(), &l);
+        // billing comes back as a Manager with its start prompt, appended to the focused group
+        // (no defaultGroup), without moving focus or the active tab
+        let billing = tab_id(&back, "billing");
+        assert_eq!(back.tabs[&billing].role, Some(Role::Manager));
+        let g = &back.groups[&back.focus.group_id];
+        assert_eq!(g.tab_ids.last(), Some(&billing));
+        assert_eq!(back.focus, saved.focus);
+        assert_eq!(g.active_tab_id, saved.groups[&saved.focus.group_id].active_tab_id);
+        let mgr = back.standing_pane(&billing).unwrap();
+        assert!(fx.spawn.contains(&(mgr.clone(), true)));
+        assert_eq!(back.panes[&mgr].session_name.as_deref(), Some("billing"));
+        // every pane of the added tab starts as at first start
+        assert!(back.tabs[&billing].layout.leaves().iter().all(|p| fx.spawn.contains(&(p.clone(), true))));
+        // handover: the plain tab keeps its name, the config tab is refused with a message
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("'handover'"), "{errs:?}");
+        let ho = tab_id(&back, "handover");
+        assert_eq!(back.tabs[&ho].role, None);
+        let mut v = back.clone();
+        assert_eq!(v.normalize_and_validate(), Ok(()));
+        // ids never collide with saved ones
+        assert!(back.counters.pane >= saved.counters.pane + back.tabs[&billing].layout.leaves().len() as u64);
+    }
+
+    #[test]
+    fn restore_uses_the_current_tab_name_for_the_session() {
+        let (l, _root) = loaded_with(ROLE_CONFIG);
+        let mut ws = Workspace::from_config(&l);
+        let billing = tab_id(&ws, "billing");
+        // rename keeps the live session name (R15); config follows the new name
+        ws.apply(WsCommand::RenameTab { tab: billing.clone(), name: "billing2".into() }, &l).unwrap();
+        let mgr = ws.standing_pane(&billing).unwrap();
+        assert_eq!(ws.panes[&mgr].session_name.as_deref(), Some("billing"));
+        let (l2, _r2) = loaded_with(&ROLE_CONFIG.replace(r#""name":"billing""#, r#""name":"billing2""#));
+        let (back, _, errs) = restore_plan(reload(&ws), &l2);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(back.panes[&mgr].session_name.as_deref(), Some("billing2"));
+        assert_eq!(back.panes[&mgr].role, Some(Role::Manager));
     }
 
     #[test]

@@ -18,6 +18,8 @@ import {
   missingDirsFlow,
   closeFlow,
   confirmKey,
+  envStatusFlag,
+  envItemLabel,
 } from '../../src/overlay-logic.js';
 
 const leaf = (id) => ({ leaf: id });
@@ -448,4 +450,80 @@ test('closeFlow: the exit confirm does not accept Enter (spec §8: Y/N)', async 
     exit: async () => {},
   });
   assert.deepEqual(opts, [{ enterYes: false }]);
+});
+
+// ---- Task 12: role choice, autostart entry, environment status ----
+
+test('newTabFlow: role Manager → createManager (config-persisting), no template step', async () => {
+  const d = fakeDeps({ dirPicks: [{ dir: 'billing', create: false }], confirms: [], templates: [], creates: [] });
+  d.pickRole = async (dir) => {
+    d.log.push(['pickRole', dir]);
+    return 'manager';
+  };
+  d.createManager = async (req) => {
+    d.log.push(['createManager', req]);
+    return true;
+  };
+  assert.deepEqual(await newTabFlow(d), { dir: 'billing', role: 'manager' });
+  assert.deepEqual(d.log, [
+    ['pickDir', ['api', 'web']],
+    ['pickRole', 'billing'],
+    ['createManager', { name: 'billing', dir: 'billing' }],
+  ]);
+});
+
+test('newTabFlow: role 일반 → template → CreateTab; Esc at the role step cancels; failed Manager goes back', async () => {
+  const d = fakeDeps({ dirPicks: [{ dir: 'api', create: false }], confirms: [], templates: ['solo'], creates: [true] });
+  d.pickRole = async () => 'plain';
+  d.createManager = async () => assert.fail('no manager');
+  assert.deepEqual(await newTabFlow(d), { dir: 'api', template: 'solo' });
+  assert.deepEqual(d.log.map((e) => e[0]), ['pickDir', 'pickTemplate', 'createTab']);
+
+  const e = fakeDeps({ dirPicks: [{ dir: 'api', create: false }], confirms: [], templates: [], creates: [] });
+  e.pickRole = async () => null;
+  assert.equal(await newTabFlow(e), null);
+  assert.ok(!e.log.some((x) => x[0] === 'pickTemplate' || x[0] === 'createTab'));
+
+  const f = fakeDeps({ dirPicks: [{ dir: 'api', create: false }], confirms: [], templates: [], creates: [] });
+  f.pickRole = async () => 'manager';
+  f.createManager = async (req) => {
+    f.log.push(['createManager', req]);
+    return false; // the error was toasted
+  };
+  assert.equal(await newTabFlow(f), null); // back to step 1, then Esc
+  assert.deepEqual(f.log.map((x) => x[0]), ['pickDir', 'createManager', 'pickDir']);
+});
+
+test('paletteItems: autostart entry shows the current state', () => {
+  const ws = fixture();
+  const find = (opts) => paletteItems(ws, { bindings: {}, ...opts }).find((i) => i.action.type === 'autostart');
+  assert.deepEqual(find({ autostart: true }), { label: '로그인 시 자동 실행 끄기', hint: '현재: 켜짐', action: { type: 'autostart', on: false } });
+  assert.deepEqual(find({ autostart: false }), { label: '로그인 시 자동 실행 켜기', hint: '현재: 꺼짐', action: { type: 'autostart', on: true } });
+  assert.equal(find({}), undefined); // state unknown → no entry
+});
+
+test('envStatusFlag: failing items only, skipped marked, required highlighted', () => {
+  const it = (id, ok, extra = {}) => ({ id, ok, detail: `${id} 상세`, fix: `${id} 조치`, skipped: false, required: false, ...extra });
+  assert.equal(envStatusFlag(null), null);
+  assert.equal(envStatusFlag([it('claude-version', true), it('git-bash', true)]), null);
+
+  const skipped = envStatusFlag([it('claude-version', true), it('git-bash', false, { skipped: true })]);
+  assert.equal(skipped.text, '[환경: Git 없음(건너뜀)]');
+  assert.equal(skipped.highlight, false);
+
+  const f = envStatusFlag([
+    it('claude-version', false),
+    it('git-bash', false, { skipped: true }),
+    it('folder-trust:billing', false),
+    it('holla', false, { required: true }),
+  ]);
+  assert.equal(f.text, '[환경: Claude 버전, Git 없음(건너뜀), billing 폴더 신뢰, holla 없음]');
+  assert.equal(f.highlight, true);
+  assert.match(f.title, /holla: holla 상세 — 조치: holla 조치/);
+  // only an optional failing item → not highlighted
+  assert.equal(envStatusFlag([it('opt', false)]).highlight, false);
+  // labels
+  assert.equal(envItemLabel('git-bash'), 'Git 없음');
+  assert.equal(envItemLabel('folder-trust:a'), 'a 폴더 신뢰');
+  assert.equal(envItemLabel('x'), 'x 없음');
 });

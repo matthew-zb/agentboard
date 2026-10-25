@@ -1,0 +1,35 @@
+{
+  "event": "Notification",
+  "pid": 174404,
+  "ppid": 152424,
+  "env": {
+    "CLAUDE_CODE_MESSAGING_SOCKET": "\\\\.\\pipe\\LOCAL\\cc-msg-7fcf5a21603a22d59b612d3d028f07e3",
+    "CLAUDE_CODE_MESSAGING_TOKEN": "<redacted>",
+    "CLAUDE_PROJECT_DIR": "C:/workspace",
+    "CLAUDE_ENV_FILE": null,
+    "CLAUDE_CODE_SESSION_ID": "<session-id>",
+    "CLAUDE_EFFORT": null
+  },
+  "envNames": [
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_PID",
+    "CLAUDE_PROJECT_DIR"
+  ],
+  "stdin": {
+    "session_id": "<session-id>",
+    "transcript_path": "C:\\Users\\<user>\\.claude\\projects\\C--workspace\\<session-id>.jsonl",
+    "cwd": "C:\\workspace",
+    "scratchpad_dir": "C:\\Users\\<user>\\AppData\\Local\\Temp\\claude\\C--workspace\\<session-id>\\scratchpad",
+    "prompt_id": "<session-id>",
+    "hook_event_name": "Notification",
+    "message": "Claude needs your permission",
+    "notification_type": "permission_prompt"
+  }
+}

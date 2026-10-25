@@ -92,8 +92,20 @@ dispatcher 탭을 분할해 오른쪽에 둔다. 터미널이 아닌 **앱 화�
 ## 5-1. 보이지 않는 창의 주의 표시 [사용자 결정]
 
 - 사용자는 dispatcher 창에 머무르므로, 다른 탭 에이전트가 **권한 승인 대기·질문 대기**로 멈추면 그 **탭에 ⚠ 표시**로 알린다(인박스 항목으로 올리지 않는다).
-- 감지: 1단계 터미널 벨에 더해 Claude Code **Notification hook**(권한 요청·입력 대기)을 앱이 각 세션에 넣어 SetAttention을 정확히 보낸다.
+- 감지: 1단계 터미널 벨에 더해 Claude Code **Notification hook**(권한 요청)을 앱이 각 세션에 넣어 SetAttention을 정확히 보낸다. 권한 요청 알림은 권한 모드에 따라 오지 않을 수 있다(auto 모드에서는 거의 없음 — 스파이크 결과).
+- **사용자 결정이 필요한 에이전트도 탭에 표시 [사용자 결정]**: 에이전트가 사용자의 판단·결정이 필요하면 MCP 도구 `need_user(reason)`을 호출한다(모든 역할 허용). 앱은 그 창에 attention을 켜고 사유를 ⚠ 툴팁·상태 표시줄 목록에 보여 준다. 사용자가 그 창에 포커스하면 해제된다. 역할 지시에 "사용자 결정이 필요하면 질문을 화면에 쓰고 `need_user`를 호출하라"를 넣는다. `idle_prompt` 알림은 상시 에이전트가 쉬는 동안 늘 발생하므로 주의 표시에 쓰지 않는다 **[설계자 판단]**.
 - **탭은 항상 보여야 한다 [사용자 결정]**: dispatcher 화면에서도 모든 탭의 ⚠가 보여야 한다. 그룹이 최대화되어 다른 그룹 탭 바가 가려지면, 상태 표시줄에 ⚠ 탭 목록(`⚠ billing, api`)을 띄운다 **[설계자 판단]**. `Alt+a`로 이동(1단계 기능).
+
+## 5-2. 문서 탭 (마크다운 뷰어) [사용자 결정]
+
+입력 자료·산출물을 md로 많이 쓰므로, mdviewer의 마크다운 뷰어를 **문서 탭**으로 넣는다.
+- 터미널 대신 마크다운 문서를 보여 주는 탭. 탭 이름 = 파일 이름. 읽기 전용.
+- 렌더링: mdviewer와 같은 엔진 — marked, Mermaid, KaTeX, highlight.js. 1단계 원칙대로 CDN 없이 `src/vendor/`에 고정 버전으로 포함.
+- 기능: 목차, 문서 안 검색, **파일 변경 시 자동 새로고침**(에이전트가 산출물을 고치면 반영), 다른 md 링크 따라가기(같은 탭에서, 뒤로 가기), 로컬 이미지.
+- 키보드: `j/k` 스크롤, `g/G` 처음·끝, `/` 검색, `o` 목차, 링크 뒤로/앞으로 `[`/`]` **[설계자 판단]**. 1단계 앱 단축키는 그대로 동작.
+- **여는 길 [사용자 결정]**: ① 인박스 상세에서 이슈 폴더 input/output의 파일 목록 → md 파일 선택 → Enter로 문서 탭 열기, ② 커맨드 팔레트 "문서 열기" → `workspaceRoot` 아래 md 파일 퍼지 검색. **에이전트가 문서 탭을 여는 기능은 두지 않는다.**
+- 새 문서 탭은 현재 포커스된 그룹에 열리고 포커스를 받는다(사용자 동작이므로). 같은 파일이 이미 열려 있으면 그 탭으로 이동.
+- 보안 **[설계자 판단]**: `workspaceRoot` 밖 파일은 열지 않는다. 문서 안 HTML은 정화(sanitize)하고 스크립트는 실행하지 않는다. 외부 링크는 시스템 브라우저로.
 
 ## 6. 이슈 폴더 [사용자 결정]
 
@@ -118,12 +130,15 @@ dispatcher 탭을 분할해 오른쪽에 둔다. 터미널이 아닌 **앱 화�
 ## 8. handover 업무 인덱스 문서 [사용자 결정]
 
 - **포인터만** 담는다. 업무마다 한 줄: 업무 이름, 작업 계획 파일 경로, 진행 내역 파일 경로, 마지막 갱신 시각. 요약·대화 내용 금지.
-- 관리 주체는 handover 에이전트(역할 지시). 앱은 경로만 설정으로 안다(`config.json`의 `handoverIndex`, 기본 `<handover 작업폴더>/INDEX.md` **[설계자 판단]**).
+- 관리 주체는 handover 에이전트(역할 지시). 앱은 경로만 설정으로 안다(`config.json`의 `handoverIndex`, workspaceRoot 기준 상대경로, 기본 `HANDOVER.md` **[설계자 판단]**).
+- **handover의 작업공간은 dispatcher와 같이 루트(`workspaceRoot`)다 [사용자 결정]**. config에서 handover 탭은 `dir: ""`(빈 값 = 루트)로 둔다. 각 Manager의 작업 폴더를 모두 볼 수 있는 위치다.
 
 ## 9. 시작과 자동 실행
 
 - **자동 실행 [사용자 결정]**: PC 로그인 시 AgentBoard 실행. 구현은 HKCU `Run` 레지스트리 키, 설정 화면/팔레트에서 켜고 끔 **[설계자 판단]**.
 - 시작 시 **상시 에이전트만** 띄운다(dispatcher, handover, 각 Manager). 팀 영역은 비어 있음. 모두 새 세션. [사용자 결정]
+- **환경 점검과 dispatcher 설치 안내 [사용자 결정]**: 시작 시 앱이 필요한 도구를 점검한다(처음 항목: Claude Code ≥ 2.1.234, Git for Windows(Git Bash), 각 role 작업 폴더의 Claude Code 신뢰 상태). 결과는 MCP 도구 `env_status()`(모든 역할)로 조회하며, 항목마다 상태·필요 이유·없으면 빠지는 기능·설치/조치 방법을 준다. dispatcher는 시작 리뷰 때 이를 확인하고 빠진 항목을 사용자에게 하나씩 안내한다. **설치·변경 명령은 사용자 승인 후에만** dispatcher가 실행한다. 사용자가 "필요 없다"고 하면 dispatcher가 `env_skip(item)`을 호출해 `config.json`의 `envSkip`에 기록하고, 이후 다시 묻지 않는다. 건너뛴 항목의 기능만 빠지고 앱은 계속 동작하며, 상태 표시줄에 작게 표시한다.
+- **사용자 정의 필수 도구 [사용자 결정]**: 점검 항목은 `config.json`의 `envRequire`로 추가할 수 있다(`{ "id", "check": "<명령>", "fix": "<설치·조치 안내>", "why", "required": true|false }`, check 명령이 종료 코드 0이면 정상, 타임아웃 10초). 기본 설정에 **holla**(`@circlesac/holla`, handover의 슬랙 연동)를 넣는다: check `holla slack version`(설치 + 슬랙 인증 확인), `required: true`. **설치 방식 [사용자 결정]**: 사용자가 GitHub 저장소 주소를 주면 Claude(dispatcher)가 설치한다. 항목에 `source`(저장소 주소) 필드를 두고, 비어 있으면 dispatcher가 사용자에게 주소를 물어 `env_set_source(item, url)`로 config에 기록한 뒤 승인을 받아 설치한다(저장소가 비공개일 수 있으므로 앱은 주소를 기본값으로 넣지 않는다). **required 항목은 건너뛸 수 없다** — `env_skip`이 거부하고, dispatcher는 해결될 때까지 안내를 반복하며 상태 표시줄에 강조 표시한다(회사 업무에 슬랙 연동이 필수).
 - 각 상시 에이전트의 시작 프롬프트: "handover 인덱스(경로)를 읽고 내 작업 계획·진행 내역을 리뷰해 진행 준비하라" + 역할별 추가 지시. handover의 시작 프롬프트에는 `/loop <간격> <확인 작업>`이 들어간다(사용자가 템플릿에서 관리).
 - 앱이 강제 종료·재부팅된 경우에도 같은 시작 절차(문서 기반)로 이어간다.
 - **재부팅 후 팀 자동 재채용 [사용자 결정]**: 재시작 때 팀 창은 띄우지 않는다. 각 Manager는 시작 리뷰 중 `teams/*/brief.md`·`roster.md`에 진행 중인 팀이 있으면 **자동으로 팀 리드를 다시 채용**하고, 팀 리드는 roster대로 팀원을 다시 채용해 brief와 산출물을 보고 이어서 일한다. 완료된 팀은 Manager가 brief에 `상태: 완료`를 적어 재채용 대상에서 뺀다.
@@ -135,12 +150,12 @@ dispatcher 탭을 분할해 오른쪽에 둔다. 터미널이 아닌 **앱 화�
 {
   "tabs": [
     { "name": "dispatcher", "role": "dispatcher", "template": "dispatcher-inbox" },
-    { "name": "handover",   "role": "handover",   "dir": "handover", "template": "handover" },
+    { "name": "handover",   "role": "handover",   "dir": "",         "template": "handover" },
     { "name": "billing",    "role": "manager",    "dir": "billing",  "template": "manager" }
   ],
   "nightlyRefresh": "03:00",
   "nightlyTimeoutMin": 20,
-  "handoverIndex": "handover/INDEX.md",
+  "handoverIndex": "HANDOVER.md",
   "roles": {
     "dispatcher": { "systemPromptFile": "roles/dispatcher.md" },
     "handover":   { "systemPromptFile": "roles/handover.md" },

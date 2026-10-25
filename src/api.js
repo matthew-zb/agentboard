@@ -142,3 +142,92 @@ export function runningCount() {
 export function appExit() {
   return invoke('app_exit');
 }
+
+// ---------------------------------------------------------------- inbox (Task 6 / Task 10)
+
+/** `{version, items}`: every item (done ones too with `showDone`), newest first. */
+export function inboxList(showDone) {
+  return invoke('inbox_list', { showDone: !!showDone });
+}
+
+export function inboxMarkRead(id) {
+  return invoke('inbox_mark_read', { id });
+}
+
+/** close_proposed → done; resolves to a Korean warning (string) when the Manager was not told, else null. */
+export function inboxConfirmDone(id) {
+  return invoke('inbox_confirm_done', { id });
+}
+
+/** Copy files into the item's issue `input|output`; resolves `{files: string[], warning: string|null}`. */
+export function inboxAddFiles(id, paths, target) {
+  return invoke('inbox_add_files', { id, paths, target });
+}
+
+/** Record the user's instruction and relay it to the dispatcher (rejects with a Korean error). */
+export function inboxInstruct(id, text) {
+  return invoke('inbox_instruct', { id, text });
+}
+
+/** Ask (via the dispatcher) the owner Manager to create an issue for the item. */
+export function inboxRequestIssue(id) {
+  return invoke('inbox_request_issue', { id });
+}
+
+/** `{input, output}` file lists (`{name, path, isMd}`) of the item's issue folder. */
+export function inboxIssueFiles(id) {
+  return invoke('inbox_issue_files', { id });
+}
+
+// ---------------------------------------------------------------- document tabs (Task 14)
+
+/** `{text, mtime, rel, path, root}`; the backend validates `path` on every call. */
+export function docRead(path) {
+  return invoke('doc_read', { path });
+}
+
+/** `.md` files under workspaceRoot (relative, `/`), at most 5,000. */
+export function docListMd(query = null) {
+  return invoke('doc_list_md', { query });
+}
+
+/** Poll the document shown in `paneId` (1 s); a change emits `doc-changed {paneId}`. */
+export function docWatch(paneId, path) {
+  return invoke('doc_watch', { paneId, path });
+}
+
+export function docUnwatch(paneId) {
+  return invoke('doc_unwatch', { paneId });
+}
+
+/** http(s) only, opened in the system browser by the backend. */
+export function docOpenUrl(url) {
+  return invoke('doc_open_url', { url });
+}
+
+/** A document image (`src` as written in document `doc`) as a data: URL; validated in Rust. */
+export function docImage(doc, src) {
+  return invoke('doc_image', { doc, src });
+}
+
+// ---------------------------------------------------------------- startup / environment (Task 12)
+
+/** Environment check items (cached; null until the first check after start finished). */
+export function envStatus() {
+  return invoke('env_status');
+}
+
+/** Whether AgentBoard starts at login. */
+export function autostartGet() {
+  return invoke('autostart_get');
+}
+
+/** Turn starting at login on/off; resolves to the new state. */
+export function autostartSet(on) {
+  return invoke('autostart_set', { on: !!on });
+}
+
+/** New-tab wizard "Manager": tab + config.json entry (same path as MCP create_manager_tab). */
+export function createManagerTab(name, dir) {
+  return invoke('create_manager_tab', { name, dir });
+}

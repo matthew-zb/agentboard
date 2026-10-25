@@ -1,8 +1,21 @@
+pub mod agentcfg;
+pub mod attention;
+pub mod autostart;
+pub mod bridge;
 pub mod config;
+pub mod control;
+pub mod docs;
+pub mod envcheck;
+pub mod hookcli;
+pub mod inbox;
+pub mod issues;
 pub mod launcher;
 pub mod layout;
+pub mod mcp_tools;
+pub mod nightly;
 pub mod persist;
 pub mod profiles;
+pub mod roles;
 pub mod workspace;
 pub mod pty;
 pub mod ring;
@@ -34,16 +47,31 @@ pub struct Snapshot {
     pub version: u64,
 }
 
+/// What the launcher pushes out to the frontend. Production: [`AppSink`] (Tauri event +
+/// per-pane output channels); tests record. Both methods are leaves (no app lock taken).
+pub trait Ui: Send + Sync {
+    /// Emit `workspace-changed` with exactly this snapshot.
+    fn workspace_changed(&self, snap: &Snapshot);
+    /// Forget the pane's output channel (pane left the model, or its process is gone).
+    fn drop_channel(&self, id: &str);
+    /// Emit `inbox-changed` (`{"version": n}`) after an inbox mutation (leaf, no app lock).
+    fn inbox_changed(&self, _version: u64) {}
+    /// Emit `doc-changed` (`{"paneId": id}`): the pane's watched document changed (Task 14).
+    fn doc_changed(&self, _pane: &str) {}
+    /// Emit `env-changed` (no payload): environment check results or the skip list changed
+    /// (Task 12; the status bar re-reads `env_status`).
+    fn env_changed(&self) {}
+}
+
 /// Lock order: see the module docs of `launcher`.
 pub struct AppState {
     pub ws: Mutex<Workspace>,
     pub loaded: RwLock<Loaded>,
     pub pty: PtyManager,
-    pub app: AppHandle,
     pub prompts: Mutex<HashMap<PaneId, PromptJob>>,
     /// Queue to the launcher worker thread (`launcher::submit`).
     pub effects: Mutex<mpsc::Sender<Effects>>,
-    pub sink: Arc<AppSink>,
+    pub ui: Arc<dyn Ui>,
     /// Last issued `Snapshot::version`; incremented only while `ws` is held.
     pub version: AtomicU64,
     /// Serializes "versioned snapshot + emit" (order ws -> emit_lock; leaf).
@@ -52,6 +80,130 @@ pub struct AppState {
     pub saver: persist::Saver,
     /// Startup problems outside config files (e.g. a discarded workspace.json), shown in the error list.
     pub startup_errors: Vec<String>,
+    /// Per-pane bearer tokens of role panes (leaf lock inside).
+    pub tokens: agentcfg::Tokens,
+    /// Control server base URL (`http://127.0.0.1:<port>`), set by the control server (Task 5)
+    /// before the initial spawns. `None` → role panes get `agentcfg::PLACEHOLDER_CTRL_URL`.
+    /// Leaf lock.
+    pub ctrl_url: Mutex<Option<String>>,
+    /// Where role panes' run files go (`%APPDATA%/agentboard/run`).
+    pub run_dir: std::path::PathBuf,
+    /// Hook event handlers of the control server (Tasks 7·10 register). Leaf lock.
+    pub hooks: control::HookRouter,
+    /// Nightly refresh (Task 11): state machine (leaf lock) + scheduler wake/stop signals.
+    pub nightly: nightly::Runtime,
+    /// Inbox store (`<workspaceRoot>/.agentboard/inbox`); its lock is a leaf (+ its own emit
+    /// lock), see `inbox` module docs.
+    pub inbox: inbox::Inbox,
+    /// App → session messages (Task 7): session registrations + per-pane queues; leaf locks.
+    pub bridge: bridge::Bridge,
+    /// Last real keystroke per pane (`pty_write`, R4). Leaf lock. Task 11 reads it too.
+    pub last_input: Mutex<HashMap<PaneId, std::time::Instant>>,
+    /// Folder-trust timers of role panes per spawn generation (Task 9, `attention`). Leaf lock.
+    pub trust: Mutex<HashMap<PaneId, attention::Trust>>,
+    /// Watched documents of document panes (Task 14). Leaf lock.
+    pub docs: docs::DocWatch,
+    /// Environment check probe results (Task 12, `envcheck`). Leaf locks.
+    pub env: envcheck::EnvCache,
+}
+
+impl AppState {
+    pub fn new(
+        ws: Workspace,
+        loaded: Loaded,
+        pty: PtyManager,
+        ui: Arc<dyn Ui>,
+        effects: mpsc::Sender<Effects>,
+        saver: persist::Saver,
+        mut startup_errors: Vec<String>,
+        run_dir: std::path::PathBuf,
+    ) -> Self {
+        // unreadable item files are skipped and listed with the startup errors (file names only)
+        let inbox_dir = loaded.settings.workspace_root.join(".agentboard").join("inbox");
+        let emit_ui = ui.clone();
+        let (inbox, inbox_errors) = inbox::Inbox::load(inbox_dir, Arc::new(move |v| emit_ui.inbox_changed(v)));
+        startup_errors.extend(inbox_errors);
+        let hooks = control::HookRouter::new();
+        bridge::register_hooks(&hooks);
+        attention::register_hooks(&hooks); // after the bridge: wraps its SessionStart
+        AppState {
+            ws: Mutex::new(ws),
+            loaded: RwLock::new(loaded),
+            pty,
+            prompts: Mutex::new(HashMap::new()),
+            effects: Mutex::new(effects),
+            ui,
+            version: AtomicU64::new(0),
+            emit_lock: Mutex::new(()),
+            saver,
+            startup_errors,
+            tokens: agentcfg::Tokens::new(),
+            ctrl_url: Mutex::new(None),
+            run_dir,
+            hooks,
+            nightly: nightly::Runtime::new(),
+            inbox,
+            bridge: bridge::Bridge::new(),
+            last_input: Mutex::new(HashMap::new()),
+            trust: Mutex::new(HashMap::new()),
+            docs: docs::DocWatch::new(),
+            env: envcheck::EnvCache::new(),
+        }
+    }
+}
+
+/// Per-pane frontend output channels. The map lock is taken before the `panes` lock
+/// (`channels -> panes`, in `remove_if_current`) and nothing else is acquired under it.
+pub struct ChannelMap<C> {
+    map: Mutex<HashMap<String, C>>,
+}
+
+impl<C> Default for ChannelMap<C> {
+    fn default() -> Self {
+        ChannelMap { map: Mutex::new(HashMap::new()) }
+    }
+}
+
+impl<C> ChannelMap<C> {
+    pub fn insert(&self, id: &str, ch: C) {
+        self.map.lock().unwrap().insert(id.to_string(), ch);
+    }
+
+    pub fn remove(&self, id: &str) {
+        self.map.lock().unwrap().remove(id);
+    }
+
+    /// Hand the pane's channel to `send`; a `false` result (frontend gone) drops the channel.
+    pub fn deliver(&self, id: &str, send: impl FnOnce(&C) -> bool) {
+        let mut m = self.map.lock().unwrap();
+        if let Some(ch) = m.get(id) {
+            if !send(ch) {
+                m.remove(id);
+            }
+        }
+    }
+
+    /// Drop the channel only if `gen` is still the id's current generation. The check and the
+    /// removal happen under the map lock, and a newer generation's channel can only be
+    /// inserted (`pty_attach`) after that generation is registered — so an old process's exit
+    /// never drops a respawned pane's channel. Returns whether `gen` was current (the caller
+    /// then announces the exit).
+    pub fn remove_if_current(&self, id: &str, gen: u64, pty: &PtyManager) -> bool {
+        let mut m = self.map.lock().unwrap();
+        if pty.current_gen(id) != Some(gen) {
+            return false;
+        }
+        m.remove(id);
+        true
+    }
+
+    #[cfg(test)]
+    fn get(&self, id: &str) -> Option<C>
+    where
+        C: Clone,
+    {
+        self.map.lock().unwrap().get(id).cloned()
+    }
 }
 
 /// Delivers PTY output to the attached frontend channel as raw binary and forwards
@@ -59,59 +211,91 @@ pub struct AppState {
 /// and runs the registration under its flush lock (see `PtyManager::attach_with`).
 pub struct AppSink {
     app: AppHandle,
-    channels: Mutex<HashMap<String, Channel<InvokeResponseBody>>>,
+    channels: ChannelMap<Channel<InvokeResponseBody>>,
 }
 
 #[derive(Clone, Serialize)]
 struct ExitPayload {
     id: String,
+    gen: u64,
     code: i32,
 }
 
 impl AppSink {
     fn new(app: AppHandle) -> Self {
-        AppSink { app, channels: Mutex::new(HashMap::new()) }
-    }
-
-    /// Forget the pane's output channel (the pane left the model). `channels` is a leaf lock.
-    pub(crate) fn drop_channel(&self, id: &str) {
-        self.channels.lock().unwrap().remove(id);
+        AppSink { app, channels: ChannelMap::default() }
     }
 }
 
+impl Ui for AppSink {
+    fn workspace_changed(&self, snap: &Snapshot) {
+        let _ = self.app.emit(launcher::WORKSPACE_CHANGED, snap);
+    }
+
+    fn drop_channel(&self, id: &str) {
+        self.channels.remove(id);
+    }
+
+    fn inbox_changed(&self, version: u64) {
+        let _ = self.app.emit(inbox::INBOX_CHANGED, inbox::InboxChanged { version });
+    }
+
+    fn doc_changed(&self, pane: &str) {
+        let _ = self.app.emit(docs::DOC_CHANGED, DocChanged { pane_id: pane.to_string() });
+    }
+
+    fn env_changed(&self) {
+        let _ = self.app.emit(ENV_CHANGED, ());
+    }
+}
+
+/// Event: environment check results / skip list changed (Task 12).
+pub const ENV_CHANGED: &str = "env-changed";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocChanged {
+    pane_id: String,
+}
+
 impl PtySink for AppSink {
-    // Runs under the pane's flush lock: flush_lock -> prompts, flush_lock -> channels.
-    fn output(&self, id: &str, bytes: &[u8]) {
+    // Runs under the pane's flush lock: flush_lock -> panes map (current_gen),
+    // flush_lock -> prompts, flush_lock -> channels. Stale generations are dropped.
+    fn output(&self, id: &str, gen: u64, bytes: &[u8]) {
         if let Some(state) = self.app.try_state::<AppState>() {
-            launcher::on_output(&state, id, bytes);
-        }
-        let mut chs = self.channels.lock().unwrap();
-        if let Some(ch) = chs.get(id) {
-            if ch.send(InvokeResponseBody::Raw(bytes.to_vec())).is_err() {
-                chs.remove(id);
+            if !launcher::on_output(&state, id, gen, bytes) {
+                return;
             }
         }
+        self.channels.deliver(id, |ch| ch.send(InvokeResponseBody::Raw(bytes.to_vec())).is_ok());
     }
 
     // Runs on the pane's waiter thread with no PTY lock held.
-    fn exited(&self, id: &str, code: i32) {
-        if let Some(state) = self.app.try_state::<AppState>() {
-            if !launcher::on_exited(&state, id, code) {
-                return; // stale: a restarted process already owns this id
-            }
+    fn exited(&self, id: &str, gen: u64, code: i32) {
+        let Some(state) = self.app.try_state::<AppState>() else { return };
+        if !launcher::on_exited(&state, id, gen, code) {
+            return; // stale: the id belongs to a newer spawn (or none) — keep its channel
         }
-        self.channels.lock().unwrap().remove(id);
-        let _ = self.app.emit("pty-exit", ExitPayload { id: id.to_string(), code });
+        // Re-checked under the channel lock: a restart may have registered (and attached) a
+        // newer generation since `on_exited` released `ws`.
+        if self.channels.remove_if_current(id, gen, &state.pty) {
+            let _ = self.app.emit("pty-exit", ExitPayload { id: id.to_string(), gen, code });
+        }
     }
 }
 
 #[tauri::command]
-fn pty_attach(state: State<'_, AppState>, pane: String, channel: Channel<InvokeResponseBody>) -> Result<Response, String> {
+fn pty_attach(
+    state: State<'_, AppState>,
+    sink: State<'_, Arc<AppSink>>,
+    pane: String,
+    channel: Channel<InvokeResponseBody>,
+) -> Result<Response, String> {
     let mut snap = Vec::new();
-    // snapshot + subscribe under PtyManager's flush lock: no loss, no duplicates
+    // snapshot + subscribe under PtyManager's flush lock (current generation): no loss, no duplicates
     let known = state.pty.attach_with(&pane, |s| {
         snap = s;
-        state.sink.channels.lock().unwrap().insert(pane.clone(), channel);
+        sink.channels.insert(&pane, channel);
     });
     if !known {
         return Err(format!("프로세스가 없는 창입니다: {pane}"));
@@ -121,6 +305,8 @@ fn pty_attach(state: State<'_, AppState>, pane: String, channel: Channel<InvokeR
 
 #[tauri::command]
 fn pty_write(state: State<'_, AppState>, pane: String, data: String) -> Result<(), String> {
+    // real keystrokes only (R4): the bridge's PTY fallback and Task 11's quiet check use it
+    bridge::note_input(&state, &pane);
     state.pty.write(&pane, data.as_bytes())
 }
 
@@ -129,17 +315,11 @@ fn pty_resize(state: State<'_, AppState>, pane: String, cols: u16, rows: u16) ->
     state.pty.resize(&pane, cols, rows)
 }
 
-/// Apply a model command; spawn/kill effects run on the launcher worker afterwards
-/// (statuses then arrive through `workspace-changed`).
+/// Apply a model command (`launcher::execute`); spawn/kill effects run on the launcher worker
+/// afterwards (statuses then arrive through `workspace-changed`).
 #[tauri::command]
 fn ws_command(state: State<'_, AppState>, cmd: WsCommand) -> Result<Snapshot, String> {
-    let fx = {
-        let mut ws = state.ws.lock().unwrap();
-        let loaded = state.loaded.read().unwrap();
-        ws.apply(cmd, &loaded)?
-    };
-    launcher::submit(&state, fx);
-    Ok(launcher::publish(&state))
+    launcher::execute(&state, cmd)
 }
 
 #[tauri::command]
@@ -160,6 +340,9 @@ fn get_keybindings(state: State<'_, AppState>) -> BTreeMap<String, String> {
 #[tauri::command]
 fn get_passthrough(state: State<'_, AppState>, pane: String) -> Vec<String> {
     let Some(p) = state.ws.lock().unwrap().pane_by_id(&pane).cloned() else { return Vec::new() };
+    if p.kind.is_applet() {
+        return Vec::new(); // no terminal, no profile
+    }
     let loaded = state.loaded.read().unwrap();
     launcher::profile_for(&p, &loaded).map(|prof| prof.passthrough_keys.clone()).unwrap_or_default()
 }
@@ -220,10 +403,310 @@ fn app_exit(app: AppHandle, state: State<'_, AppState>) {
     app.exit(0);
 }
 
+/// Inbox applet (Task 10): items newest first (done ones only with `show_done`) + version.
+#[tauri::command]
+fn inbox_list(state: State<'_, AppState>, show_done: bool) -> inbox::InboxList {
+    inbox_list_with_owners(&state, show_done)
+}
+
+/// `inbox_list` plus the owners that have no tab any more (R29, review #9). `ws` is read and
+/// released before the inbox is called.
+fn inbox_list_with_owners(state: &AppState, show_done: bool) -> inbox::InboxList {
+    let known: std::collections::BTreeSet<String> = {
+        let ws = state.ws.lock().unwrap();
+        ws.tabs.values().filter(|t| bridge::owner_session_in(&ws, &t.name).is_some()).map(|t| t.name.clone()).collect()
+    };
+    let mut l = state.inbox.list(show_done);
+    let unknown: std::collections::BTreeSet<String> =
+        l.items.iter().filter(|i| !known.contains(&i.owner_name)).map(|i| i.owner_name.clone()).collect();
+    l.unknown_owners = unknown.into_iter().collect();
+    l
+}
+
+#[tauri::command]
+fn inbox_get(state: State<'_, AppState>, id: String) -> Result<inbox::InboxItem, String> {
+    state.inbox.get(&id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))
+}
+
+#[tauri::command]
+fn inbox_mark_read(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.inbox.mark_read(&id)
+}
+
+/// The user confirms a proposed close (`close_proposed` → `done`) and the owner Manager is told
+/// via the dispatcher. Returns a Korean warning when that notice could not be queued.
+#[tauri::command]
+fn inbox_confirm_done(state: State<'_, AppState>, id: String) -> Result<Option<String>, String> {
+    bridge::confirm_done(&state, &id)
+}
+
+/// The user's instruction for an item: recorded (state → in_progress) and relayed to the
+/// dispatcher, which passes it to the owner Manager. Err (Korean) when the dispatcher is not
+/// running, the text is empty/too long, or the item is done.
+#[tauri::command]
+fn inbox_instruct(state: State<'_, AppState>, id: String, text: String) -> Result<(), String> {
+    bridge::relay_instruct(&state, &id, &text)
+}
+
+/// Ask (via the dispatcher) the owner Manager to create an issue for the item.
+#[tauri::command]
+fn inbox_request_issue(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    bridge::relay_issue_request(&state, &id)
+}
+
+/// Result of `inbox_add_files`: the copied files and, when the dispatcher could not be told,
+/// a Korean warning (the files stay copied).
+#[derive(serde::Serialize)]
+struct AddFilesResult {
+    files: Vec<String>,
+    warning: Option<String>,
+}
+
+/// Copy files into the item's issue `input/` or `output/` (never overwriting); returns the new
+/// files. Runs on a blocking thread (copies may be large).
+#[tauri::command]
+async fn inbox_add_files(
+    app: AppHandle,
+    id: String,
+    paths: Vec<String>,
+    target: inbox::Target,
+) -> Result<AddFilesResult, String> {
+    let paths: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
+    let (id2, app2) = (id.clone(), app.clone());
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let app = app2;
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        let owner = state.inbox.get(&id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))?.owner_name;
+        // ws taken and released here; the inbox is called without it
+        let workspace = mcp_tools::owner_workspace(&state, &owner)?;
+        state.inbox.add_files(&id, &paths, target, &workspace)
+    })
+    .await
+    .map_err(|e| format!("파일 복사 작업이 중단되었습니다 — {e}"))??;
+    let files: Vec<String> = res.into_iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    // spec §5: the owner Manager hears about the new files through the dispatcher
+    let warning = match app.try_state::<AppState>() {
+        Some(state) => bridge::notify_files_saved(&state, &id2, &files).err(),
+        None => Some("앱 상태가 아직 준비되지 않았습니다".into()),
+    }
+    .map(|e| format!("파일은 복사했지만 담당 Manager에게 알리지 못했습니다 — {e}"));
+    Ok(AddFilesResult { files, warning })
+}
+
+// ───────── document tabs (Task 14) ─────────
+
+fn workspace_root(state: &AppState) -> std::path::PathBuf {
+    state.loaded.read().unwrap().settings.workspace_root.clone()
+}
+
+/// Read a document (`path`: absolute or relative to workspaceRoot). Validated on every call
+/// (`docs::resolve_doc`): an existing `.md` inside workspaceRoot after resolving links.
+#[tauri::command]
+async fn doc_read(app: AppHandle, path: String) -> Result<docs::DocText, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        docs::read_doc(&workspace_root(&state), &path)
+    })
+    .await
+    .map_err(|e| format!("문서를 읽는 작업이 중단되었습니다 — {e}"))?
+}
+
+/// `.md` files under workspaceRoot (relative, `/`), excluding `.agentboard`, `node_modules`,
+/// `.git`, `target`; at most 5,000.
+#[tauri::command]
+async fn doc_list_md(app: AppHandle, query: Option<String>) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        Ok(docs::list_md(&workspace_root(&state), query.as_deref(), docs::LIST_MAX))
+    })
+    .await
+    .map_err(|e| format!("문서 목록 작업이 중단되었습니다 — {e}"))?
+}
+
+/// Watch the document a document pane shows (replaces its previous one). The watcher thread
+/// polls mtimes every second and emits `doc-changed {paneId}`. Runs on a blocking thread
+/// (canonicalize can be slow on a network share — review #12).
+#[tauri::command]
+async fn doc_watch(app: AppHandle, pane_id: String, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        doc_watch_blocking(&state, pane_id, path)
+    })
+    .await
+    .map_err(|e| format!("문서 감시 작업이 중단되었습니다 — {e}"))?
+}
+
+fn doc_watch_blocking(state: &AppState, pane_id: String, path: String) -> Result<(), String> {
+    // ws taken and released; then loaded(read), released; then the watch map (leaf)
+    let is_doc = state.ws.lock().unwrap().pane_by_id(&pane_id).is_some_and(|p| p.kind.is_doc());
+    if !is_doc {
+        return Err(format!("문서 창이 아닙니다: {pane_id}"));
+    }
+    // a document missing right now is still watched (inside the root), so it reloads once created
+    let abs = docs::resolve_watch_path(&workspace_root(state), &path)?;
+    let mtime = docs::mtime_of(&abs);
+    state.docs.watch(&pane_id, abs, mtime);
+    // the pane may have closed (and been unwatched by run_effects) since the check above:
+    // re-check after inserting so no orphan entry stays polled (locks taken one at a time)
+    let alive = state.ws.lock().unwrap().pane_by_id(&pane_id).is_some();
+    if !alive {
+        state.docs.unwatch(&pane_id);
+    }
+    Ok(())
+}
+
+/// An image of a document as a `data:` URL. `src` is validated lexically before any file
+/// system call (`docs::check_image_src`: no UNC / device / drive / absolute paths), then
+/// resolved against the document's folder and prefix-checked against the canonical
+/// workspaceRoot (`docs::resolve_image`). Replaces the asset protocol (fix round 1, R23).
+#[tauri::command]
+async fn doc_image(app: AppHandle, doc: String, src: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        docs::read_image(&workspace_root(&state), &doc, &src)
+    })
+    .await
+    .map_err(|e| format!("이미지를 읽는 작업이 중단되었습니다 — {e}"))?
+}
+
+#[tauri::command]
+fn doc_unwatch(state: State<'_, AppState>, pane_id: String) {
+    state.docs.unwatch(&pane_id);
+}
+
+/// An http(s) link of a document → the system browser (opener plugin's Rust API; the frontend
+/// gets no opener capability). Anything else is refused.
+#[tauri::command]
+fn doc_open_url(url: String) -> Result<(), String> {
+    let url = docs::check_external_url(&url)?;
+    tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| format!("브라우저를 열 수 없습니다 — {e}"))
+}
+
+/// Files of the inbox item's issue folder (`input/`, `output/`), for the inbox detail. The
+/// folder is re-derived and checked with `issues::resolve` (stored paths are not trusted).
+/// Runs on a blocking thread (canonicalize + read_dir — review #12).
+#[tauri::command]
+async fn inbox_issue_files(app: AppHandle, id: String) -> Result<docs::IssueFiles, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        let item = state.inbox.get(&id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))?;
+        let Some(issue) = item.issue else { return Ok(docs::IssueFiles::default()) };
+        let workspace = mcp_tools::owner_workspace(&state, &item.owner_name)?;
+        docs::issue_files(&issues::resolve(&workspace, &issue)?)
+    })
+    .await
+    .map_err(|e| format!("이슈 파일 목록 작업이 중단되었습니다 — {e}"))?
+}
+
+/// The document watcher thread: one `poll` per second; changed panes get `doc-changed`.
+fn start_doc_watcher(app: AppHandle) {
+    let _ = std::thread::Builder::new().name("doc-watch".into()).spawn(move || loop {
+        std::thread::sleep(docs::POLL_INTERVAL);
+        let Some(state) = app.try_state::<AppState>() else { continue };
+        if state.docs.is_empty() {
+            continue;
+        }
+        for pane in state.docs.poll(docs::mtime_of) {
+            state.ui.doc_changed(&pane);
+        }
+    });
+}
+
+// ───────── startup · autostart · environment (Task 12) ─────────
+
+/// Environment check items from the cached probe results (status bar); `None` until the first
+/// check after start finished (`env-changed` follows). Never runs the probes itself.
+#[tauri::command]
+fn env_status(state: State<'_, AppState>) -> Option<Vec<envcheck::EnvItem>> {
+    envcheck::current(&state)
+}
+
+/// Whether AgentBoard starts at login (HKCU Run value).
+#[tauri::command]
+fn autostart_get() -> Result<bool, String> {
+    autostart::is_enabled()
+}
+
+/// Turn starting at login on/off; returns the new state.
+#[tauri::command]
+fn autostart_set(on: bool) -> Result<bool, String> {
+    if on {
+        autostart::enable()?;
+    } else {
+        autostart::disable()?;
+    }
+    autostart::is_enabled()
+}
+
+/// New-tab wizard, role "Manager": same path as MCP `create_manager_tab` (config.json entry,
+/// so it survives a restart), but the tab opens in the focused group with the focus.
+#[tauri::command]
+async fn create_manager_tab(app: AppHandle, name: String, dir: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        mcp_tools::create_manager_tab_ui(&state, name, dir)
+    })
+    .await
+    .map_err(|e| format!("탭을 만드는 작업이 중단되었습니다 — {e}"))?
+}
+
+/// Restore a loaded workspace.json (spec §9 rules, `persist::restore_plan`; config role tabs
+/// that could not be added become startup errors). A plan that does not validate (e.g. a
+/// hand-edited file) falls back to a fresh start from config with a startup error; the file is
+/// first moved to `workspace.json.bak` — if that fails, `saving` is turned off so the saved
+/// layout is never overwritten.
+fn restore_or_fresh(
+    ws: Workspace,
+    loaded: &Loaded,
+    ws_path: &std::path::Path,
+    saving: &mut bool,
+    startup_errors: &mut Vec<String>,
+    restored: &mut bool,
+) -> (Workspace, Effects) {
+    let (mut ws, fx, errors) = persist::restore_plan(ws, loaded);
+    match ws.normalize_and_validate() {
+        Ok(()) => {
+            startup_errors.extend(errors);
+            *restored = true;
+            (ws, fx)
+        }
+        Err(e) => {
+            eprintln!("[agentboard] 복원 규칙 적용 실패: {e}");
+            match persist::move_to_bak(ws_path) {
+                Ok(()) => startup_errors.push(format!(
+                    "저장된 작업 상태를 복원할 수 없어 초기 배치로 시작했습니다(원본은 workspace.json.bak) — {e}"
+                )),
+                Err(be) => {
+                    *saving = false;
+                    startup_errors.push(format!(
+                        "저장된 작업 상태를 복원할 수 없어 초기 배치로 시작했습니다. 이번 실행의 변경 사항은 저장되지 않습니다 — {e} ({be})"
+                    ));
+                }
+            }
+            let ws = Workspace::from_config(loaded);
+            let fx = launcher::initial_effects(&ws);
+            (ws, fx)
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // R30 / final review #4: registered first — a second launch (autostart + shortcut,
+        // installer relaunch) hands over to the running instance, which shows and focuses its
+        // window, and exits before restoring a second set of role sessions. The `--hook` CLI
+        // mode never gets here (main.rs returns before `run`), so hooks keep working.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_clipboard_manager::init())
+        // the main WebView never leaves the app (document links, image maps, …): fix round 1
+        .plugin(webview::nav_guard())
         .invoke_handler(tauri::generate_handler![
             pty_attach,
             pty_write,
@@ -240,6 +723,24 @@ pub fn run() {
             missing_dirs,
             running_count,
             app_exit,
+            inbox_list,
+            inbox_get,
+            inbox_mark_read,
+            inbox_confirm_done,
+            inbox_add_files,
+            inbox_instruct,
+            inbox_request_issue,
+            inbox_issue_files,
+            doc_read,
+            doc_list_md,
+            doc_watch,
+            doc_unwatch,
+            doc_open_url,
+            doc_image,
+            env_status,
+            autostart_get,
+            autostart_set,
+            create_manager_tab,
         ])
         .setup(|app| {
             // load_all = load_settings + ensure_dotdir (incl. powershell profile) + load
@@ -248,11 +749,10 @@ pub fn run() {
             let ws_path = appdata.join("workspace.json");
             let mut startup_errors = Vec::new();
             let mut saving = true;
+            // tab ids are trustworthy for the legacy inbox migration only in a restored layout
+            let mut restored = false;
             let (ws, initial) = match persist::load(&ws_path) {
-                Ok(Some(mut ws)) => {
-                    let fx = persist::prepare_restored(&mut ws);
-                    (ws, fx)
-                }
+                Ok(Some(ws)) => restore_or_fresh(ws, &loaded, &ws_path, &mut saving, &mut startup_errors, &mut restored),
                 Ok(None) => {
                     let ws = Workspace::from_config(&loaded);
                     let fx = launcher::initial_effects(&ws);
@@ -281,21 +781,52 @@ pub fn run() {
             let sink = Arc::new(AppSink::new(app.handle().clone()));
             let pty = PtyManager::new(sink.clone());
             let (tx, rx) = mpsc::channel();
-            app.manage(AppState {
-                ws: Mutex::new(ws),
-                loaded: RwLock::new(loaded),
-                pty,
-                app: app.handle().clone(),
-                prompts: Mutex::new(HashMap::new()),
-                effects: Mutex::new(tx),
-                sink,
-                version: AtomicU64::new(0),
-                emit_lock: Mutex::new(()),
-                saver,
-                startup_errors,
-            });
+            app.manage(sink.clone()); // pty_attach registers output channels on it
+            // control server: bound before AppState exists (a failure becomes a startup error),
+            // serving + ctrl_url before the initial spawns so role panes get the real URL
+            let listener = match tauri::async_runtime::block_on(control::bind()) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    eprintln!("[agentboard] 제어 서버 시작 실패: {e}");
+                    startup_errors.push(format!(
+                        "제어 서버를 시작할 수 없습니다: {e} — 역할 에이전트의 MCP 도구와 hook 보고가 동작하지 않습니다"
+                    ));
+                    None
+                }
+            };
+            app.manage(AppState::new(ws, loaded, pty, sink, tx, saver, startup_errors, agentcfg::default_run_dir()));
+            {
+                // R29: items written before name-keyed ownership carry a tab id; map it once
+                let state = app.state::<AppState>();
+                let ws = state.ws.lock().unwrap().clone();
+                let errs = state.inbox.migrate_legacy_owners(|tab, name| legacy_owner(&ws.tabs, restored, tab, name));
+                for e in errs {
+                    eprintln!("[agentboard] 인박스 항목 이전 실패: {e}");
+                }
+            }
+            if let Some(listener) = listener {
+                let handle = app.handle().clone();
+                if let Err(e) = tauri::async_runtime::block_on(control::serve_on(handle, listener)) {
+                    eprintln!("[agentboard] 제어 서버 시작 실패: {e}");
+                }
+            }
+            // app → session messages: delivered off the hook/command threads
+            bridge::start_worker(app.handle().clone());
+            // document tabs: mtime polling (Task 14)
+            start_doc_watcher(app.handle().clone());
+            // nightly refresh scheduler (Task 11); last run date in %APPDATA%/agentboard/nightly.json
+            nightly::start(app.handle().clone(), appdata.join(nightly::FILE_NAME));
             // spawning happens on the launcher thread: window creation is not blocked
             launcher::start(app.handle(), rx, initial);
+            // environment check (Task 12): probes run off the UI thread; `env-changed` when done
+            let handle = app.handle().clone();
+            let _ = std::thread::Builder::new().name("envcheck".into()).spawn(move || {
+                if let Some(state) = handle.try_state::<AppState>() {
+                    let items = envcheck::refresh(&state);
+                    let bad: Vec<&str> = items.iter().filter(|i| !i.ok).map(|i| i.id.as_str()).collect();
+                    eprintln!("[agentboard] envcheck: items={} failing={bad:?}", items.len());
+                }
+            });
 
             if let Some(w) = app.get_webview_window("main") {
                 webview::disable_browser_accelerators(&w);
@@ -312,8 +843,30 @@ pub fn run() {
                     state.saver.flush();
                 }
             }
+            // only on the real exit: an ExitRequested may be vetoed (Task 17) and the app goes on
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.nightly.stop(); // the scheduler thread ends at its next wake
+                }
+            }
         });
 }
+
+/// Owner name of a pre-R29 inbox item that stored tab id `tab` and name `name`: the stored name
+/// when a role tab still has it; otherwise the current name of tab `tab` — but only when the
+/// layout was restored from workspace.json (a fresh start renumbers tab ids, so an id could
+/// name another Manager). `None` = keep the stored name (owner unknown, dispatcher only).
+fn legacy_owner(tabs: &TabMap, restored: bool, tab: &str, name: &str) -> Option<String> {
+    if tabs.values().any(|t| t.name == name && t.role.is_some()) {
+        return Some(name.to_string());
+    }
+    if !restored {
+        return None;
+    }
+    tabs.get(tab).filter(|t| t.role.is_some()).map(|t| t.name.clone())
+}
+
+type TabMap = std::collections::BTreeMap<crate::workspace::TabId, crate::workspace::Tab>;
 
 /// `%APPDATA%/agentboard` (settings.json, workspace.json) — not Tauri's identifier-based dir.
 pub fn appdata_dir() -> std::path::PathBuf {
@@ -322,6 +875,83 @@ pub fn appdata_dir() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
     #[test]
     fn it_builds() {}
+
+    /// R29 legacy migration: the stored name wins; a tab id is trusted only in a restored
+    /// layout (a fresh start renumbers ids); otherwise the owner stays unknown.
+    #[test]
+    fn legacy_inbox_owner_mapping() {
+        let mut tabs = TabMap::new();
+        let mut tab = |id: &str, name: &str, role: Option<crate::roles::Role>| {
+            let t = crate::workspace::Tab {
+                id: id.into(),
+                name: name.into(),
+                dir: name.into(),
+                template: "solo".into(),
+                is_dispatcher: false,
+                workspace: std::path::PathBuf::from(name),
+                layout: crate::layout::LayoutNode::Leaf("p".into()),
+                last_focused_pane_id: "p".into(),
+                maximized_pane_id: None,
+                sync_input: false,
+                role,
+                team_seq: Default::default(),
+            };
+            tabs.insert(id.into(), t);
+        };
+        use crate::roles::Role::Manager;
+        tab("t2", "billing", Some(Manager));
+        tab("t5", "ops", Some(Manager));
+        tab("t7", "notes", None);
+        assert_eq!(legacy_owner(&tabs, false, "t5", "billing").as_deref(), Some("billing"), "name still exists");
+        assert_eq!(legacy_owner(&tabs, false, "t5", "renamed"), None, "fresh start: ids are not trusted");
+        assert_eq!(legacy_owner(&tabs, true, "t5", "renamed").as_deref(), Some("ops"), "restored: id → current name");
+        assert_eq!(legacy_owner(&tabs, true, "t7", "renamed"), None, "not a role tab");
+        assert_eq!(legacy_owner(&tabs, true, "t9", "renamed"), None, "gone");
+    }
+
+    struct NullSink;
+    impl PtySink for NullSink {
+        fn output(&self, _: &str, _: u64, _: &[u8]) {}
+        fn exited(&self, _: &str, _: u64, _: i32) {}
+    }
+
+    fn cmd(args: &[&str]) -> pty::SpawnSpec {
+        pty::SpawnSpec {
+            cmd: "cmd.exe".into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            env: vec![],
+            env_remove: vec![],
+            cwd: std::env::current_dir().unwrap(),
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    #[test]
+    fn stale_exit_keeps_new_generation_channel() {
+        let pty = PtyManager::new_per_child_job(Arc::new(NullSink));
+        let chs: ChannelMap<&str> = ChannelMap::default();
+        let g1 = pty.spawn("c", cmd(&["/c", "exit 0"])).unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        while pty.is_running("c") && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        chs.insert("c", "gen1-channel");
+        // restart: gen2 registered and attached before gen1's exited is delivered
+        let g2 = pty.spawn("c", cmd(&[])).unwrap();
+        chs.insert("c", "gen2-channel");
+        assert!(!chs.remove_if_current("c", g1, &pty), "stale exit must not drop (and so not emit pty-exit)");
+        assert_eq!(chs.get("c"), Some("gen2-channel"));
+        // the current generation's exit drops its channel
+        assert!(chs.remove_if_current("c", g2, &pty));
+        assert_eq!(chs.get("c"), None);
+        // unknown ids: nothing to drop, not current
+        assert!(!chs.remove_if_current("nope", g2, &pty));
+        pty.remove("c");
+    }
 }

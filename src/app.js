@@ -50,9 +50,15 @@ import {
   showErrors,
   toast,
   newTabWizard,
+  promptText,
+  choose,
+  pickDoc,
 } from './overlays.js';
+import { mountInbox, configureInbox } from './inbox.js';
+import { mountDoc, configureDocView } from './docview.js';
 import { configureCopyMode, toggleCopyMode, copyActive, pruneCopySessions } from './copy-ui.js';
-import { pickCommands, paletteItems, missingDirsFlow, closeFlow } from './overlay-logic.js';
+import { pickCommands, paletteItems, missingDirsFlow, closeFlow, envStatusFlag } from './overlay-logic.js';
+import { hiddenAttentionTabs, statusEntryText } from './attention-logic.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -178,10 +184,21 @@ async function pick(kind) {
   });
 }
 
-function openPalette() {
+async function openPalette() {
   if (!current || overlayOpen()) return;
-  const items = paletteItems(current.workspace, { bindings, has: hasCommand });
+  // login autostart state for its entry (unknown → no entry)
+  const autostart = await api.autostartGet().catch(() => null);
+  if (!current || overlayOpen()) return;
+  const items = paletteItems(current.workspace, { bindings, has: hasCommand, autostart });
   return palette(items.map((it) => ({ label: it.label, hint: it.hint, run: () => runPaletteAction(it.action) })));
+}
+
+/** Palette "로그인 시 자동 실행 켜기/끄기" (HKCU Run value). */
+function setAutostart(on) {
+  return api.autostartSet(on).then(
+    (now) => toast(now ? '로그인 시 자동 실행을 켰습니다' : '로그인 시 자동 실행을 껐습니다', 'info'),
+    showError,
+  );
 }
 
 function runPaletteAction(a) {
@@ -197,9 +214,33 @@ function runPaletteAction(a) {
     case 'sidebar':
       toggleSidebar();
       return undefined;
+    case 'openDoc':
+      return openDocPicker();
+    case 'autostart':
+      return setAutostart(a.on);
     default:
       return undefined;
   }
+}
+
+// ---------------------------------------------------------------- document tabs (Task 14)
+
+/** OpenDoc (user action: the new or existing document tab takes the focus). */
+function openDoc(path) {
+  enqueue(() => execute([{ type: 'openDoc', path, group: null }]));
+}
+
+/** Palette "문서 열기": workspace .md files → fuzzy pick → OpenDoc. */
+async function openDocPicker() {
+  let paths;
+  try {
+    paths = await api.docListMd();
+  } catch (err) {
+    showError(err);
+    return;
+  }
+  const path = await pickDoc(Array.isArray(paths) ? paths : []);
+  if (path) openDoc(path);
 }
 
 async function renameTab(tabId) {
@@ -335,7 +376,7 @@ export function render(snap) {
   const focusedId = focusedPaneId(ws);
   const groupOf = tabGroups(ws);
   for (const pane of Object.values(ws.panes)) {
-    syncPane(pane, { group: groupOf[pane.tab] ?? null, tab: pane.tab, focused: pane.id === focusedId });
+    syncPane(pane, { group: groupOf[pane.tab] ?? null, tab: pane.tab, focused: pane.id === focusedId, attention: !!pane.attention });
   }
 
   const groupsEl = $('groups');
@@ -375,6 +416,7 @@ function selectTab(ws, group, tab) {
 function renderStatus(snap) {
   const s = statusParts(snap);
   $('status').querySelector('.status-path').textContent = s.path;
+  renderAttentionList($('status').querySelector('.status-attn'), snap);
   const flags = $('status').querySelector('.status-flags');
   flags.replaceChildren();
   if (s.sync) flags.appendChild(flag('[SYNC]', 'sync', '입력 동기화: 이 탭의 모든 실행 중 창에 입력이 전달됩니다'));
@@ -387,6 +429,61 @@ function renderStatus(snap) {
     });
     flags.appendChild(f);
   }
+  const env = envStatusFlag(envItems);
+  if (env) flags.appendChild(flag(env.text, env.highlight ? 'env env-error' : 'env', env.title));
+}
+
+// Environment check (Task 12): cached items from the backend; re-read when the check finishes
+// (`env-changed`) and after model changes (folder-trust items follow pane state).
+let envItems = null;
+let envPending = false;
+let envAgain = false; // a request that arrived while one was in flight: run once more after
+function refreshEnv() {
+  if (envPending) {
+    envAgain = true;
+    return;
+  }
+  envPending = true;
+  envAgain = false;
+  api
+    .envStatus()
+    .then((items) => {
+      const changed = JSON.stringify(items) !== JSON.stringify(envItems);
+      envItems = items;
+      if (changed && current) renderStatus(current);
+    })
+    .catch(() => {})
+    .finally(() => {
+      envPending = false;
+      if (envAgain) refreshEnv();
+    });
+}
+
+/**
+ * `⚠ billing(사유…), api`: ⚠ tabs whose tab bar is off screen (spec §5-1). Text only via
+ * textContent (reasons come from agents); a click focuses that tab's attention pane, which
+ * clears its ⚠. Alt+a (pane.nextAttention) reaches the same panes.
+ */
+function renderAttentionList(el, snap) {
+  if (!el) return;
+  const entries = hiddenAttentionTabs(snap);
+  el.replaceChildren();
+  el.classList.toggle('hidden', entries.length === 0);
+  if (!entries.length) return;
+  el.appendChild(document.createTextNode('⚠ '));
+  entries.forEach((en, i) => {
+    if (i > 0) el.appendChild(document.createTextNode(', '));
+    const a = document.createElement('span');
+    a.className = 'attn-tab';
+    a.textContent = statusEntryText(en);
+    a.title = en.reason ? `${en.name}: ${en.reason}` : `${en.name}: 주의가 필요한 창이 있습니다`;
+    a.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      if (overlayOpen()) return;
+      enqueue(() => execute([{ type: 'setFocus', group: en.group, tab: en.tab, pane: en.pane }]));
+    });
+    el.appendChild(a);
+  });
 }
 
 function flag(text, cls, title) {
@@ -425,6 +522,14 @@ configureOverlays({
   popModal: (t) => router.popModal(t),
   restoreFocus: () => applyFocus(current),
   createTab: (cmd) => execute([cmd]),
+  createManager: ({ name, dir }) =>
+    api.createManagerTab(name, dir).then(
+      () => true,
+      (e) => {
+        showError(e);
+        return false;
+      },
+    ),
 });
 configureCopyMode({
   pushModal: (fn) => router.pushModal(fn),
@@ -441,7 +546,13 @@ configurePanes({
   report: showError,
   keyFilter: (paneId, ev) => router.termKeyFilter(paneId, ev),
   onBell,
+  // Applet panes (Task 10): the inbox view replaces the xterm. Its keys are handled on the
+  // applet element (bubble phase), so the router's app chords always win.
+  // Document tabs (Task 14) mount the markdown viewer the same way.
+  mountApplet: (kind, paneId, model) => (kind === 'inbox' ? mountInbox() : kind === 'doc' ? mountDoc(paneId, model) : null),
 });
+configureInbox({ toast, confirm, promptText, choose, onOpenFile: openDoc });
+configureDocView({ toast, prompt, choose });
 // Tab drag & drop (spec 6.6). Errors from MoveTab/SplitGroupWith are toasted by sendCmd.
 installDnd($('groups'), {
   getWs: () => (current ? current.workspace : null),
@@ -450,7 +561,12 @@ installDnd($('groups'), {
     if (!overlayOpen()) applyFocus(current);
   },
 });
-api.onWorkspaceChanged(render);
+api.onWorkspaceChanged((snap) => {
+  render(snap);
+  refreshEnv();
+});
+api.on('env-changed', refreshEnv);
+refreshEnv();
 api
   .snapshot()
   .then(render)

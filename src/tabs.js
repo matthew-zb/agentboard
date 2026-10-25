@@ -10,6 +10,16 @@ export function tabHasAttention(tab, panes) {
   });
 }
 
+/** Tooltip of a tab's ⚠: a fixed line plus `pane name: reason` for each pane with a reason. */
+export function tabAttentionTitle(tab, panes) {
+  const lines = ['주의가 필요한 창이 있습니다'];
+  for (const id of leafIds(tab.layout)) {
+    const p = panes && panes[id];
+    if (p && p.attention && p.attentionReason) lines.push(`${p.name}: ${p.attentionReason}`);
+  }
+  return lines.join('\n');
+}
+
 /**
  * Tab bar for `group`. `tabs` are the group's Tab objects in order. `focused` = this is the
  * focused group; otherwise the bar gets `.dim`.
@@ -48,7 +58,7 @@ export function renderTabBar(group, tabs, focused, opts = {}) {
       const badge = document.createElement('span');
       badge.className = 'tab-badge';
       badge.textContent = '⚠';
-      badge.title = '주의가 필요한 창이 있습니다';
+      badge.title = tabAttentionTitle(tab, panes);
       el.appendChild(badge);
     }
     el.title = tab.dir ? `${tab.name} — ${tab.dir}` : tab.name;

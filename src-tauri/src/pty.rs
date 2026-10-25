@@ -3,7 +3,7 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -45,17 +45,40 @@ pub struct SpawnSpec {
     pub cmd: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Inherited variables to drop before `env` is applied (role panes: `CLAUDECODE`,
+    /// `CLAUDE_CODE_*`, R18). Names set in `env` are set again afterwards.
+    pub env_remove: Vec<String>,
     pub cwd: PathBuf,
     pub cols: u16,
     pub rows: u16,
 }
 
+/// Receives PTY events. `gen` is the generation returned by the `spawn` that started the
+/// process; a sink should ignore events whose `gen` differs from
+/// [`PtyManager::current_gen`] (they belong to an earlier process of the same id).
 pub trait PtySink: Send + Sync {
-    fn output(&self, id: &str, bytes: &[u8]);
-    fn exited(&self, id: &str, code: i32);
+    fn output(&self, id: &str, gen: u64, bytes: &[u8]);
+    fn exited(&self, id: &str, gen: u64, code: i32);
+}
+
+/// A pane id's registration. `Starting` is the placeholder that makes spawn's
+/// "already running?" check and the registration one atomic step under the `panes` lock.
+enum Slot {
+    Starting(u64),
+    Live(Arc<Entry>),
+}
+
+impl Slot {
+    fn gen(&self) -> u64 {
+        match self {
+            Slot::Starting(g) => *g,
+            Slot::Live(e) => e.gen,
+        }
+    }
 }
 
 struct Entry {
+    gen: u64,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
@@ -67,7 +90,10 @@ struct Entry {
 
 pub struct PtyManager {
     sink: Arc<dyn PtySink>,
-    panes: Mutex<HashMap<String, Arc<Entry>>>,
+    panes: Mutex<HashMap<String, Slot>>,
+    /// Last issued generation. Global to the manager (not per id), starts at 1, never reused:
+    /// a generation identifies exactly one spawn attempt.
+    next_gen: AtomicU64,
     #[cfg(windows)]
     job: Option<crate::winjob::JobGuard>,
     /// true when the app process itself is in the job (children inherit it)
@@ -116,7 +142,7 @@ impl Batch {
     }
 
     /// Flush pending bytes; with `finish` also mark the pane done (under the lock).
-    fn flush(&self, sink: &dyn PtySink, id: &str, finish: bool) {
+    fn flush(&self, sink: &dyn PtySink, id: &str, gen: u64, finish: bool) {
         let _g = self.flush_lock.lock().unwrap();
         if self.done.load(Ordering::Acquire) {
             return;
@@ -125,7 +151,7 @@ impl Batch {
         self.space.notify_all();
         if !bytes.is_empty() {
             self.ring.lock().unwrap().push(&bytes);
-            sink.output(id, &bytes);
+            sink.output(id, gen, &bytes);
         }
         if finish {
             self.done.store(true, Ordering::Release);
@@ -174,12 +200,19 @@ impl PtyManager {
             if let Some(e) = &err {
                 eprintln!("[agentboard] job object: {e}");
             }
-            PtyManager { sink, panes: Mutex::new(HashMap::new()), job, self_assigned, job_error: Mutex::new(err) }
+            PtyManager {
+                sink,
+                panes: Mutex::new(HashMap::new()),
+                next_gen: AtomicU64::new(0),
+                job,
+                self_assigned,
+                job_error: Mutex::new(err),
+            }
         }
         #[cfg(not(windows))]
         {
             let _ = assign_self;
-            PtyManager { sink, panes: Mutex::new(HashMap::new()), job_error: Mutex::new(None) }
+            PtyManager { sink, panes: Mutex::new(HashMap::new()), next_gen: AtomicU64::new(0), job_error: Mutex::new(None) }
         }
     }
 
@@ -200,16 +233,45 @@ impl PtyManager {
         self.entry(id).map(|e| e.batch.pending.lock().unwrap().len()).unwrap_or(0)
     }
 
-    pub fn spawn(&self, id: &str, spec: SpawnSpec) -> Result<(), String> {
-        if self.is_running(id) {
-            return Err(format!("pane {id} is already running"));
+    /// Start a process for `id` and return its generation (see [`PtySink`]). Fails while a
+    /// process for `id` is running or being started. The check and the registration of a
+    /// `Starting` placeholder are one step under the `panes` lock, so concurrent spawns of the
+    /// same id cannot both pass; the placeholder also makes the previous generation stale at
+    /// once. On failure the id is left unregistered (the previous entry and ring are gone too).
+    pub fn spawn(&self, id: &str, spec: SpawnSpec) -> Result<u64, String> {
+        let gen = {
+            let mut panes = self.panes.lock().unwrap();
+            match panes.get(id) {
+                Some(Slot::Starting(_)) => return Err(format!("pane {id} is already starting")),
+                Some(Slot::Live(e)) if e.running.load(Ordering::Acquire) => {
+                    return Err(format!("pane {id} is already running"))
+                }
+                _ => {}
+            }
+            let gen = self.next_gen.fetch_add(1, Ordering::SeqCst) + 1;
+            panes.insert(id.to_string(), Slot::Starting(gen));
+            gen
+        };
+        let r = self.spawn_inner(id, gen, spec);
+        if r.is_err() {
+            let mut panes = self.panes.lock().unwrap();
+            if matches!(panes.get(id), Some(Slot::Starting(g)) if *g == gen) {
+                panes.remove(id);
+            }
         }
+        r.map(|()| gen)
+    }
+
+    fn spawn_inner(&self, id: &str, gen: u64, spec: SpawnSpec) -> Result<(), String> {
         let pair = native_pty_system()
             .openpty(PtySize { rows: spec.rows, cols: spec.cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| e.to_string())?;
         let mut cb = CommandBuilder::new(&spec.cmd);
         cb.args(&spec.args);
         cb.cwd(&spec.cwd);
+        for k in &spec.env_remove {
+            cb.env_remove(k);
+        }
         for (k, v) in &spec.env {
             cb.env(k, v);
         }
@@ -243,6 +305,7 @@ impl PtyManager {
         let running = Arc::new(AtomicBool::new(true));
         let batch = Arc::new(Batch::new(ring.clone()));
         let entry = Arc::new(Entry {
+            gen,
             master: Mutex::new(Some(pair.master)),
             writer: Mutex::new(Some(writer)),
             killer: Mutex::new(child.clone_killer()),
@@ -253,8 +316,17 @@ impl PtyManager {
         });
         let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
 
-        // Registered only after everything above succeeded.
-        self.panes.lock().unwrap().insert(id.to_string(), entry.clone());
+        // Registered only after everything above succeeded, and only while our placeholder is
+        // still there (a `remove` during the start means the pane is gone: undo the process).
+        {
+            let mut panes = self.panes.lock().unwrap();
+            if !matches!(panes.get(id), Some(Slot::Starting(g)) if *g == gen) {
+                drop(panes);
+                let _ = child.kill();
+                return Err(format!("pane {id} was removed while starting"));
+            }
+            panes.insert(id.to_string(), Slot::Live(entry.clone()));
+        }
 
         // reader thread
         {
@@ -295,7 +367,7 @@ impl PtyManager {
             std::thread::spawn(move || {
                 while !batch.done.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(BATCH_MS));
-                    batch.flush(sink.as_ref(), &id, false);
+                    batch.flush(sink.as_ref(), &id, gen, false);
                 }
             });
         }
@@ -312,16 +384,26 @@ impl PtyManager {
                 *entry.master.lock().unwrap() = None;
                 let _ = reader_done_rx.recv_timeout(DRAIN_MAX);
                 // Final flush strictly before `exited`; nothing is delivered after it.
-                batch.flush(sink.as_ref(), &id, true);
+                batch.flush(sink.as_ref(), &id, gen, true);
                 running.store(false, Ordering::Release);
-                sink.exited(&id, code);
+                sink.exited(&id, gen, code);
             });
         }
         Ok(())
     }
 
+    /// The current generation's entry (none while it is still starting).
     fn entry(&self, id: &str) -> Option<Arc<Entry>> {
-        self.panes.lock().unwrap().get(id).cloned()
+        match self.panes.lock().unwrap().get(id) {
+            Some(Slot::Live(e)) => Some(e.clone()),
+            _ => None,
+        }
+    }
+
+    /// Generation of the id's current registration (starting or started, running or exited);
+    /// `None` when unknown, removed, or its last spawn failed. Takes only the `panes` lock.
+    pub fn current_gen(&self, id: &str) -> Option<u64> {
+        self.panes.lock().unwrap().get(id).map(Slot::gen)
     }
 
     pub fn write(&self, id: &str, bytes: &[u8]) -> Result<(), String> {
@@ -348,7 +430,8 @@ impl PtyManager {
     /// ring are freed once its threads finish). Afterwards the id is unknown (`attach_with`
     /// false, empty snapshot); `spawn` may reuse it. Unknown ids are a no-op.
     pub fn remove(&self, id: &str) {
-        let Some(e) = self.panes.lock().unwrap().remove(id) else { return };
+        // a `Starting` placeholder is just dropped: that spawn sees it gone and kills its child
+        let Some(Slot::Live(e)) = self.panes.lock().unwrap().remove(id) else { return };
         if e.running.load(Ordering::Acquire) {
             let _ = e.killer.lock().unwrap().kill();
         }
@@ -356,7 +439,16 @@ impl PtyManager {
 
     /// Kill every pane's process (app exit). The Job Object still reaps grandchildren.
     pub fn kill_all(&self) {
-        let entries: Vec<Arc<Entry>> = self.panes.lock().unwrap().values().cloned().collect();
+        let entries: Vec<Arc<Entry>> = self
+            .panes
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|s| match s {
+                Slot::Live(e) => Some(e.clone()),
+                Slot::Starting(_) => None,
+            })
+            .collect();
         for e in entries {
             let _ = e.killer.lock().unwrap().kill();
         }
@@ -368,17 +460,29 @@ impl PtyManager {
 
     /// Atomically snapshot the pane's output and run `register` (e.g. subscribe a channel)
     /// while no flush can happen: bytes are either in the snapshot or delivered to the sink
-    /// after `register` returns, never both and never neither. Returns false if unknown pane.
+    /// after `register` returns, never both and never neither. Attaches to the current
+    /// generation only: if a newer spawn replaced the entry between lookup and lock, it retries
+    /// on the new one. Returns false if the pane is unknown or still starting.
     pub fn attach_with(&self, id: &str, register: impl FnOnce(Vec<u8>)) -> bool {
-        let Some(e) = self.entry(id) else { return false };
-        let _g = e.batch.flush_lock.lock().unwrap();
-        let snap = e.ring.lock().unwrap().snapshot();
-        register(snap);
-        true
+        loop {
+            let Some(e) = self.entry(id) else { return false };
+            let _g = e.batch.flush_lock.lock().unwrap();
+            if self.current_gen(id) != Some(e.gen) {
+                continue; // replaced meanwhile (flush_lock -> panes is an allowed nesting)
+            }
+            let snap = e.ring.lock().unwrap().snapshot();
+            register(snap);
+            return true;
+        }
     }
 
+    /// True while the current generation's process runs, and while a spawn is starting one.
     pub fn is_running(&self, id: &str) -> bool {
-        self.entry(id).map(|e| e.running.load(Ordering::Acquire)).unwrap_or(false)
+        match self.panes.lock().unwrap().get(id) {
+            Some(Slot::Starting(_)) => true,
+            Some(Slot::Live(e)) => e.running.load(Ordering::Acquire),
+            None => false,
+        }
     }
 }
 

@@ -114,7 +114,7 @@ spikes/phase2/    # Task 1 버리는 스파이크 코드 (커밋은 하되 빌�
 **Interfaces:**
 - Produces:
   - `pub enum Role { Dispatcher, Handover, Manager, Lead, Member }` (serde lowercase)
-  - `pub struct RoleConfig { pub system_prompt_file: Option<String>, pub agent: Option<String>, pub args: Vec<String>, pub max_per_team: Option<usize> }`, `Config.roles: BTreeMap<Role, RoleConfig>`, `Config.nightly_refresh: Option<String>`("HH:MM" 검증), `nightly_timeout_min: u32`(20), `nightly_quiet_min: u32`(10), `handover_index: Option<String>`(기본 `<handover dir>/INDEX.md`), `TabSpec.role: Option<Role>`(manager|handover만 허용).
+  - `pub struct RoleConfig { pub system_prompt_file: Option<String>, pub agent: Option<String>, pub args: Vec<String>, pub max_per_team: Option<usize> }`, `Config.roles: BTreeMap<Role, RoleConfig>`, `Config.nightly_refresh: Option<String>`("HH:MM" 검증), `nightly_timeout_min: u32`(20), `nightly_quiet_min: u32`(10), `handover_index: Option<String>`(workspaceRoot 기준, 기본 `HANDOVER.md`), `TabSpec.role: Option<Role>`(manager|handover만 허용). **handover 탭은 작업공간이 루트**: role이 handover인 탭은 `dir`이 빈 값(`""`)이어야 하며 workspace = workspaceRoot(스펙 §8, 사용자 결정). 다른 탭의 빈 `dir`은 기존 규칙대로 처리. handover 탭은 최대 1개(검증 오류).
   - `pub fn session_name(tab: &str, role: Role, team: Option<&str>, n: usize) -> String` — 상시 = 탭 이름, lead = `<tab>-<team>-lead`, member = `<tab>-<team>-m<n>`.
   - `Pane` 추가 필드: `kind: PaneKind`(`Terminal` | `Applet { kind: String }`), `role: Option<Role>`, `team: Option<String>`, `session_name: Option<String>`. `Tab.role: Option<Role>`. 모두 `#[serde(default)]`(1단계 workspace.json 호환).
   - 템플릿 노드 `{"applet":{"name":"inbox","kind":"inbox"}}` 파싱(PaneSpec에 `applet: Option<String>`), 검증: applet은 agent·cwd·prompt 불가.
@@ -125,6 +125,7 @@ spikes/phase2/    # Task 1 버리는 스파이크 코드 (커밋은 하되 빌�
 #[test] fn parses_roles_and_nightly_config() {}
 #[test] fn rejects_bad_nightly_time_and_dispatcher_role_in_tabs() {}
 #[test] fn applet_node_parses_and_rejects_agent_fields() {}
+#[test] fn handover_tab_workspace_is_root_and_unique() {}
 #[test] fn session_name_rules() { assert_eq!(session_name("billing", Role::Lead, Some("batch"), 0), "billing-batch-lead"); /* member m1 등 */ }
 #[test] fn phase1_workspace_json_still_loads() { /* 1단계 포맷 fixture → 새 필드 기본값 */ }
 #[test] fn applet_pane_is_never_spawned() {}
@@ -262,8 +263,12 @@ spikes/phase2/    # Task 1 버리는 스파이크 코드 (커밋은 하되 빌�
 - Modify: `src-tauri/src/control.rs`(Notification 처리기 → `SetAttention{on:true}`; 포커스된 창이면 무시), `src/groups.js`/`src/app.js`(상태 표시줄), `README.md`
 
 **Interfaces:**
-- Produces: Notification hook(권한 요청·입력 대기) → 해당 창 attention. 그룹 최대화 등으로 ⚠ 탭이 화면에 안 보이면 상태 표시줄에 `⚠ billing, api` (클릭·`Alt+a`로 이동). 순수 함수 `hiddenAttentionTabs(snapshot) -> string[]` + 테스트.
-- [ ] **Step 1–4** — 테스트(`hidden_attention_tabs`, hook → attention, 포커스 창 무시) → 구현 → PASS
+- Produces:
+  - Notification hook 중 `permission_prompt`만 → 해당 창 attention(`idle_prompt`는 무시 — 상시 에이전트가 쉬는 동안 늘 발생). 포커스된 창이면 무시.
+  - **MCP 도구 `need_user(reason: String)` (모든 역할)** — 호출자 창 attention on + `Pane.attention_reason: Option<String>`(serde default) 저장. SetFocus로 attention이 해제될 때 reason도 지운다. ⚠ 툴팁과 상태 표시줄 목록에 사유 표시.
+  - 그룹 최대화 등으로 ⚠ 탭이 화면에 안 보이면 상태 표시줄에 `⚠ billing(사유…), api` (클릭·`Alt+a`로 이동). 순수 함수 `hiddenAttentionTabs(snapshot) -> {tab, reason?}[]` + 테스트.
+  - SessionStart가 spawn 후 30초 안에 오지 않은 role 창 → attention + reason "폴더 신뢰 확인 필요"(ledger R5).
+- [ ] **Step 1–4** — 테스트(`hidden_attention_tabs`, `need_user_sets_reason_and_focus_clears_it`, permission_prompt → attention·idle_prompt 무시, 포커스 창 무시, `missing_session_start_flags_trust`) → 구현 → PASS
 - [ ] **Step 5: Commit** — `feat(attention): notification hook and status-bar attention list`
 
 ---
@@ -285,6 +290,41 @@ spikes/phase2/    # Task 1 버리는 스파이크 코드 (커밋은 하되 빌�
 - [ ] **Step 2–4** — FAIL → 구현 → PASS
 - [ ] **Step 5: 수동 확인 항목** — `docs/spikes.md` "2단계 Task 10"에 "사용자 확인 필요"로: 지시 → dispatcher 화면에 전달 확인, 입력 중 dispatcher 입력란 무손상.
 - [ ] **Step 6: Commit** — `feat(ui): inbox applet next to dispatcher`
+
+---
+
+### Task 14: 문서 탭 (마크다운 뷰어) — **Task 10 다음, Task 11 전에 실행**
+
+**Files:**
+- Create: `src/docview.js`(렌더·스크롤·검색·목차·링크 이력), `src/docview-logic.js`(순수: 링크 해석·이력·목차 추출·키 매핑), `tests/js/docview.test.mjs`, `src-tauri/src/docs.rs`
+- Modify: `package.json`·`scripts/vendor.mjs`(marked 11.0.0, mermaid 11.x 고정, katex 0.16.9(+폰트), highlight.js 11.9.0, DOMPurify 3.x 고정 — mdviewer와 같은 버전대, 모두 `src/vendor/`), `src-tauri/src/workspace.rs`(문서 탭), `src-tauri/src/lib.rs`(명령·감시), `src-tauri/tauri.conf.json`(CSP: `img-src 'self' data: asset: http://asset.localhost`, mermaid가 필요하면 `style-src 'unsafe-inline'` 유지), `src/pane.js`, `src/inbox.js`, `src/overlay-logic.js`(팔레트 "문서 열기"), `src/style.css`
+
+**Interfaces:**
+- Consumes: Task 3 `PaneKind::Applet { kind }`, Task 6 인박스 이슈 폴더, 1단계 팔레트·퍼지 검색(`fuzzy.js`)·포커스 규칙.
+- Produces:
+  - 문서 탭 = applet 창 하나짜리 탭: `PaneKind::Applet { kind: "doc" }` + `Pane.doc_path: Option<PathBuf>`(serde default). `WsCommand::OpenDoc { path, group: Option<GroupId> }` — 같은 경로가 열려 있으면 그 탭으로 SetFocus, 아니면 포커스 그룹에 새 탭(이름 = 파일명, 중복 시 1단계 규칙) 만들고 포커스(사용자 동작). `path`는 `workspaceRoot` 안의 기존 `.md` 파일만(정규화 후 접두사 검사, 심볼릭 링크 해석 후 재검사), 아니면 한국어 Err.
+  - Tauri 명령: `doc_read(path) -> {text, mtime}`, `doc_list_md(query?) -> Vec<rel path>`(workspaceRoot 아래, `.agentboard`·`node_modules`·`.git`·`target` 제외, 최대 5,000개), `doc_watch(paneId, path)`/`doc_unwatch` — 1초 주기 mtime 폴링 스레드 하나가 변경 시 `doc-changed {paneId}` 이벤트 **[설계자 판단: notify 크레이트 대신 폴링 — 의존성 최소]**. 이미지: Tauri asset 프로토콜을 `workspaceRoot/**`로 범위 제한해 켠다.
+  - 렌더: marked(GFM) → DOMPurify로 정화 → highlight.js → KaTeX auto-render → mermaid(문서 안 ```mermaid 블록). 상대 링크 `.md`는 같은 탭에서 열기(이력 push), `http(s)`는 opener 플러그인으로 시스템 브라우저, 그 외는 무시.
+  - 키(문서 창 포커스 시, 1단계 앱 단축키 우선): `j/k` 한 줄, `Space/Shift+Space` 한 화면, `g/G`, `/` 검색(1단계 프롬프트 재사용, `n/N`), `o` 목차 오버레이(↑↓ Enter), `[`/`]` 뒤로/앞으로, `r` 새로고침. 스크롤 위치는 자동 새로고침 시 유지.
+  - 여는 길: 인박스 상세(Task 10)에 이슈 폴더 `input/`·`output/` 파일 목록 섹션 — md 파일 선택 후 `Enter` → `OpenDoc`; 다른 파일은 경로만 표시. 팔레트 "문서 열기" → `doc_list_md` + `fuzzyFilter` → `OpenDoc`.
+  - 복원: 문서 탭은 `workspace.json`에 저장·복원(파일이 사라졌으면 탭에 "파일을 찾을 수 없습니다" 표시).
+- [ ] **Step 1: 실패하는 테스트**
+```rust
+#[test] fn open_doc_rejects_outside_root_and_non_md() {}
+#[test] fn open_doc_reuses_existing_tab() {}
+#[test] fn list_md_skips_excluded_dirs_and_caps() {}
+#[test] fn doc_tab_persists_and_restores() {}
+```
+```js
+test('relative md links resolve against current doc and stay inside root', () => {})
+test('history back/forward', () => {})
+test('toc extraction from headings incl. duplicates', () => {})
+test('sanitizer strips script and on* attributes', () => {}) // DOMPurify 설정 확인 (jsdom 없이 가능한 범위: 설정 객체 검증 + 문자열 사전 필터)
+test('key map: j/k/g/G/o/[ ]/r', () => {})
+```
+- [ ] **Step 2–4** — FAIL → 구현 → PASS
+- [ ] **Step 5: 수동 확인 항목** — `docs/spikes.md` "2단계 Task 14"에 "사용자 확인 필요": Mermaid·KaTeX·코드 하이라이트 렌더, 산출물 파일 수정 시 1–2초 안에 자동 새로고침, 인박스에서 열기, 팔레트에서 열기, 한글 파일명.
+- [ ] **Step 6: Commit** — `feat(ui): markdown document tabs (viewer from mdviewer)`
 
 ---
 
@@ -315,18 +355,21 @@ spikes/phase2/    # Task 1 버리는 스파이크 코드 (커밋은 하되 빌�
 
 ---
 
-### Task 12: 시작 절차 · 복원 규칙 · 자동 실행 · 버전 확인
+### Task 12: 시작 절차 · 복원 규칙 · 자동 실행 · 환경 점검
 
 **Files:**
-- Create: `src-tauri/src/autostart.rs`
-- Modify: `src-tauri/src/persist.rs`(`prepare_restored`), `src-tauri/src/lib.rs`, `src/overlay-logic.js`(팔레트 "로그인 시 자동 실행 켜기/끄기"), `src/overlays.js`/`overlay-logic.js`(새 탭 마법사에 역할 선택: 일반 / Manager)
+- Create: `src-tauri/src/autostart.rs`, `src-tauri/src/envcheck.rs`
+- Modify: `src-tauri/src/mcp_tools.rs`(`env_status`, `env_skip`), `src-tauri/src/config.rs`(`envSkip: Vec<String>`, 원자적 갱신), `src-tauri/src/persist.rs`(`prepare_restored`), `src-tauri/src/lib.rs`, `src/overlay-logic.js`(팔레트 "로그인 시 자동 실행 켜기/끄기"), `src/overlays.js`/`overlay-logic.js`(새 탭 마법사에 역할 선택: 일반 / Manager)
 
 **Interfaces:**
 - Produces:
   - 복원 규칙(스펙 §9): role 없는 탭 = 1단계 그대로. role 탭 = 레이아웃·위치 복원, 팀 창(lead/member)·팀 영역 **제거**, 상시 창은 `inject_prompt=true` 새 세션. 순수 함수 `restore_plan(ws) -> (Workspace, Effects)` + 테스트.
   - `autostart::{enable, disable, is_enabled}` — `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 값 `AgentBoard` = `"<exe>"`. Tauri 명령 `autostart_get/set`.
-  - 시작 시 `claude --version` 확인(타임아웃 5초) → 미달·실패 시 시작 오류 목록에 "Claude Code 2.1.234 이상이 필요합니다(현재 x)".
-- [ ] **Step 1: 실패하는 테스트** — `restore_plan_drops_team_panes_and_reinjects_prompts`, `non_role_tabs_restore_as_phase1`, `version_parse_and_compare`, autostart는 레지스트리 키 이름을 주입 가능하게 해 테스트 키로 왕복.
+  - **환경 점검 (`envcheck.rs`, 스펙 §9)**: `pub struct EnvItem { id: &'static str /*claude-version|git-bash|folder-trust:<tab>*/, ok: bool, detail: String, why: String, missing_features: String, fix: String /*설치·조치 명령 또는 안내*/ , skipped: bool }`, `pub fn check_all(cfg: &Loaded, ws: &Workspace, probe: &dyn EnvProbe) -> Vec<EnvItem>` — `EnvProbe`(테스트에서 가짜로 바꿀 수 있게): `claude --version`(타임아웃 5초, ≥ 2.1.234), Git Bash 존재(Claude Code와 같은 규칙: `CLAUDE_CODE_GIT_BASH_PATH` 또는 PATH의 git 기준), 폴더 신뢰는 Task 9의 "SessionStart 30초 미도착" 결과를 반영. 설치 안내 예: Git → `winget install --id Git.Git -e`, Claude → `claude update`.
+  - MCP `env_status()`(모든 역할) → 항목 목록, `env_skip(item)`(dispatcher만) → `config.json` `envSkip`에 추가(다른 키 보존). 건너뛴 항목은 `skipped: true`, 상태 표시줄에 `[환경: Git 없음(건너뜀)]`처럼 작게.
+  - **사용자 정의 항목**: `config.json` `envRequire: [{id, check, fix, why, required}]` — check 명령(셸 실행, 타임아웃 10초, 종료 코드 0 = 정상). 기본 설정(ensure_dotdir가 만드는 config가 없을 때의 기본값과 README 예시)에 holla 항목: `{"id":"holla","check":"holla slack version","fix":"source의 GitHub 저장소로 holla(@circlesac/holla)를 설치한 뒤 `holla slack auth`로 슬랙 로그인","why":"handover의 슬랙 확인에 필요","required":true,"source":""}`. 항목 필드에 `source: Option<String>`(저장소 주소) 추가, MCP `env_set_source(item, url)`(dispatcher만, config 원자적 갱신, http(s) URL만 허용) — source가 비면 dispatcher가 사용자에게 주소를 묻는다(사용자 결정: 주소만 주면 Claude가 설치). `required: true` 항목은 `env_skip`이 한국어 오류로 거부, 상태 표시줄에 강조.
+  - 앱은 직접 설치하지 않는다(설치는 dispatcher가 사용자 승인 후 실행).
+- [ ] **Step 1: 실패하는 테스트** — `restore_plan_drops_team_panes_and_reinjects_prompts`, `non_role_tabs_restore_as_phase1`, `version_parse_and_compare`, `env_items_respect_skip_list`, `custom_required_item_cannot_be_skipped`, `env_set_source_validates_url_and_persists`, `custom_check_timeout_is_failure`, `env_skip_persists_and_keeps_other_config_keys`, autostart는 레지스트리 키 이름을 주입 가능하게 해 테스트 키로 왕복.
 - [ ] **Step 2–4** — FAIL → 구현 → PASS
 - [ ] **Step 5: Commit** — `feat: role-aware restore, autostart toggle, Claude version check`
 
@@ -340,8 +383,8 @@ spikes/phase2/    # Task 1 버리는 스파이크 코드 (커밋은 하되 빌�
 
 **Interfaces:**
 - Produces (역할 지시 최소판 — 스펙 §2·§5·§7·§8·§9 반영, 각 1–2쪽):
-  - 공통: 세션 이름 규칙, `SendMessage`로 보낼 대상 규칙(경로: handover→dispatcher→Manager, 지시는 dispatcher 경유, 팀원→리드만), `[AgentBoard]` 메시지는 앱 지시로 취급.
-  - dispatcher: handover 메시지 판단·담당 전달, 인박스 지시 전달, `create_manager_tab` 사용 조건.
+  - 공통: 사용자 결정이 필요하면 질문을 화면에 쓰고 `need_user(사유)` 호출, `[AgentBoard]`·agentboard 발신 메시지는 사용자 지시를 전달하는 것(R3), 세션 이름 규칙, `SendMessage`로 보낼 대상 규칙(경로: handover→dispatcher→Manager, 지시는 dispatcher 경유, 팀원→리드만), `[AgentBoard]` 메시지는 앱 지시로 취급.
+  - dispatcher: handover 메시지 판단·담당 전달, 인박스 지시 전달, `create_manager_tab` 사용 조건, **시작 시 `env_status()` 확인 → 빠진 항목을 하나씩 안내, 설치는 사용자 승인 후에만 실행, 거절 시 `env_skip`(required는 불가); 설치 소스(GitHub 주소)가 비어 있으면 사용자에게 물어 `env_set_source`로 기록 후 그 저장소 README대로 설치**.
   - handover: `/loop`는 템플릿 프롬프트가 시작, 인덱스 문서는 **포인터만**(업무·계획 파일·진행 파일·갱신 시각 한 줄), 야간 정리 절차.
   - manager: 보고 = `inbox_post`(확인할 것/리스크 짧고 명료), 종료 = `inbox_propose_close` + 최종 의견, 이슈 = `issue_create`, 팀 = `teams/<id>/brief.md`·`roster.md` 작성 후 `hire_lead`, 끝난 팀 brief에 `상태: 완료`, **시작 시 진행 중 팀 자동 재채용**, 야간 정리 절차.
   - lead: brief 기준 배분, 팀원 결과물 **검증·지적**, `hire_member`/`dismiss`, Manager에게 보고.

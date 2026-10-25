@@ -4,7 +4,7 @@
 // Pure logic lives in overlay-logic.js / fuzzy.js. No top-level DOM access (Node-importable).
 import * as api from './api.js';
 import { fuzzyRank } from './fuzzy.js';
-import { PICK_TIMEOUT_MS, TOAST_MS, pickerKey, listMove, dirChoices, newTabFlow, confirmKey } from './overlay-logic.js';
+import { PICK_TIMEOUT_MS, TOAST_MS, pickerKey, listMove, dirChoices, newTabFlow, confirmKey, docChoices } from './overlay-logic.js';
 
 const cfg = {
   /** router.pushModal(fn) -> token / router.popModal(token): a stack, copy mode may sit below. */
@@ -16,9 +16,12 @@ const cfg = {
   restoreFocus() {},
   /** Send CreateTab; resolves true on success, false after the error was toasted. */
   createTab: async () => false,
+  /** Wizard "Manager": resolves true on success, false after toasting the error. */
+  createManager: async () => false,
 };
 
-/** `{pushModal(fn) → token, popModal(token), restoreFocus(), createTab(cmd) → Promise<bool>}` (set by app.js). */
+/** `{pushModal(fn) → token, popModal(token), restoreFocus(), createTab(cmd) → Promise<bool>,
+ * createManager({name, dir}) → Promise<bool>}` (set by app.js). */
 export function configureOverlays(c) {
   Object.assign(cfg, c);
 }
@@ -268,6 +271,20 @@ export async function palette(entries) {
   }
 }
 
+/**
+ * "문서 열기" (Task 14): fuzzy search over workspace-relative `.md` paths (only the best
+ * matches are drawn). Resolves the picked path or null.
+ */
+export async function pickDoc(paths) {
+  const r = await listOverlay({
+    title: '문서 열기',
+    placeholder: 'workspaceRoot 아래 md 파일 검색',
+    emptyText: paths.length ? '일치하는 문서가 없습니다' : 'md 파일이 없습니다',
+    compute: (q) => docChoices(paths, q).map((p) => ({ label: p, value: p })),
+  });
+  return r ? r.value : null;
+}
+
 /** Single-line text input. Enter → the text, Esc → null. */
 export function prompt(title, initial = '') {
   return open((finish, onCleanup) => {
@@ -300,6 +317,54 @@ export function prompt(title, initial = '') {
       },
     };
   });
+}
+
+/**
+ * Multi-line text input (inbox instruction, file paths). Enter adds a line, Ctrl+Enter submits
+ * (→ the text), Esc cancels (→ null). Every other key types into the box: no app shortcut and no
+ * applet key fires underneath while it is open.
+ */
+export function promptText(title, { initial = '', placeholder = '', hint = 'Ctrl+Enter: 확인 · Esc: 취소' } = {}) {
+  return open((finish, onCleanup) => {
+    const { back, box } = dialog('ov-prompt ov-prompt-multi', () => finish(null));
+    onCleanup(() => back.remove());
+    box.appendChild(h('div', 'ov-title', title));
+    const input = h('textarea', 'ov-input ov-textarea');
+    Object.assign(input, { value: initial, placeholder, spellcheck: false, rows: 6 });
+    box.appendChild(input);
+    if (hint) box.appendChild(h('div', 'ov-hint-line', hint));
+    input.focus();
+    return {
+      cancelValue: null,
+      onKey(e) {
+        if (composing(e)) return false;
+        if (e.code === 'Escape') {
+          finish(null);
+          return true;
+        }
+        if (e.target !== input) {
+          input.focus();
+          return true;
+        }
+        if (isEnter(e) && e.ctrlKey) {
+          if (!e.repeat) finish(input.value);
+          return true;
+        }
+        if (e.code === 'Tab') return true;
+        return false;
+      },
+    };
+  });
+}
+
+/** Pick one of `options` ({label, hint?, value}) with ↑↓ / typing + Enter; null on Esc. */
+export async function choose(title, options) {
+  const labels = options.map((o) => o.label);
+  const r = await listOverlay({
+    title,
+    compute: (q) => fuzzyRank(labels, q).map((i) => ({ label: options[i].label, hint: options[i].hint, value: options[i].value })),
+  });
+  return r ? r.value : null;
 }
 
 // ---------------------------------------------------------------- dialogs
@@ -359,8 +424,9 @@ export function showErrors(lines) {
   });
 }
 
-/** Message above the status bar for TOAST_MS (newest at the bottom, at most 4). */
-export function toast(message) {
+/** Message above the status bar for TOAST_MS (newest at the bottom, at most 4). `kind: 'info'`
+ * marks a success notice (errors are the default). */
+export function toast(message, kind = '') {
   const text = message && message.message ? message.message : String(message);
   let box = document.getElementById('toasts');
   if (!box) {
@@ -368,7 +434,7 @@ export function toast(message) {
     box.id = 'toasts';
     document.body.appendChild(box);
   }
-  const t = h('div', 'toast', text);
+  const t = h('div', kind === 'info' ? 'toast info' : 'toast', text);
   box.appendChild(t);
   while (box.children.length > 4) box.firstChild.remove();
   setTimeout(() => t.remove(), TOAST_MS);
@@ -376,7 +442,8 @@ export function toast(message) {
 
 // ---------------------------------------------------------------- new-tab wizard
 
-/** ① workspace dir (fuzzy; unknown name → create) → ② template → ③ CreateTab. Esc cancels. */
+/** ① workspace dir (fuzzy; unknown name → create) → ② role (일반 / Manager) → ③ template →
+ * CreateTab (Manager: config-persisting backend path, no template step). Esc cancels. */
 export function newTabWizard() {
   return newTabFlow({
     alive: flowGuard(),
@@ -397,9 +464,15 @@ export function newTabWizard() {
       }).then((r) => (r ? r.value : null)),
     confirm,
     createDir: (name) => api.createDir(name),
+    pickRole: (dir) =>
+      choose(`새 탭 ② 역할 — 폴더: ${dir}`, [
+        { label: '일반', hint: '템플릿을 골라 에이전트 탭을 엽니다', value: 'plain' },
+        { label: 'Manager', hint: '상시업무 Manager 탭 — config.json에 기록되어 재시작 후에도 유지', value: 'manager' },
+      ]),
+    createManager: (req) => cfg.createManager(req),
     pickTemplate: (list, def, dir) =>
       listOverlay({
-        title: `새 탭 ② 템플릿 — 폴더: ${dir}`,
+        title: `새 탭 ③ 템플릿 — 폴더: ${dir}`,
         placeholder: '템플릿 이름',
         emptyText: '템플릿이 없습니다',
         compute: (q) => fuzzyRank(list, q).map((i) => ({ label: list[i], hint: list[i] === def ? '기본값' : '', value: list[i] })),

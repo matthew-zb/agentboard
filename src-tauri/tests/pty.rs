@@ -12,11 +12,15 @@ struct CollectSink {
     exits: Mutex<HashMap<String, i32>>,
     out_at_exit: Mutex<HashMap<String, usize>>,
     output_after_exit: AtomicBool,
+    /// generation tagged on each pane's events (last seen)
+    out_gen: Mutex<HashMap<String, u64>>,
+    exit_gen: Mutex<HashMap<String, u64>>,
     /// when true, output() blocks (simulates a stalled consumer)
     block: AtomicBool,
 }
 impl PtySink for CollectSink {
-    fn output(&self, id: &str, bytes: &[u8]) {
+    fn output(&self, id: &str, gen: u64, bytes: &[u8]) {
+        self.out_gen.lock().unwrap().insert(id.to_string(), gen);
         while self.block.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -25,7 +29,8 @@ impl PtySink for CollectSink {
         }
         self.out.lock().unwrap().entry(id.to_string()).or_default().extend_from_slice(bytes);
     }
-    fn exited(&self, id: &str, code: i32) {
+    fn exited(&self, id: &str, gen: u64, code: i32) {
+        self.exit_gen.lock().unwrap().insert(id.to_string(), gen);
         let n = self.out.lock().unwrap().get(id).map(|v| v.len()).unwrap_or(0);
         self.out_at_exit.lock().unwrap().insert(id.to_string(), n);
         self.exits.lock().unwrap().insert(id.to_string(), code);
@@ -56,6 +61,7 @@ fn spec(cmd: &str, args: &[&str], cwd: PathBuf) -> SpawnSpec {
         cmd: PathBuf::from(cmd),
         args: args.iter().map(|s| s.to_string()).collect(),
         env: vec![],
+        env_remove: vec![],
         cwd,
         cols: 120,
         rows: 30,
@@ -91,6 +97,21 @@ fn spawn_echo_streams_output_and_exit_code() {
     assert!(!m.snapshot("p1").windows(4).any(|w| w == b"\x1b[6n"));
     assert!(String::from_utf8_lossy(&m.snapshot("p1")).contains("hello-agentboard"));
     assert!(!m.is_running("p1"));
+}
+
+#[test]
+fn env_remove_drops_inherited_variable_and_env_still_sets() {
+    std::env::set_var("AGENTBOARD_T4_INHERITED", "parent-value");
+    let (sink, m) = setup();
+    let mut s = spec("cmd.exe", &["/c", "echo [%AGENTBOARD_T4_INHERITED%][%AGENTBOARD_T4_SET%]"], cwd());
+    s.env_remove = vec!["AGENTBOARD_T4_INHERITED".into(), "AGENTBOARD_T4_SET".into()];
+    s.env = vec![("AGENTBOARD_T4_SET".into(), "child-value".into())];
+    m.spawn("envrm", s).unwrap();
+    assert!(wait_until(|| sink.exit("envrm").is_some()), "no exit");
+    let out = sink.text("envrm");
+    // cmd leaves an undefined %VAR% as-is
+    assert!(out.contains("[%AGENTBOARD_T4_INHERITED%][child-value]"), "got: {out:?}");
+    std::env::remove_var("AGENTBOARD_T4_INHERITED");
 }
 
 #[test]
@@ -177,8 +198,8 @@ fn pending_is_bounded_when_sink_stalls() {
 
 struct Quiet;
 impl PtySink for Quiet {
-    fn output(&self, _: &str, _: &[u8]) {}
-    fn exited(&self, _: &str, _: i32) {}
+    fn output(&self, _: &str, _: u64, _: &[u8]) {}
+    fn exited(&self, _: &str, _: u64, _: i32) {}
 }
 
 /// Helper, only active when re-executed by `job_kills_children_when_app_exits`.
@@ -310,4 +331,66 @@ fn remove_kills_and_forgets_the_pane() {
     assert!(wait_until(|| sink.exit("rm2").is_some()));
     let snap = String::from_utf8_lossy(&m.snapshot("rm2")).into_owned();
     assert!(snap.contains("new-marker") && !snap.contains("old-marker"), "{snap:?}");
+}
+
+#[test]
+fn spawn_generations_tag_events_and_increase() {
+    let (sink, m) = setup();
+    assert_eq!(m.current_gen("g1"), None);
+    let g1 = m.spawn("g1", spec("cmd.exe", &["/c", "echo gen-one"], cwd())).unwrap();
+    assert_eq!(m.current_gen("g1"), Some(g1));
+    assert!(wait_until(|| sink.exit("g1").is_some()));
+    assert_eq!(sink.out_gen.lock().unwrap().get("g1"), Some(&g1));
+    assert_eq!(sink.exit_gen.lock().unwrap().get("g1"), Some(&g1));
+    // an exited pane keeps its generation until respawned/removed
+    assert_eq!(m.current_gen("g1"), Some(g1));
+
+    sink.exits.lock().unwrap().clear();
+    let g2 = m.spawn("g1", spec("cmd.exe", &["/c", "echo gen-two"], cwd())).unwrap();
+    assert!(g2 > g1, "generations increase: {g1} -> {g2}");
+    assert!(wait_until(|| sink.exit("g1").is_some()));
+    assert_eq!(sink.exit_gen.lock().unwrap().get("g1"), Some(&g2));
+    // global counter: another id never reuses a generation
+    let g3 = m.spawn("g2", spec("cmd.exe", &["/c", "exit 0"], cwd())).unwrap();
+    assert!(g3 > g2);
+    m.remove("g1");
+    assert_eq!(m.current_gen("g1"), None);
+}
+
+#[test]
+fn failed_spawn_leaves_no_generation() {
+    let (_sink, m) = setup();
+    let g1 = m.spawn("f1", spec("cmd.exe", &["/c", "exit 0"], cwd())).unwrap();
+    assert!(wait_until(|| !m.is_running("f1")));
+    assert!(m.spawn("f1", spec("definitely-not-a-real-cmd-xyz.exe", &[], cwd())).is_err());
+    // the old generation is retired too: its late events are stale
+    assert_ne!(m.current_gen("f1"), Some(g1));
+    assert_eq!(m.current_gen("f1"), None);
+    assert!(m.spawn("f1", spec("cmd.exe", &["/c", "exit 0"], cwd())).is_ok());
+}
+
+#[test]
+fn concurrent_spawns_of_one_id_admit_exactly_one() {
+    let (_sink, m) = setup();
+    let m = Arc::new(m);
+    for round in 0..5 {
+        let id = format!("c{round}");
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let (m, b, id) = (m.clone(), barrier.clone(), id.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    m.spawn(&id, spec("ping", &["-n", "30", "127.0.0.1"], cwd()))
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ok: Vec<u64> = results.iter().filter_map(|r| r.as_ref().ok().copied()).collect();
+        assert_eq!(ok.len(), 1, "round {round}: {results:?}");
+        assert_eq!(m.current_gen(&id), Some(ok[0]));
+        let pid = m.pid(&id).unwrap();
+        m.remove(&id);
+        assert!(wait_until(|| !pid_alive(pid)), "winner process must be the only one and killable");
+    }
 }
