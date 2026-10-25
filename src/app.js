@@ -1,0 +1,2 @@
+// AgentBoard bootstrap (placeholder)
+export {};
