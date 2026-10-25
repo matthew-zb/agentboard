@@ -49,7 +49,7 @@ function freshState(entry, sess) {
 }
 
 export function enterCopyMode(paneId) {
-  if (sessions.has(paneId) || !hasPane(paneId)) return false;
+  if (sessions.has(paneId) || !hasPane(paneId) || !getPane(paneId).term) return false; // applets have no buffer
   const entry = getPane(paneId);
   const sess = { state: null, token: null, lastQuery: '', busy: false };
   sess.state = createCopyState(makeCopyBuffer(entry.term.buffer.active, entry.term.rows));

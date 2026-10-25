@@ -1,4 +1,5 @@
 use crate::layout::{Dir, LayoutNode};
+use crate::roles::{Role, RoleConfig, DEFAULT_MAX_PER_TEAM};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -104,6 +105,8 @@ pub fn load_settings(appdata_dir: &Path) -> Settings {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PaneSpec {
     pub name: String,
+    /// `Some(kind)` for an applet node (`{"applet":{"name","kind"}}`): an app screen, no process.
+    pub applet: Option<String>,
     pub agent: Option<String>,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
@@ -136,6 +139,30 @@ struct RawPane {
     focus: bool,
 }
 
+/// `{"applet":{...}}`. agent/args/env/cwd/prompt are accepted here only so `validate_template`
+/// can reject them with a precise message.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawApplet {
+    name: String,
+    kind: String,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    focus: bool,
+}
+
+/// Applet kinds the frontend knows.
+pub const APPLET_KINDS: [&str; 1] = ["inbox"];
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTemplate {
@@ -165,30 +192,38 @@ fn fit_sizes(sizes: Option<Vec<f32>>, n: usize) -> Vec<f32> {
 }
 
 fn pane_spec(p: RawPane) -> PaneSpec {
-    PaneSpec { name: p.name, agent: p.agent, args: p.args, env: p.env, cwd: p.cwd, prompt: p.prompt, focus: p.focus }
+    PaneSpec { name: p.name, applet: None, agent: p.agent, args: p.args, env: p.env, cwd: p.cwd, prompt: p.prompt, focus: p.focus }
 }
 
-/// Parse a layout node from JSON: a leaf (`{key: {...}}`) or a split. Errors carry a JSON path.
+fn applet_spec(a: RawApplet) -> PaneSpec {
+    PaneSpec { name: a.name, applet: Some(a.kind), agent: a.agent, args: a.args, env: a.env, cwd: a.cwd, prompt: a.prompt, focus: a.focus }
+}
+
+/// Parse a layout node from JSON: a leaf (`{key: {...}}` for one of `keys`) or a split. Errors
+/// carry a JSON path. `leaf` gets the leaf key, its value and its path.
 fn parse_node<T>(
     v: &serde_json::Value,
     path: &str,
-    key: &str,
+    keys: &[&str],
     file: &Path,
-    leaf: &dyn Fn(&serde_json::Value, &str) -> Result<T, ConfigError>,
+    leaf: &dyn Fn(&str, &serde_json::Value, &str) -> Result<T, ConfigError>,
 ) -> Result<LayoutNode<T>, ConfigError> {
     let Some(obj) = v.as_object() else {
         return Err(sem_err(file, path, "노드는 객체여야 함"));
     };
-    match (obj.contains_key(key), obj.contains_key("split")) {
-        (true, true) => Err(sem_err(file, path, format!("노드에 '{key}'와 'split'을 함께 쓸 수 없음"))),
-        (false, false) => Err(sem_err(file, path, format!("노드에는 '{key}' 또는 'split'이 필요함"))),
-        (true, false) => {
-            if let Some(extra) = obj.keys().find(|k| k.as_str() != key) {
+    let present: Vec<&str> = keys.iter().copied().filter(|k| obj.contains_key(*k)).collect();
+    let label = keys.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join("/");
+    match (present.as_slice(), obj.contains_key("split")) {
+        ([_, ..], true) => Err(sem_err(file, path, format!("노드에 {label}와 'split'을 함께 쓸 수 없음"))),
+        ([], false) => Err(sem_err(file, path, format!("노드에는 {label} 또는 'split'이 필요함"))),
+        ([_, _, ..], false) => Err(sem_err(file, path, format!("노드에 {label} 중 하나만 쓸 수 있음"))),
+        ([key], false) => {
+            if let Some(extra) = obj.keys().find(|k| k.as_str() != *key) {
                 return Err(sem_err(file, path, format!("알 수 없는 필드 '{extra}'")));
             }
-            leaf(&obj[key], &format!("{path}.{key}")).map(LayoutNode::Leaf)
+            leaf(key, &obj[*key], &format!("{path}.{key}")).map(LayoutNode::Leaf)
         }
-        (false, true) => {
+        ([], true) => {
             let dir: Dir = serde_json::from_value(obj["split"].clone()).map_err(|e| {
                 sem_err(file, format!("{path}.split"), format!("split은 \"horizontal\" 또는 \"vertical\"이어야 함 ({e})"))
             })?;
@@ -202,7 +237,7 @@ fn parse_node<T>(
             };
             let mut children = Vec::new();
             for (i, c) in arr.iter().enumerate() {
-                children.push(parse_node(c, &format!("{path}.children[{i}]"), key, file, leaf)?);
+                children.push(parse_node(c, &format!("{path}.children[{i}]"), keys, file, leaf)?);
             }
             let sizes = fit_sizes(rest.sizes, children.len());
             Ok(LayoutNode::Split { dir, sizes, children, slot: rest.slot })
@@ -215,10 +250,16 @@ pub fn parse_template(text: &str, file: &Path) -> Result<Template, ConfigError> 
     let v: serde_json::Value = serde_json::from_str(text).map_err(|e| located_json_error(file, &e))?;
     let raw: RawTemplate =
         serde_json::from_value(v).map_err(|e| sem_err(file, "$", format!("템플릿 형식 오류: {e}")))?;
-    let layout = parse_node(&raw.layout, "layout", "pane", file, &|v, p| {
-        serde_json::from_value::<RawPane>(v.clone())
-            .map(pane_spec)
-            .map_err(|e| sem_err(file, p, format!("창 정의 오류: {e}")))
+    let layout = parse_node(&raw.layout, "layout", &["pane", "applet"], file, &|key, v, p| {
+        if key == "applet" {
+            serde_json::from_value::<RawApplet>(v.clone())
+                .map(applet_spec)
+                .map_err(|e| sem_err(file, p, format!("애플릿 정의 오류: {e}")))
+        } else {
+            serde_json::from_value::<RawPane>(v.clone())
+                .map(pane_spec)
+                .map_err(|e| sem_err(file, p, format!("창 정의 오류: {e}")))
+        }
     })?;
     Ok(Template { name: raw.name, layout })
 }
@@ -274,7 +315,22 @@ fn walk_template(
 ) {
     match n {
         LayoutNode::Leaf(p) => {
-            let pp = format!("{path}.pane");
+            let pp = format!("{path}.{}", if p.applet.is_some() { "applet" } else { "pane" });
+            if let Some(kind) = &p.applet {
+                if !APPLET_KINDS.contains(&kind.as_str()) {
+                    errs.push(sem_err(file, format!("{pp}.kind"), format!("알 수 없는 애플릿 종류 '{kind}' (inbox)")));
+                }
+                let given = [
+                    ("agent", p.agent.is_some()),
+                    ("args", !p.args.is_empty()),
+                    ("env", !p.env.is_empty()),
+                    ("cwd", p.cwd.is_some()),
+                    ("prompt", p.prompt.is_some()),
+                ];
+                for (field, _) in given.iter().filter(|(_, set)| *set) {
+                    errs.push(sem_err(file, format!("{pp}.{field}"), format!("애플릿 창에는 {field}을(를) 쓸 수 없음 (프로세스가 없음)")));
+                }
+            }
             if p.name.trim().is_empty() {
                 errs.push(sem_err(file, format!("{pp}.name"), "창 이름이 비어 있음"));
             } else if !seen.insert(p.name.clone()) {
@@ -310,6 +366,8 @@ pub struct TabSpec {
     pub name: String,
     pub dir: String,
     pub template: Option<String>,
+    /// `manager` | `handover` (the Dispatcher role is implied by `config.dispatcher`).
+    pub role: Option<Role>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -332,6 +390,53 @@ pub struct Config {
     pub groups: Option<LayoutNode<GroupSpec>>,
     pub default_group: Option<String>,
     pub tabs: Vec<TabSpec>,
+    /// Per-role settings (`roles.<role>`); roles without an entry use defaults.
+    pub roles: BTreeMap<Role, RoleConfig>,
+    /// Nightly refresh time "HH:MM" (24h). Absent = "03:00"; explicit `null` = off.
+    pub nightly_refresh: Option<String>,
+    /// Minutes to wait for `handoff_done` before restarting anyway (>= 1).
+    pub nightly_timeout_min: u32,
+    /// The refresh is postponed while the user typed into the Dispatcher within this many
+    /// minutes (0 = no grace period).
+    pub nightly_quiet_min: u32,
+    /// handover index document, relative to workspaceRoot (`None` = `HANDOVER.md`).
+    pub handover_index: Option<String>,
+    /// Indices (in `tabs`) that `parse_config` already reported invalid; `sanitize_config`
+    /// drops them silently so later JSON paths keep the file's numbering.
+    pub(crate) rejected_tabs: BTreeSet<usize>,
+}
+
+pub const DEFAULT_NIGHTLY_REFRESH: &str = "03:00";
+pub const DEFAULT_NIGHTLY_TIMEOUT_MIN: u32 = 20;
+pub const DEFAULT_NIGHTLY_QUIET_MIN: u32 = 10;
+pub const DEFAULT_HANDOVER_INDEX: &str = "HANDOVER.md";
+
+impl Config {
+    /// handover index path relative to workspaceRoot.
+    pub fn handover_index_path(&self) -> &str {
+        self.handover_index.as_deref().unwrap_or(DEFAULT_HANDOVER_INDEX)
+    }
+
+    /// `roles.member.maxPerTeam` (default 4).
+    pub fn max_per_team(&self) -> usize {
+        self.roles.get(&Role::Member).and_then(|r| r.max_per_team).unwrap_or(DEFAULT_MAX_PER_TEAM)
+    }
+
+    /// Settings of `role` (defaults when `roles` has no entry for it).
+    pub fn role_config(&self, role: Role) -> RoleConfig {
+        self.roles.get(&role).cloned().unwrap_or_default()
+    }
+}
+
+/// "HH:MM", 00:00–23:59, two digits each.
+pub fn valid_hhmm(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 5 || b[2] != b':' || !b.iter().enumerate().all(|(i, c)| i == 2 || c.is_ascii_digit()) {
+        return false;
+    }
+    let h = (b[0] - b'0') * 10 + (b[1] - b'0');
+    let m = (b[3] - b'0') * 10 + (b[4] - b'0');
+    h < 24 && m < 60
 }
 
 impl Default for Config {
@@ -343,6 +448,12 @@ impl Default for Config {
             groups: None,
             default_group: None,
             tabs: Vec::new(),
+            roles: BTreeMap::new(),
+            nightly_refresh: Some(DEFAULT_NIGHTLY_REFRESH.into()),
+            nightly_timeout_min: DEFAULT_NIGHTLY_TIMEOUT_MIN,
+            nightly_quiet_min: DEFAULT_NIGHTLY_QUIET_MIN,
+            handover_index: None,
+            rejected_tabs: BTreeSet::new(),
         }
     }
 }
@@ -363,6 +474,8 @@ struct RawTab {
     dir: String,
     #[serde(default)]
     template: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -389,6 +502,22 @@ struct RawConfig {
     default_group: Option<String>,
     #[serde(default)]
     tabs: Vec<RawTab>,
+    #[serde(default)]
+    roles: Option<serde_json::Value>,
+    /// Outer `None` = absent (default time), `Some(None)` = explicit `null` (off).
+    #[serde(default, deserialize_with = "present")]
+    nightly_refresh: Option<Option<String>>,
+    #[serde(default)]
+    nightly_timeout_min: Option<u32>,
+    #[serde(default)]
+    nightly_quiet_min: Option<u32>,
+    #[serde(default)]
+    handover_index: Option<String>,
+}
+
+/// Distinguishes an explicit `null` from an absent field (used with `#[serde(default)]`).
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
 }
 
 /// Returns the parsed config plus errors for parts that were dropped (currently: a malformed
@@ -399,7 +528,7 @@ pub fn parse_config(text: &str, file: &Path) -> Result<(Config, Vec<ConfigError>
     let mut errs = Vec::new();
     let groups = match raw.groups {
         None => None,
-        Some(v) => match parse_node(&v, "groups", "group", file, &|v, p| {
+        Some(v) => match parse_node(&v, "groups", &["group"], file, &|_, v, p| {
             serde_json::from_value::<RawGroup>(v.clone())
                 .map(|g| GroupSpec { name: g.name, tabs: g.tabs })
                 .map_err(|e| sem_err(file, p, format!("그룹 정의 오류: {e}")))
@@ -412,6 +541,71 @@ pub fn parse_config(text: &str, file: &Path) -> Result<(Config, Vec<ConfigError>
         },
     };
     let disp = raw.dispatcher.unwrap_or(RawDispatcher { agent: None, template: None });
+    let roles = match &raw.roles {
+        None => BTreeMap::new(),
+        Some(v) => {
+            let (r, e) = crate::roles::parse_roles(v, file);
+            errs.extend(e);
+            r
+        }
+    };
+    let nightly_refresh = match raw.nightly_refresh {
+        None => d.nightly_refresh.clone(),
+        Some(None) => None,
+        Some(Some(t)) if valid_hhmm(&t) => Some(t),
+        Some(Some(t)) => {
+            errs.push(sem_err(
+                file,
+                "nightlyRefresh",
+                format!("시각 '{t}'이(가) 올바르지 않음 (\"HH:MM\" 24시간 형식) — 기본값 {DEFAULT_NIGHTLY_REFRESH} 사용"),
+            ));
+            d.nightly_refresh.clone()
+        }
+    };
+    let nightly_timeout_min = match raw.nightly_timeout_min {
+        Some(0) => {
+            errs.push(sem_err(file, "nightlyTimeoutMin", format!("1 이상이어야 함 — 기본값 {DEFAULT_NIGHTLY_TIMEOUT_MIN} 사용")));
+            DEFAULT_NIGHTLY_TIMEOUT_MIN
+        }
+        Some(n) => n,
+        None => DEFAULT_NIGHTLY_TIMEOUT_MIN,
+    };
+    let handover_index = match raw.handover_index {
+        Some(h) if h.trim().is_empty() => {
+            errs.push(sem_err(file, "handoverIndex", format!("경로가 비어 있음 — 기본값 {DEFAULT_HANDOVER_INDEX} 사용")));
+            None
+        }
+        Some(h) => match check_relative(&h) {
+            Some(m) => {
+                errs.push(sem_err(file, "handoverIndex", format!("{m} (workspaceRoot 기준) — 기본값 {DEFAULT_HANDOVER_INDEX} 사용")));
+                None
+            }
+            None => Some(h),
+        },
+        None => None,
+    };
+    // tabs[].role: manager | handover only. A bad role drops the tab (reported here, skipped by
+    // sanitize_config so the remaining JSON paths keep the file's indices).
+    let mut rejected_tabs = BTreeSet::new();
+    let mut tabs = Vec::new();
+    for (i, t) in raw.tabs.into_iter().enumerate() {
+        let role = match t.role.as_deref() {
+            None => None,
+            Some("manager") => Some(Role::Manager),
+            Some("handover") => Some(Role::Handover),
+            Some(other) => {
+                let why = if other == "dispatcher" {
+                    "dispatcher 역할은 config.dispatcher로 정함".to_string()
+                } else {
+                    format!("탭 역할 '{other}'은(는) 쓸 수 없음")
+                };
+                errs.push(sem_err(file, format!("tabs[{i}].role"), format!("{why} — tabs[].role은 \"manager\" 또는 \"handover\"만 가능")));
+                rejected_tabs.insert(i);
+                None
+            }
+        };
+        tabs.push(TabSpec { name: t.name, dir: t.dir, template: t.template, role });
+    }
     let cfg = Config {
         dispatcher: DispatcherSpec {
             agent: disp.agent.or(d.dispatcher.agent),
@@ -421,7 +615,13 @@ pub fn parse_config(text: &str, file: &Path) -> Result<(Config, Vec<ConfigError>
         default_agent: raw.default_agent.unwrap_or(d.default_agent),
         groups,
         default_group: raw.default_group,
-        tabs: raw.tabs.into_iter().map(|t| TabSpec { name: t.name, dir: t.dir, template: t.template }).collect(),
+        tabs,
+        roles,
+        nightly_refresh,
+        nightly_timeout_min,
+        nightly_quiet_min: raw.nightly_quiet_min.unwrap_or(DEFAULT_NIGHTLY_QUIET_MIN),
+        handover_index,
+        rejected_tabs,
     };
     Ok((cfg, errs))
 }
@@ -431,7 +631,12 @@ pub fn sanitize_config(mut c: Config, file: &Path) -> (Config, Vec<ConfigError>)
     let mut errs = Vec::new();
     let mut names = BTreeSet::new();
     let mut kept = Vec::new();
+    let rejected = std::mem::take(&mut c.rejected_tabs);
+    let mut handover_seen = false;
     for (i, t) in std::mem::take(&mut c.tabs).into_iter().enumerate() {
+        if rejected.contains(&i) {
+            continue; // already reported by parse_config
+        }
         let p = format!("tabs[{i}]");
         let before = errs.len();
         if t.name.trim().is_empty() {
@@ -444,7 +649,16 @@ pub fn sanitize_config(mut c: Config, file: &Path) -> (Config, Vec<ConfigError>)
         if let Some(m) = check_relative(&t.dir) {
             errs.push(sem_err(file, format!("{p}.dir"), m));
         }
+        if t.role == Some(Role::Handover) {
+            // spec §8 (R11): the handover workspace is workspaceRoot; at most one handover tab
+            if !t.dir.is_empty() {
+                errs.push(sem_err(file, format!("{p}.dir"), "handover 탭의 dir은 빈 값(\"\")이어야 함 — 작업공간은 workspaceRoot"));
+            } else if handover_seen {
+                errs.push(sem_err(file, format!("{p}.role"), "handover 탭은 하나만 둘 수 있음"));
+            }
+        }
         if errs.len() == before {
+            handover_seen |= t.role == Some(Role::Handover);
             names.insert(t.name.clone());
             kept.push(t);
         }
@@ -1148,6 +1362,155 @@ mod tests {
         assert!(l.config.groups.is_none());
         assert_eq!(l.config.tabs.len(), 1);
         assert!(l.errors.iter().any(|e| e.json_path.as_deref() == Some("groups.split")));
+    }
+
+    // ── phase 2: roles, nightly settings, applet panes ──
+
+    fn cfg_errs(src: &str) -> (Config, Vec<ConfigError>) {
+        let p = Path::new("config.json");
+        let (c, mut errs) = parse_config(src, p).expect("parse");
+        let (c, e2) = sanitize_config(c, p);
+        errs.extend(e2);
+        (c, errs)
+    }
+    fn paths(errs: &[ConfigError]) -> Vec<String> {
+        errs.iter().map(|e| e.json_path.clone().unwrap_or_default()).collect()
+    }
+
+    #[test]
+    fn parses_roles_and_nightly_config() {
+        let (c, errs) = cfg_errs(
+            r#"{"tabs":[{"name":"handover","role":"handover","dir":"","template":"solo"},
+                        {"name":"billing","role":"manager","dir":"billing"},
+                        {"name":"plain","dir":"plain"}],
+                "nightlyRefresh":"23:30","nightlyTimeoutMin":30,"nightlyQuietMin":5,
+                "handoverIndex":"docs/HANDOVER.md",
+                "roles":{"dispatcher":{"systemPromptFile":"roles/dispatcher.md"},
+                         "lead":{"agent":"claude","args":["--model","opus"]},
+                         "member":{"systemPromptFile":"roles/member.md","maxPerTeam":6}}}"#,
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        let roles: Vec<_> = c.tabs.iter().map(|t| t.role).collect();
+        assert_eq!(roles, [Some(Role::Handover), Some(Role::Manager), None]);
+        assert_eq!(c.nightly_refresh.as_deref(), Some("23:30"));
+        assert_eq!((c.nightly_timeout_min, c.nightly_quiet_min), (30, 5));
+        assert_eq!(c.handover_index.as_deref(), Some("docs/HANDOVER.md"));
+        assert_eq!(c.handover_index_path(), "docs/HANDOVER.md");
+        assert_eq!(c.roles[&Role::Dispatcher].system_prompt_file.as_deref(), Some("roles/dispatcher.md"));
+        assert_eq!(c.roles[&Role::Lead].agent.as_deref(), Some("claude"));
+        assert_eq!(c.roles[&Role::Lead].args, ["--model", "opus"]);
+        assert_eq!(c.roles[&Role::Member].max_per_team, Some(6));
+        assert_eq!(c.max_per_team(), 6);
+        assert!(!c.roles.contains_key(&Role::Manager));
+
+        // defaults
+        let (d, errs) = cfg_errs("{}");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(d.nightly_refresh.as_deref(), Some("03:00"));
+        assert_eq!((d.nightly_timeout_min, d.nightly_quiet_min), (20, 10));
+        assert_eq!(d.handover_index, None);
+        assert_eq!(d.handover_index_path(), "HANDOVER.md");
+        assert!(d.roles.is_empty());
+        assert_eq!(d.max_per_team(), 4);
+        // explicit null switches the nightly refresh off
+        let (n, errs) = cfg_errs(r#"{"nightlyRefresh":null}"#);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(n.nightly_refresh, None);
+    }
+
+    #[test]
+    fn rejects_bad_nightly_time_and_dispatcher_role_in_tabs() {
+        for bad in ["3:00", "24:00", "03:60", "0300", "aa:bb", "", "03:00 "] {
+            let (c, errs) = cfg_errs(&format!(r#"{{"nightlyRefresh":"{bad}"}}"#));
+            assert_eq!(paths(&errs), ["nightlyRefresh"], "{bad:?}");
+            assert_eq!(c.nightly_refresh.as_deref(), Some("03:00"), "falls back to the default");
+        }
+        for ok in ["00:00", "23:59", "07:05"] {
+            let (_, errs) = cfg_errs(&format!(r#"{{"nightlyRefresh":"{ok}"}}"#));
+            assert!(errs.is_empty(), "{ok}: {errs:?}");
+        }
+        let (c, errs) = cfg_errs(r#"{"nightlyTimeoutMin":0,"nightlyQuietMin":0}"#);
+        assert_eq!(paths(&errs), ["nightlyTimeoutMin"]);
+        assert_eq!((c.nightly_timeout_min, c.nightly_quiet_min), (20, 0), "quiet 0 = no grace period");
+
+        // tabs[].role: only manager | handover; the offending tab alone is dropped
+        let (c, errs) = cfg_errs(
+            r#"{"tabs":[{"name":"a","role":"dispatcher","dir":"a"},{"name":"b","role":"lead","dir":"b"},
+                        {"name":"c","role":"boss","dir":"c"},{"name":"d","role":"manager","dir":"d"},
+                        {"name":"d","dir":"x"}]}"#,
+        );
+        assert_eq!(paths(&errs), ["tabs[0].role", "tabs[1].role", "tabs[2].role", "tabs[4].name"], "{errs:?}");
+        assert!(errs[0].message.contains("manager"), "{}", errs[0].message);
+        let names: Vec<_> = c.tabs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["d"]);
+
+        // roles: unknown role key / bad fields reported, the rest kept
+        let (c, errs) = cfg_errs(
+            r#"{"roles":{"boss":{},"lead":{"agentt":"x"},"manager":{"maxPerTeam":3},
+                         "member":{"maxPerTeam":0},"handover":{"systemPromptFile":"C:/x.md"},
+                         "dispatcher":{"systemPromptFile":"roles/d.md"}}}"#,
+        );
+        let mut p = paths(&errs);
+        p.sort();
+        assert_eq!(
+            p,
+            ["roles.boss", "roles.handover.systemPromptFile", "roles.lead", "roles.manager.maxPerTeam", "roles.member.maxPerTeam"],
+            "{errs:?}"
+        );
+        assert_eq!(c.roles.keys().copied().collect::<Vec<_>>(), [Role::Dispatcher]);
+        // a wrongly typed roles value is a located error, not a dropped config
+        let (_, errs) = cfg_errs(r#"{"roles":[],"tabs":[{"name":"a","dir":"a"}]}"#);
+        assert_eq!(paths(&errs), ["roles"]);
+        // handoverIndex must stay inside the root
+        let (c, errs) = cfg_errs(r#"{"handoverIndex":"../x.md"}"#);
+        assert_eq!(paths(&errs), ["handoverIndex"]);
+        assert_eq!(c.handover_index_path(), "HANDOVER.md");
+    }
+
+    #[test]
+    fn handover_tab_rules_in_config() {
+        let (c, errs) = cfg_errs(
+            r#"{"tabs":[{"name":"h1","role":"handover","dir":"sub"},{"name":"h2","role":"handover","dir":""},
+                        {"name":"h3","role":"handover"},{"name":"m","role":"manager","dir":""}]}"#,
+        );
+        assert_eq!(paths(&errs), ["tabs[0].dir", "tabs[2].role"], "{errs:?}");
+        let names: Vec<_> = c.tabs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["h2", "m"], "other tabs keep the phase-1 empty-dir rule");
+    }
+
+    #[test]
+    fn applet_node_parses_and_rejects_agent_fields() {
+        let src = r#"{"name":"dispatcher-inbox","layout":{"split":"horizontal","sizes":[60,40],"children":[
+            {"pane":{"name":"dispatcher","focus":true}},
+            {"applet":{"name":"inbox","kind":"inbox"}}]}}"#;
+        let t = tpl(src);
+        let leaves = t.layout.leaves();
+        assert_eq!(leaves[0].applet, None);
+        assert_eq!(leaves[1].name, "inbox");
+        assert_eq!(leaves[1].applet.as_deref(), Some("inbox"));
+        assert!(validate_template(&t, f(), &agents(&["claude"])).is_empty());
+
+        for (field, val) in [("agent", r#""claude""#), ("cwd", r#""x""#), ("prompt", r#""hi""#), ("args", r#"["a"]"#)] {
+            let t = tpl(&format!(r#"{{"name":"x","layout":{{"applet":{{"name":"inbox","kind":"inbox","{field}":{val}}}}}}}"#));
+            let errs = validate_template(&t, f(), &agents(&["claude"]));
+            assert_eq!(paths(&errs), [format!("layout.applet.{field}")], "{field}");
+        }
+        // unknown kind / unknown field / missing kind
+        let t = tpl(r#"{"name":"x","layout":{"applet":{"name":"a","kind":"clock"}}}"#);
+        assert_eq!(paths(&validate_template(&t, f(), &agents(&[]))), ["layout.applet.kind"]);
+        let e = perr(r#"{"name":"x","layout":{"applet":{"name":"a","kind":"inbox","foo":1}}}"#);
+        assert_eq!(e.json_path.as_deref(), Some("layout.applet"));
+        assert!(e.message.contains("foo"), "{}", e.message);
+        let e = perr(r#"{"name":"x","layout":{"applet":{"name":"a"}}}"#);
+        assert_eq!(e.json_path.as_deref(), Some("layout.applet"));
+        // pane and applet together, applet names share the pane-name namespace
+        let e = perr(r#"{"name":"x","layout":{"pane":{"name":"a"},"applet":{"name":"b","kind":"inbox"}}}"#);
+        assert_eq!(e.json_path.as_deref(), Some("layout"));
+        let t = tpl(r#"{"name":"x","layout":{"split":"horizontal","children":[{"pane":{"name":"a"}},{"applet":{"name":"a","kind":"inbox"}}]}}"#);
+        assert_eq!(paths(&validate_template(&t, f(), &agents(&[]))), ["layout.children[1].applet.name"]);
+        // a template made only of applets has no terminal pane
+        let t = tpl(r#"{"name":"x","layout":{"applet":{"name":"a","kind":"inbox"}}}"#);
+        assert!(validate_template(&t, f(), &agents(&[])).is_empty());
     }
 
     #[test]

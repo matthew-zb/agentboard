@@ -299,3 +299,24 @@ test('fanoutIds: input goes to source + eligible targets once; replies to source
   assert.deepEqual(fanoutIds('a', [], 'x', of), ['a']);
   assert.deepEqual(fanoutIds('a', ['b'], '\x1b[200~paste\x1b[201~', of), ['a', 'b']);
 });
+
+// ---- phase 2 Task 3: applet panes (no xterm, no process)
+import { isApplet, appletLabel } from '../../src/pane.js';
+
+test('isApplet: only kind.type applet; phase-1 panes without kind are terminals', () => {
+  assert.equal(isApplet({ kind: { type: 'applet', kind: 'inbox' } }), true);
+  assert.equal(isApplet({ kind: { type: 'terminal' } }), false);
+  assert.equal(isApplet({}), false);
+  assert.equal(isApplet(null), false);
+});
+
+test('appletLabel: Korean placeholder per applet kind', () => {
+  assert.equal(appletLabel({ kind: { type: 'applet', kind: 'inbox' } }), '인박스 (준비 중)');
+  assert.match(appletLabel({ kind: { type: 'applet', kind: 'clock' } }), /준비 중/);
+});
+
+test('syncTargets: applet panes never receive input', () => {
+  const ws = wsSync(true);
+  ws.panes.app = { id: 'app', tab: 't1', status: { state: 'running' }, kind: { type: 'applet', kind: 'inbox' } };
+  assert.deepEqual([...syncTargets(ws, 'a')].sort(), ['a', 'b']);
+});

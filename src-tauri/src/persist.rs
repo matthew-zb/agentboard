@@ -216,7 +216,7 @@ mod tests {
     use super::*;
     use crate::config::{ensure_dotdir, load_all, Loaded};
     use crate::layout::{Dir, LayoutNode};
-    use crate::workspace::{Counters, Location, PaneStatus, WsCommand};
+    use crate::workspace::{Counters, Location, PaneKind, PaneStatus, WsCommand};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -436,6 +436,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(b.tabs.len(), back.tabs.len() + 1);
+    }
+
+    /// A workspace.json written by phase 1 (no kind/role/team/sessionName on panes, no role on
+    /// tabs) loads, and the new fields take their defaults.
+    #[test]
+    fn phase1_workspace_json_still_loads() {
+        let phase1 = r#"{
+          "groupLayout": {"leaf": "g1"},
+          "groups": {"g1": {"id": "g1", "name": "main", "tabIds": ["t1", "t2"], "activeTabId": "t1"}},
+          "tabs": {
+            "t1": {"id": "t1", "name": "dispatcher", "dir": "", "template": "dispatcher", "isDispatcher": true,
+                   "workspace": "C:/workspace", "layout": {"leaf": "p1"}, "lastFocusedPaneId": "p1",
+                   "maximizedPaneId": null, "syncInput": false},
+            "t2": {"id": "t2", "name": "api", "dir": "api", "template": "solo", "isDispatcher": false,
+                   "workspace": "C:/workspace/api",
+                   "layout": {"split": "horizontal", "sizes": [50, 50], "children": [{"leaf": "p2"}, {"leaf": "p3"}]},
+                   "lastFocusedPaneId": "p2", "maximizedPaneId": null, "syncInput": true}
+          },
+          "panes": {
+            "p1": {"id": "p1", "name": "dispatcher", "tab": "t1", "agent": "claude", "args": [], "env": {},
+                   "cwd": "C:/workspace", "prompt": null, "status": {"state": "running"}, "attention": false,
+                   "promptWarning": false},
+            "p2": {"id": "p2", "name": "main", "tab": "t2", "agent": "claude", "args": ["--x"], "env": {"A": "1"},
+                   "cwd": "C:/workspace/api", "prompt": "hi", "status": {"state": "exited", "code": 1},
+                   "attention": true, "promptWarning": false},
+            "p3": {"id": "p3", "name": "pane-1", "tab": "t2", "agent": "cmd", "args": [], "env": {},
+                   "cwd": "C:/workspace/api", "prompt": null, "status": {"state": "starting"}, "attention": false,
+                   "promptWarning": true}
+          },
+          "focus": {"groupId": "g1"},
+          "lastLocation": null,
+          "groupMaximized": null,
+          "counters": {"group": 1, "tab": 2, "pane": 3}
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(path(&dir), phase1).unwrap();
+        let ws = load(&path(&dir)).unwrap().expect("phase-1 file loads");
+        assert_eq!(ws.tabs.len(), 2);
+        assert!(ws.tabs.values().all(|t| t.role.is_none()));
+        for p in ws.panes.values() {
+            assert_eq!(p.kind, PaneKind::Terminal, "{}", p.id);
+            assert_eq!((p.role, p.team.clone(), p.session_name.clone()), (None, None, None), "{}", p.id);
+        }
+        assert_eq!(ws.panes["p2"].args, ["--x"]);
+        // saving writes the new fields; the result round-trips
+        save_atomic(&path(&dir), &ws).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path(&dir)).unwrap()).unwrap();
+        assert_eq!(v["panes"]["p1"]["kind"], serde_json::json!({"type": "terminal"}));
+        assert_eq!(load(&path(&dir)).unwrap().unwrap(), ws);
     }
 
     #[test]

@@ -71,6 +71,22 @@ export function keepRestartMark(state, action, marked) {
   return !!marked && action === 'none' && state !== 'failed' && state !== 'exited';
 }
 
+/**
+ * Applet pane (`kind: {type: 'applet', kind}`): an app screen, not a terminal — no xterm, no
+ * process, no input. Panes without `kind` (phase-1 snapshots) are terminals.
+ */
+export function isApplet(pane) {
+  return !!(pane && pane.kind && pane.kind.type === 'applet');
+}
+
+const APPLET_LABELS = { inbox: '인박스 (준비 중)' };
+
+/** Placeholder text for an applet until its real view exists. */
+export function appletLabel(pane) {
+  const k = pane && pane.kind && pane.kind.kind;
+  return APPLET_LABELS[k] || `애플릿 '${k}' (준비 중)`;
+}
+
 /** Known pane ids that are no longer in the snapshot's `panes` map. */
 export function staleIds(knownIds, panes) {
   return [...knownIds].filter((id) => !Object.prototype.hasOwnProperty.call(panes, id));
@@ -90,7 +106,7 @@ export function syncTargets(ws, paneId) {
   const tab = p && ws.tabs && ws.tabs[p.tab];
   if (!tab || !tab.syncInput) return null;
   return Object.values(ws.panes)
-    .filter((q) => q.tab === p.tab && q.status && q.status.state === 'running')
+    .filter((q) => q.tab === p.tab && !isApplet(q) && q.status && q.status.state === 'running')
     .map((q) => q.id);
 }
 
@@ -164,12 +180,59 @@ function div(cls) {
  * until placed). Attach happens in syncPane once the status allows it (a `starting` pane has no
  * process to attach to yet).
  */
-export function getPane(paneId) {
+export function getPane(paneId, model) {
   let e = entries.get(paneId);
   if (!e) {
-    e = createEntry(paneId);
+    e = isApplet(model) ? createAppletEntry(paneId, model) : createEntry(paneId);
     entries.set(paneId, e);
   }
+  return e;
+}
+
+/**
+ * Entry for an applet pane: same element/header shape as a terminal entry but `term: null`
+ * (no xterm, no attach, no input). Placeholder content until the applet view lands (Task 10).
+ */
+function createAppletEntry(id, model) {
+  const el = div('pane applet');
+  el.dataset.pane = id;
+  const header = div('pane-header');
+  const host = div('applet-host');
+  const body = div('applet-placeholder');
+  body.textContent = appletLabel(model);
+  host.appendChild(body);
+  el.append(header, host);
+  parking().appendChild(el);
+  const e = {
+    id,
+    el,
+    header,
+    host,
+    restartLine: null,
+    term: null,
+    fitAddon: null,
+    search: null,
+    model: null,
+    ctx: null,
+    prevState: null,
+    attachState: 'none',
+    gen: 0,
+    restartMarked: false,
+    suppressInput: true, // never a sync-input target
+    live: false,
+    queue: [],
+    lastSize: null,
+    visible: false,
+    fitQueued: false,
+    resizeTimer: null,
+    writeFailed: false,
+    inputBlocked: false,
+    ro: null,
+  };
+  el.tabIndex = -1; // focusable, so pane focus has somewhere to go
+  el.addEventListener('mousedown', () => {
+    if (e.ctx && !e.ctx.focused) hooks.onFocus(e.ctx.group, e.ctx.tab, id);
+  });
   return e;
 }
 
@@ -297,7 +360,7 @@ export function setInputBlocked(paneId, blocked) {
  */
 export function pasteText(paneId, text) {
   const e = entries.get(paneId);
-  if (!e || e.inputBlocked || !text) return false;
+  if (!e || !e.term || e.inputBlocked || !text) return false;
   e.term.paste(text);
   return true;
 }
@@ -315,7 +378,7 @@ export function paneHeader(pane) {
   name.textContent = pane.name;
   const profile = document.createElement('span');
   profile.className = 'pane-profile';
-  profile.textContent = pane.agent;
+  profile.textContent = isApplet(pane) ? '애플릿' : pane.agent;
   h.append(status, name, profile);
   const warn = warnTitle(pane);
   if (warn) {
@@ -371,7 +434,7 @@ export function restartPane(paneId) {
  * focus chain ends at this pane). Updates header/classes and attaches when appropriate.
  */
 export function syncPane(pane, ctx) {
-  const e = getPane(pane.id);
+  const e = getPane(pane.id, pane);
   const prev = e.prevState;
   const state = pane.status && pane.status.state;
   e.model = pane;
@@ -381,6 +444,11 @@ export function syncPane(pane, ctx) {
   e.header.replaceWith(h);
   e.header = h;
   e.el.classList.toggle('focused', !!ctx.focused);
+  if (!e.term) {
+    // applet: no process to attach to, nothing to restart into
+    e.prevState = state;
+    return e;
+  }
   e.el.classList.toggle('dead', isDead(pane));
   e.restartLine.classList.toggle('hidden', !isDead(pane));
 
@@ -463,7 +531,7 @@ function scheduleFit(e) {
 /** Fit the terminal to its container; pty_resize only when cols/rows change. */
 export function fitPane(paneId) {
   const e = entries.get(paneId);
-  if (!e || !e.visible || !e.el.isConnected) return;
+  if (!e || !e.term || !e.visible || !e.el.isConnected) return;
   if (e.host.clientWidth < 20 || e.host.clientHeight < 20) return;
   try {
     e.fitAddon.fit();
@@ -493,7 +561,8 @@ export function focusPane(paneId) {
   const e = entries.get(paneId);
   if (!e || !e.el.isConnected) return;
   if (e.el.contains(document.activeElement)) return;
-  e.term.focus();
+  if (e.term) e.term.focus();
+  else e.el.focus({ preventScroll: true });
 }
 
 /** Called for panes missing from the snapshot. */
@@ -503,9 +572,9 @@ export function disposePane(paneId) {
   e.gen++; // ignore late attach callbacks
   clearTimeout(e.resizeTimer);
   entries.delete(paneId);
-  e.ro.disconnect();
+  if (e.ro) e.ro.disconnect();
   try {
-    e.term.dispose();
+    if (e.term) e.term.dispose();
   } catch (_) {
     /* already gone */
   }

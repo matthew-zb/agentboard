@@ -79,6 +79,9 @@ pub fn profile_for<'a>(pane: &Pane, loaded: &'a Loaded) -> Option<&'a AgentProfi
 /// Pure core of spawning: profile lookup, cwd check, command resolution, args/env merge.
 /// The working folder is checked before the command so the user sees the real cause.
 pub fn plan_spawn(pane: &Pane, loaded: &Loaded) -> Result<SpawnSpec, String> {
+    if pane.kind.is_applet() {
+        return Err("애플릿 창은 프로세스를 실행하지 않습니다".into());
+    }
     let profile = profile_for(pane, loaded).ok_or_else(|| {
         format!("프로필을 찾을 수 없습니다: {} (기본값 {})", pane.agent, loaded.config.default_agent)
     })?;
@@ -317,6 +320,13 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
         std::thread::sleep(Duration::from_millis(20));
     }
     let Some(pane) = state.ws.lock().unwrap().pane_by_id(id).cloned() else { return }; // closed meanwhile
+    if pane.kind.is_applet() {
+        // An applet is an app screen: never a process, always shown as Running. No PtyManager
+        // call, no prompt job (locks taken one at a time, nothing nested).
+        state.prompts.lock().unwrap().remove(id);
+        state.ws.lock().unwrap().set_status(id, PaneStatus::Running);
+        return;
+    }
     let (plan, job) = {
         let loaded = state.loaded.read().unwrap();
         let plan = plan_spawn(&pane, &loaded);
@@ -439,7 +449,7 @@ mod tests {
     use super::*;
     use crate::config::{load_all, ensure_dotdir};
     use crate::profiles::{encode_submit, Ready, READY_TIMEOUT};
-    use crate::workspace::{PaneStatus, WsCommand};
+    use crate::workspace::{PaneKind, PaneStatus, WsCommand};
     use regex::Regex;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -501,6 +511,10 @@ mod tests {
             status: PaneStatus::Starting,
             attention: false,
             prompt_warning: false,
+            kind: PaneKind::Terminal,
+            role: None,
+            team: None,
+            session_name: None,
         }
     }
 
@@ -797,6 +811,57 @@ mod tests {
         assert!(err.is_err());
         assert_eq!(rt.ui.snaps.lock().unwrap().len(), n);
         assert!(rt.rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn applet_pane_is_never_spawned() {
+        let Fx { loaded, root, _appdata } = fixture();
+        std::fs::write(
+            root.path().join(".agentboard/templates/dispatcher-inbox.json"),
+            r#"{"name":"dispatcher-inbox","layout":{"split":"horizontal","children":[
+                {"pane":{"name":"dispatcher","focus":true}},{"applet":{"name":"inbox","kind":"inbox"}}]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join(".agentboard/config.json"),
+            r#"{"defaultAgent":"cmd","dispatcher":{"agent":"cmd","template":"dispatcher-inbox"}}"#,
+        )
+        .unwrap();
+        drop(loaded);
+        let loaded = load_all(_appdata.path());
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        let ws = Workspace::from_config(&loaded);
+        let id = |name: &str| ws.panes.values().find(|p| p.name == name).unwrap().id.clone();
+        let (inbox, disp) = (id("inbox"), id("dispatcher"));
+        let ui = std::sync::Arc::new(RecUi::default());
+        let (tx, rx) = mpsc::channel();
+        let pty = crate::pty::PtyManager::new_per_child_job(std::sync::Arc::new(NullSink));
+        let state = AppState::new(ws, loaded, pty, ui.clone(), tx, crate::persist::Saver::disabled(), Vec::new());
+        let rt = Rt { state, ui, rx, pane: disp.clone(), _keep: (root, _appdata) };
+        let state = &rt.state;
+
+        let fx = initial_effects(&state.ws.lock().unwrap());
+        assert!(fx.spawn.iter().any(|(p, _)| *p == inbox));
+        run_effects(state, fx);
+        assert_eq!(status(state, &inbox), PaneStatus::Running, "applet shows Running without a process");
+        assert_eq!(state.pty.current_gen(&inbox), None, "no PTY for an applet");
+        assert!(!state.pty.is_running(&inbox));
+        assert!(state.prompts.lock().unwrap().get(&inbox).is_none());
+        assert!(state.pty.current_gen(&disp).is_some(), "the terminal pane next to it is spawned");
+
+        // restart / restored-workspace respawn: still no process
+        execute(state, WsCommand::RestartPane { pane: inbox.clone() }).unwrap();
+        assert_eq!(status(state, &inbox), PaneStatus::Starting);
+        run_effects(state, rt.rx.try_recv().expect("restart effects"));
+        assert_eq!(status(state, &inbox), PaneStatus::Running);
+        assert_eq!(state.pty.current_gen(&inbox), None);
+        let fx = state.ws.lock().unwrap().reset_runtime_state();
+        run_effects(state, fx);
+        assert_eq!(status(state, &inbox), PaneStatus::Running);
+        assert_eq!(state.pty.current_gen(&inbox), None);
+        // the planner refuses an applet outright (defence in depth)
+        let p = state.ws.lock().unwrap().pane_by_id(&inbox).cloned().unwrap();
+        assert!(plan_spawn(&p, &state.loaded.read().unwrap()).is_err());
     }
 
     #[test]

@@ -6,6 +6,7 @@
 use crate::config::{check_relative, GroupSpec, Loaded, PaneSpec, Template};
 use crate::layout::{Dir, LayoutNode, Side};
 use crate::profiles::resolve_cwd;
+use crate::roles::{session_name, Role};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -26,6 +27,23 @@ pub enum PaneStatus {
     Failed { message: String },
 }
 
+/// What a pane shows. Wire shape: `{"type":"terminal"}` | `{"type":"applet","kind":"inbox"}`.
+/// An applet is an app screen rendered by the frontend: it never has a process (the launcher
+/// marks it `Running` without spawning) and its `agent` is empty.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum PaneKind {
+    #[default]
+    Terminal,
+    Applet { kind: String },
+}
+
+impl PaneKind {
+    pub fn is_applet(&self) -> bool {
+        matches!(self, PaneKind::Applet { .. })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Pane {
@@ -43,6 +61,18 @@ pub struct Pane {
     pub status: PaneStatus,
     pub attention: bool,
     pub prompt_warning: bool,
+    // ── phase 2 (all default when loading a phase-1 workspace.json) ──
+    #[serde(default)]
+    pub kind: PaneKind,
+    /// Agent role; `None` for phase-1 panes, applets and extra panes of a role tab.
+    #[serde(default)]
+    pub role: Option<Role>,
+    /// Team id for `Lead` / `Member` panes.
+    #[serde(default)]
+    pub team: Option<String>,
+    /// Claude Code session name (`--name`, see `roles::session_name`); set for role panes only.
+    #[serde(default)]
+    pub session_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -61,6 +91,10 @@ pub struct Tab {
     pub last_focused_pane_id: PaneId,
     pub maximized_pane_id: Option<PaneId>,
     pub sync_input: bool,
+    /// `Dispatcher` for the Dispatcher tab, `Manager` / `Handover` from `config.tabs[].role`,
+    /// `None` for phase-1 tabs (and tabs created / broken off at run time).
+    #[serde(default)]
+    pub role: Option<Role>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -198,11 +232,12 @@ impl Workspace {
             .templates
             .get(&cfg.dispatcher.template)
             .expect("load_all guarantees the dispatcher template");
-        let mut made: Vec<(String, TabId)> = vec![("dispatcher".into(), ws.build_tab("dispatcher", "", dtpl, true, loaded))];
+        let mut made: Vec<(String, TabId)> =
+            vec![("dispatcher".into(), ws.build_tab("dispatcher", "", dtpl, true, Some(Role::Dispatcher), loaded))];
         for t in &cfg.tabs {
             let tn = t.template.as_deref().unwrap_or(&cfg.default_template);
             let Some(tpl) = loaded.templates.get(tn) else { continue };
-            made.push((t.name.clone(), ws.build_tab(&t.name, &t.dir, tpl, false, loaded)));
+            made.push((t.name.clone(), ws.build_tab(&t.name, &t.dir, tpl, false, t.role, loaded)));
         }
 
         // placement
@@ -355,9 +390,12 @@ impl Workspace {
         Effects { spawn: self.panes.keys().map(|id| (id.clone(), false)).collect(), kill: Vec::new() }
     }
 
-    /// Panes whose process is alive (`starting` or `running`).
+    /// Panes whose process is alive (`starting` or `running`). Applets have no process.
     pub fn running_count(&self) -> usize {
-        self.panes.values().filter(|p| matches!(p.status, PaneStatus::Starting | PaneStatus::Running)).count()
+        self.panes
+            .values()
+            .filter(|p| !p.kind.is_applet() && matches!(p.status, PaneStatus::Starting | PaneStatus::Running))
+            .count()
     }
 
     pub fn pane_by_id(&self, id: &str) -> Option<&Pane> {
@@ -387,7 +425,7 @@ impl Workspace {
                 };
                 let tn = template.unwrap_or_else(|| loaded.config.default_template.clone());
                 let tpl = loaded.templates.get(&tn).ok_or_else(|| format!("템플릿 '{tn}'을(를) 찾을 수 없습니다"))?;
-                let tid = self.build_tab(&name, &dir, tpl, false, loaded);
+                let tid = self.build_tab(&name, &dir, tpl, false, None, loaded);
                 fx.spawn = self.tabs[&tid].layout.leaves().into_iter().map(|p| (p, true)).collect();
                 self.groups.get_mut(&gid).unwrap().tab_ids.push(tid.clone());
                 self.activate_tab(&gid, &tid);
@@ -416,6 +454,8 @@ impl Workspace {
                 let names: BTreeSet<String> = t.layout.leaves().iter().map(|p| self.panes[p].name.clone()).collect();
                 let name = (1..).map(|n| format!("pane-{n}")).find(|n| !names.contains(n)).unwrap();
                 let cwd = t.workspace.clone();
+                // the new pane is always a plain terminal (an applet has no agent to copy)
+                let agent = if src.kind.is_applet() { loaded.config.default_agent.clone() } else { src.agent.clone() };
                 let id = self.new_pane_id();
                 self.panes.insert(
                     id.clone(),
@@ -423,7 +463,7 @@ impl Workspace {
                         id: id.clone(),
                         name,
                         tab: src.tab.clone(),
-                        agent: src.agent.clone(),
+                        agent,
                         args: Vec::new(),
                         env: BTreeMap::new(),
                         cwd,
@@ -431,6 +471,10 @@ impl Workspace {
                         status: PaneStatus::Starting,
                         attention: false,
                         prompt_warning: false,
+                        kind: PaneKind::Terminal,
+                        role: None,
+                        team: None,
+                        session_name: None,
                     },
                 );
                 let t = self.tabs.get_mut(&src.tab).unwrap();
@@ -528,6 +572,8 @@ impl Workspace {
                         last_focused_pane_id: pane.clone(),
                         maximized_pane_id: None,
                         sync_input: false,
+                        // a broken-off tab is a plain tab; the pane keeps its own role
+                        role: None,
                     },
                 );
                 self.panes.get_mut(&pane).unwrap().tab = nid.clone();
@@ -705,10 +751,25 @@ impl Workspace {
     }
 
     /// Create a tab (not yet placed in a group) and its panes from a template.
-    fn build_tab(&mut self, name: &str, dir: &str, tpl: &Template, is_dispatcher: bool, loaded: &Loaded) -> TabId {
+    ///
+    /// `role` is the tab's role (`Dispatcher` for the Dispatcher tab, `Manager` / `Handover`
+    /// from config). Exactly one pane of a role tab is the standing agent and carries the role
+    /// and `session_name` (= tab name): the template's `focus` pane when it is a terminal, else
+    /// the first terminal pane. Other terminal panes of the tab (helpers such as a shell) and
+    /// applets get no role. A handover tab's workspace is workspaceRoot (its `dir` is "").
+    fn build_tab(
+        &mut self,
+        name: &str,
+        dir: &str,
+        tpl: &Template,
+        is_dispatcher: bool,
+        role: Option<Role>,
+        loaded: &Loaded,
+    ) -> TabId {
         let cfg = &loaded.config;
         let root = &loaded.settings.workspace_root;
-        let workspace = if is_dispatcher || dir.is_empty() { root.clone() } else { root.join(dir) };
+        let at_root = is_dispatcher || role == Some(Role::Handover) || dir.is_empty();
+        let workspace = if at_root { root.clone() } else { root.join(dir) };
         let default_agent = if is_dispatcher {
             cfg.dispatcher.agent.clone().unwrap_or_else(|| cfg.default_agent.clone())
         } else {
@@ -716,17 +777,27 @@ impl Workspace {
         };
         let id = self.new_tab_id();
         let specs: Vec<PaneSpec> = tpl.layout.leaves();
+        let standing = role.and_then(|_| {
+            let focus = specs.iter().position(|s| s.focus && s.applet.is_none());
+            focus.or_else(|| specs.iter().position(|s| s.applet.is_none()))
+        });
         let ids: Vec<PaneId> = specs
             .iter()
-            .map(|s| {
+            .enumerate()
+            .map(|(i, s)| {
                 let pid = self.new_pane_id();
+                let (kind, agent) = match &s.applet {
+                    Some(k) => (PaneKind::Applet { kind: k.clone() }, String::new()),
+                    None => (PaneKind::Terminal, s.agent.clone().unwrap_or_else(|| default_agent.clone())),
+                };
+                let pane_role = if standing == Some(i) { role } else { None };
                 self.panes.insert(
                     pid.clone(),
                     Pane {
                         id: pid.clone(),
                         name: s.name.clone(),
                         tab: id.clone(),
-                        agent: s.agent.clone().unwrap_or_else(|| default_agent.clone()),
+                        agent,
                         args: s.args.clone(),
                         env: s.env.clone(),
                         cwd: resolve_cwd(&workspace, s.cwd.as_deref()),
@@ -734,6 +805,10 @@ impl Workspace {
                         status: PaneStatus::Starting,
                         attention: false,
                         prompt_warning: false,
+                        kind,
+                        role: pane_role,
+                        team: None,
+                        session_name: pane_role.map(|r| session_name(name, r, None, 0)),
                     },
                 );
                 pid
@@ -755,6 +830,7 @@ impl Workspace {
                 last_focused_pane_id: last,
                 maximized_pane_id: None,
                 sync_input: false,
+                role,
             },
         );
         id
@@ -1216,6 +1292,111 @@ mod tests {
         ws.set_status(&ids[2], PaneStatus::Running);
         ws.set_status("nope", PaneStatus::Running);
         assert_eq!(ws.running_count(), 2);
+    }
+
+    // ── phase 2: roles, handover, applet panes ──
+
+    const INBOX_TPL: &str = r#"{"name":"dispatcher-inbox","layout":{"split":"horizontal","sizes":[60,40],"children":[
+        {"pane":{"name":"dispatcher","focus":true}},{"applet":{"name":"inbox","kind":"inbox"}}]}}"#;
+    const MANAGER_TPL: &str = r#"{"name":"manager","layout":{"split":"horizontal","children":[
+        {"pane":{"name":"shell","agent":"powershell"}},{"pane":{"name":"manager","focus":true}},{"pane":{"name":"extra"}}]}}"#;
+
+    /// Load with extra template files; returns errors instead of asserting none.
+    fn loaded_files(config: &str, templates: &[(&str, &str)]) -> Loaded {
+        let root = tempfile::tempdir().unwrap().keep();
+        let appdata = tempfile::tempdir().unwrap();
+        let s = serde_json::json!({ "workspaceRoot": root.to_string_lossy() });
+        std::fs::write(appdata.path().join("settings.json"), s.to_string()).unwrap();
+        ensure_dotdir(&root).unwrap();
+        for (n, c) in templates {
+            std::fs::write(root.join(".agentboard/templates").join(n), c).unwrap();
+        }
+        std::fs::write(root.join(".agentboard/config.json"), config).unwrap();
+        load_all(appdata.path())
+    }
+
+    #[test]
+    fn handover_tab_workspace_is_root_and_unique() {
+        let l = loaded_files(
+            r#"{"tabs":[{"name":"handover","role":"handover","dir":""},
+                        {"name":"h-sub","role":"handover","dir":"sub"},
+                        {"name":"h2","role":"handover"},
+                        {"name":"billing","role":"manager","dir":"billing"}]}"#,
+            &[],
+        );
+        let cfg_errs: Vec<_> = l.errors.iter().filter_map(|e| e.json_path.clone()).collect();
+        assert_eq!(cfg_errs, ["tabs[1].dir", "tabs[2].role"], "{:?}", l.errors);
+        let ws = Workspace::from_config(&l);
+        let h = tab(&ws, "handover");
+        assert_eq!(h.role, Some(Role::Handover));
+        assert_eq!(h.workspace, root(&l), "handover works in workspaceRoot");
+        assert_eq!(h.dir, "");
+        assert!(!has_tab(&ws, "h-sub") && !has_tab(&ws, "h2"));
+        assert_eq!(ws.tabs.values().filter(|t| t.role == Some(Role::Handover)).count(), 1);
+        let b = tab(&ws, "billing");
+        assert_eq!(b.role, Some(Role::Manager));
+        assert_eq!(b.workspace, root(&l).join("billing"));
+        let p = &ws.panes[&b.layout.leaves()[0]];
+        assert_eq!(p.cwd, root(&l).join("billing"));
+    }
+
+    #[test]
+    fn standing_panes_get_roles_and_session_names() {
+        let l = loaded_files(
+            r#"{"dispatcher":{"template":"dispatcher-inbox"},
+                "tabs":[{"name":"billing","role":"manager","dir":"billing","template":"manager"},
+                        {"name":"plain","dir":"plain","template":"team-3"}]}"#,
+            &[("dispatcher-inbox.json", INBOX_TPL), ("manager.json", MANAGER_TPL)],
+        );
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        let ws = Workspace::from_config(&l);
+
+        let d = tab(&ws, "dispatcher");
+        assert_eq!(d.role, Some(Role::Dispatcher));
+        let dp = &ws.panes[&pane(&ws, "dispatcher", "dispatcher")];
+        assert_eq!((dp.kind.clone(), dp.role), (PaneKind::Terminal, Some(Role::Dispatcher)));
+        assert_eq!(dp.session_name.as_deref(), Some("dispatcher"));
+        let inbox = &ws.panes[&pane(&ws, "dispatcher", "inbox")];
+        assert_eq!(inbox.kind, PaneKind::Applet { kind: "inbox".into() });
+        assert_eq!((inbox.role, inbox.session_name.clone(), inbox.prompt.clone()), (None, None, None));
+
+        // only the focus terminal pane is the standing agent
+        let m = &ws.panes[&pane(&ws, "billing", "manager")];
+        assert_eq!(m.role, Some(Role::Manager));
+        assert_eq!(m.session_name.as_deref(), Some("billing"));
+        for other in ["shell", "extra"] {
+            let p = &ws.panes[&pane(&ws, "billing", other)];
+            assert_eq!((p.role, p.session_name.clone()), (None, None), "{other}");
+        }
+        assert!(ws.panes.values().all(|p| p.team.is_none()));
+        // phase-1 tabs carry no role at all
+        assert_eq!(tab(&ws, "plain").role, None);
+        assert!(tab(&ws, "plain").layout.leaves().iter().all(|p| ws.panes[p].role.is_none()));
+        // a tab created at run time has no role either
+        let mut ws2 = ws.clone();
+        ws2.apply(create("web", "solo"), &l).unwrap();
+        assert_eq!(tab(&ws2, "web").role, None);
+        assert!(ws2.panes[&pane(&ws2, "web", "main")].role.is_none());
+    }
+
+    #[test]
+    fn applet_panes_have_no_process() {
+        let l = loaded_files(
+            r#"{"dispatcher":{"template":"dispatcher-inbox"}}"#,
+            &[("dispatcher-inbox.json", INBOX_TPL)],
+        );
+        let mut ws = Workspace::from_config(&l);
+        let inbox = pane(&ws, "dispatcher", "inbox");
+        let disp = pane(&ws, "dispatcher", "dispatcher");
+        ws.set_status(&inbox, PaneStatus::Running);
+        ws.set_status(&disp, PaneStatus::Running);
+        assert_eq!(ws.running_count(), 1, "an applet is not a live process");
+        // splitting an applet makes a terminal pane with the default agent
+        ws.apply(WsCommand::SplitPane { pane: inbox.clone(), dir: Dir::Vertical }, &l).unwrap();
+        let new = ws.tabs[&ws.panes[&inbox].tab].last_focused_pane_id.clone();
+        assert_eq!(ws.panes[&new].kind, PaneKind::Terminal);
+        assert_eq!(ws.panes[&new].agent, l.config.default_agent);
+        assert_eq!(ws.panes[&new].role, None);
     }
 
     #[test]

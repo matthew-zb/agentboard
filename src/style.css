@@ -146,3 +146,6 @@ body.dragging-v, body.dragging-v * { cursor: row-resize !important; user-select:
 .tab.drop-before { box-shadow: inset 3px 0 0 var(--accent); }
 .tab.drop-after { box-shadow: inset -3px 0 0 var(--accent); }
 .tabbar.drop-end { box-shadow: inset -3px 0 0 var(--accent); }
+.applet-host { flex: 1; min-height: 0; min-width: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.applet-placeholder { color: #888; font-size: 13px; user-select: none; }
+.pane.applet:focus { outline: none; }

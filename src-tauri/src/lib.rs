@@ -3,6 +3,7 @@ pub mod launcher;
 pub mod layout;
 pub mod persist;
 pub mod profiles;
+pub mod roles;
 pub mod workspace;
 pub mod pty;
 pub mod ring;
