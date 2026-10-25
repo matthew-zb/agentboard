@@ -62,12 +62,17 @@ pub fn on_session_start(state: &AppState, caller: &Caller, body: &Value) {
     let Some(gen) = state.pty.current_gen(&caller.pane) else { return };
     state.trust.lock().unwrap().insert(caller.pane.clone(), Trust::Started { gen });
     // a SessionStart after the warning: the trust question was answered
+    clear_trust_warning(state, &caller.pane);
+}
+
+/// Turn off the pane's ⚠ if (and only if) it is still the trust warning.
+fn clear_trust_warning(state: &AppState, pane: &str) {
     let warned = {
         let ws = state.ws.lock().unwrap();
-        ws.pane_by_id(&caller.pane).is_some_and(|p| p.attention && p.attention_reason.as_deref() == Some(TRUST_REASON))
+        ws.pane_by_id(pane).is_some_and(|p| p.attention && p.attention_reason.as_deref() == Some(TRUST_REASON))
     };
     if warned {
-        let _ = launcher::execute(state, WsCommand::SetAttention { pane: caller.pane.clone(), on: false, reason: None });
+        let _ = launcher::execute(state, WsCommand::SetAttention { pane: pane.to_string(), on: false, reason: None });
     }
 }
 
@@ -139,12 +144,29 @@ pub fn poll_trust(state: &AppState, now: Instant) -> usize {
         if !is_role {
             continue;
         }
-        let cmd = WsCommand::SetAttention { pane: pane.clone(), on: true, reason: Some(TRUST_REASON.into()) };
-        if launcher::execute(state, cmd).is_ok() {
+        if flag_trust(state, &pane, gen) {
             flagged += 1;
         }
     }
     flagged
+}
+
+/// Raise the trust warning for `gen`, then re-check: a SessionStart of that generation that
+/// slipped in between the due check and the flag (it found nothing to clear) has recorded
+/// `Started{gen}` before looking, so seeing it here means the warning is wrong — take it back.
+/// Each side checks after its own write, so one of them always sees the other. Returns
+/// whether the warning stands. `trust` is taken alone (leaf), after `execute` returned.
+fn flag_trust(state: &AppState, pane: &str, gen: u64) -> bool {
+    let cmd = WsCommand::SetAttention { pane: pane.to_string(), on: true, reason: Some(TRUST_REASON.into()) };
+    if launcher::execute(state, cmd).is_err() {
+        return false;
+    }
+    let started = state.trust.lock().unwrap().get(pane) == Some(&Trust::Started { gen });
+    if started {
+        clear_trust_warning(state, pane);
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -337,6 +359,24 @@ mod tests {
         arm_trust(&f.state, &f.pane, gen2, t0);
         assert_eq!(poll_trust(&f.state, t0 + TRUST_TIMEOUT), 1);
         assert_eq!(f.att(&f.pane), (true, Some(TRUST_REASON.into())));
+    }
+
+    #[test]
+    fn session_start_racing_the_flag_leaves_no_warning() {
+        let f = fixture();
+        let gen = f.spawn(&f.pane);
+        // poll_trust already took the due timer; SessionStart lands before the flag is raised
+        // (it finds nothing to clear), then the flag goes up: it must take itself back
+        f.session_start();
+        assert!(!flag_trust(&f.state, &f.pane, gen));
+        assert_eq!(f.att(&f.pane), (false, None));
+        // without a SessionStart the warning stands
+        let gen2 = f.spawn(&f.pane);
+        assert!(flag_trust(&f.state, &f.pane, gen2));
+        assert_eq!(f.att(&f.pane), (true, Some(TRUST_REASON.into())));
+        // an older generation's Started does not take a newer warning back
+        f.state.trust.lock().unwrap().insert(f.pane.clone(), Trust::Started { gen });
+        assert!(flag_trust(&f.state, &f.pane, gen2));
     }
 
     #[test]

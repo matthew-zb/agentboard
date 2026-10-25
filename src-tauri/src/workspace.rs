@@ -145,15 +145,24 @@ impl Pane {
 /// Longest attention reason kept (characters); longer ones are cut.
 pub const ATTENTION_REASON_MAX: usize = 200;
 
-/// An attention reason as stored: control and bidi-override characters dropped (line breaks
-/// and tabs become spaces), whitespace runs collapsed, trimmed, cut to
-/// [`ATTENTION_REASON_MAX`] characters. `None` when nothing is left.
+/// An attention reason as stored: control and format (Cf: zero-width, bidi, BOM, tags)
+/// characters dropped (line breaks and tabs become spaces), whitespace runs collapsed,
+/// trimmed, cut to [`ATTENTION_REASON_MAX`] characters. `None` when nothing is left.
 pub fn clean_reason(s: &str) -> Option<String> {
-    let bidi = |c: char| matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    // Unicode general category Cf (format: zero-width, bidi controls, BOM, tags, …); std has
+    // no category lookup, so the Cf ranges are listed (Unicode 15).
+    let format = |c: char| {
+        matches!(c,
+            '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}' | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}')
+    };
     let mut out = String::new();
     for c in s.chars() {
         let c = if c.is_whitespace() { ' ' } else { c };
-        if c.is_control() || bidi(c) || (c == ' ' && (out.is_empty() || out.ends_with(' '))) {
+        if c.is_control() || format(c) || (c == ' ' && (out.is_empty() || out.ends_with(' '))) {
             continue;
         }
         out.push(c);
@@ -2089,6 +2098,8 @@ mod tests {
         assert_eq!(clean_reason(""), None);
         assert_eq!(clean_reason(" \u{1b}[31m \t\r\n "), Some("[31m".into()));
         assert_eq!(clean_reason("\u{0}\u{7}\u{200F}"), None);
+        // format characters (Cf): zero-width, word joiner, BOM, Arabic letter mark, tags
+        assert_eq!(clean_reason("a\u{200B}b\u{2060}c\u{FEFF}d\u{061C}e\u{E0041}f\u{00AD}g"), Some("abcdefg".into()));
         let long = "가".repeat(ATTENTION_REASON_MAX + 50);
         assert_eq!(clean_reason(&long).unwrap().chars().count(), ATTENTION_REASON_MAX);
         assert_eq!(clean_reason("a  b\n\nc"), Some("a b c".into()));
