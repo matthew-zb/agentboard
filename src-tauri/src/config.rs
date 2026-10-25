@@ -269,6 +269,18 @@ fn is_absolute_like(p: &str) -> bool {
     p.starts_with('/') || p.starts_with('\\') || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
 }
 
+/// Like [`check_relative`], with the message naming `base` (e.g. `.agentboard 폴더`,
+/// `workspaceRoot`) instead of the tab workspace.
+pub(crate) fn check_relative_in(p: &str, base: &str) -> Option<String> {
+    check_relative(p).map(|_| {
+        if is_absolute_like(p) {
+            format!("절대경로는 사용할 수 없음 ({base} 기준 상대경로만 허용)")
+        } else {
+            format!("{base} 밖으로 벗어나는 경로는 사용할 수 없음")
+        }
+    })
+}
+
 /// Returns an error message when `p` is not a relative path staying inside its base.
 pub(crate) fn check_relative(p: &str) -> Option<&'static str> {
     if is_absolute_like(p) {
@@ -575,9 +587,9 @@ pub fn parse_config(text: &str, file: &Path) -> Result<(Config, Vec<ConfigError>
             errs.push(sem_err(file, "handoverIndex", format!("경로가 비어 있음 — 기본값 {DEFAULT_HANDOVER_INDEX} 사용")));
             None
         }
-        Some(h) => match check_relative(&h) {
+        Some(h) => match check_relative_in(&h, "workspaceRoot") {
             Some(m) => {
-                errs.push(sem_err(file, "handoverIndex", format!("{m} (workspaceRoot 기준) — 기본값 {DEFAULT_HANDOVER_INDEX} 사용")));
+                errs.push(sem_err(file, "handoverIndex", format!("{m} — 기본값 {DEFAULT_HANDOVER_INDEX} 사용")));
                 None
             }
             None => Some(h),

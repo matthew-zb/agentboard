@@ -140,6 +140,35 @@ pub fn role_prompt(role: Role, cfg: &Loaded) -> Result<String, String> {
     }
 }
 
+/// Whether `cmd` is a batch shim (`.cmd`/`.bat`, e.g. an npm-installed `claude.cmd`):
+/// CreateProcess runs it through cmd.exe, which ends the command line at the first newline.
+pub fn is_batch(cmd: &Path) -> bool {
+    cmd.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+}
+
+/// One-line form of a multi-line argument for batch shims: each line break becomes ` ⏎ `.
+pub fn single_line(text: &str) -> String {
+    text.replace("\r\n", "\n").replace(['\n', '\r'], " ⏎ ")
+}
+
+/// Names (from `vars`) a role session must not inherit: `CLAUDECODE` and `CLAUDE_CODE_*`
+/// (e.g. a parent session's `CLAUDE_CODE_MESSAGING_SOCKET/TOKEN` when the app runs under
+/// Claude Code), R18.
+pub fn inherited_claude_vars(vars: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut v: Vec<String> = vars
+        .into_iter()
+        .filter(|k| {
+            let u = k.to_ascii_uppercase();
+            u == "CLAUDECODE" || u.starts_with("CLAUDE_CODE_")
+        })
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// Write `contents` next to `path` and rename over it (readers never see a partial file).
 fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
@@ -194,15 +223,17 @@ pub fn role_spawn_extras_with_exe(
     let settings = settings_file(run_dir, &pane.id);
     write_atomic(&mcp, &serde_json::to_string_pretty(&mcp_config_json(ctrl_url, token)).unwrap())?;
     write_atomic(&settings, &serde_json::to_string_pretty(&settings_json(exe)).unwrap())?;
+    // R18: the multi-line prompt goes LAST — if a `.cmd` shim cuts the command line at a
+    // newline, the run-file flags are already in (plan_spawn also flattens it for .cmd/.bat).
     let args = vec![
         "--name".to_string(),
         name,
-        "--append-system-prompt".to_string(),
-        prompt,
-        "--mcp-config".to_string(),
-        slash(&mcp),
         "--settings".to_string(),
         slash(&settings),
+        "--mcp-config".to_string(),
+        slash(&mcp),
+        "--append-system-prompt".to_string(),
+        prompt,
     ];
     let env = vec![
         ("AGENTBOARD_URL".to_string(), ctrl_url.to_string()),
@@ -268,9 +299,10 @@ mod tests {
         assert_eq!(args.len(), 8);
         assert_eq!(args[0], "--name");
         assert_eq!(args[1], "billing");
-        assert_eq!(args[2], "--append-system-prompt");
-        assert_eq!(args[3], default_role_prompt(Role::Manager));
-        assert_eq!(&args[4..], &["--mcp-config".to_string(), mcp, "--settings".to_string(), settings]);
+        assert_eq!(&args[2..6], &["--settings".to_string(), settings, "--mcp-config".to_string(), mcp]);
+        assert_eq!(args[6], "--append-system-prompt", "the multi-line prompt is last (R18)");
+        assert_eq!(args[7], default_role_prompt(Role::Manager));
+        assert!(args[7].contains('\n'), "unflattened here; plan_spawn flattens only for .cmd/.bat");
         assert_eq!(
             env,
             vec![
@@ -337,6 +369,23 @@ mod tests {
         assert!(role_spawn_extras_with_exe(&p, Role::Member, &loaded, "u", "t", run.path(), exe).is_err());
         let p = role_pane("../evil", Role::Member, "x");
         assert!(role_spawn_extras_with_exe(&p, Role::Member, &loaded, "u", "t", run.path(), exe).is_err());
+    }
+
+    #[test]
+    fn batch_detection_and_single_line() {
+        assert!(is_batch(Path::new(r"C:\npm\claude.cmd")) && is_batch(Path::new("C:/x/run.BAT")));
+        assert!(!is_batch(Path::new(r"C:\bin\claude.exe")) && !is_batch(Path::new("claude")));
+        assert_eq!(single_line("a\nb\r\nc\rd"), "a ⏎ b ⏎ c ⏎ d");
+        assert_eq!(single_line("one"), "one");
+    }
+
+    #[test]
+    fn inherited_claude_vars_are_selected() {
+        let names = ["PATH", "CLAUDECODE", "CLAUDE_CODE_MESSAGING_SOCKET", "claude_code_x", "CLAUDE_PROJECT_DIR", "AGENTBOARD_URL"];
+        assert_eq!(
+            inherited_claude_vars(names.iter().map(|s| s.to_string())),
+            vec!["CLAUDECODE", "CLAUDE_CODE_MESSAGING_SOCKET", "claude_code_x"]
+        );
     }
 
     #[test]

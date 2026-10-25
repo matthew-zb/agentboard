@@ -6,7 +6,7 @@
 //! panes are created at run time by the team tools (Task 8). Loading the role prompt files
 //! (`systemPromptFile`) is Task 4.
 
-use crate::config::{check_relative, sem_err, ConfigError};
+use crate::config::{check_relative_in, sem_err, ConfigError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -93,7 +93,7 @@ pub fn parse_roles(v: &serde_json::Value, file: &Path) -> (BTreeMap<Role, RoleCo
         if let Some(f) = &rc.system_prompt_file {
             if f.trim().is_empty() {
                 errs.push(sem_err(file, format!("{p}.systemPromptFile"), "경로가 비어 있음"));
-            } else if let Some(m) = check_relative(f) {
+            } else if let Some(m) = check_relative_in(f, ".agentboard 폴더") {
                 errs.push(sem_err(file, format!("{p}.systemPromptFile"), m));
             }
         }
@@ -140,6 +140,23 @@ mod tests {
         assert_eq!(session_name("billing", Role::Manager, Some("ignored"), 3), "billing");
         assert_eq!(session_name("dispatcher", Role::Dispatcher, None, 0), "dispatcher");
         assert_eq!(session_name("handover", Role::Handover, None, 0), "handover");
+    }
+
+    #[test]
+    fn path_errors_name_the_right_base() {
+        let v = serde_json::json!({"manager":{"systemPromptFile":"C:/x.md"},"lead":{"systemPromptFile":"../../x.md"}});
+        let (ok, errs) = parse_roles(&v, Path::new("config.json"));
+        assert!(ok.is_empty());
+        assert_eq!(errs.len(), 2);
+        for e in &errs {
+            let s = format!("{e:?}");
+            assert!(s.contains(".agentboard 폴더") && !s.contains("탭 작업공간"), "{s}");
+        }
+        assert_eq!(
+            crate::config::check_relative_in("/abs", "workspaceRoot").unwrap(),
+            "절대경로는 사용할 수 없음 (workspaceRoot 기준 상대경로만 허용)"
+        );
+        assert_eq!(crate::config::check_relative_in("a/../b", "workspaceRoot"), None);
     }
 
     #[test]

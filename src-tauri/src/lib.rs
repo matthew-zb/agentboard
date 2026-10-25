@@ -438,6 +438,7 @@ mod tests {
             cmd: "cmd.exe".into(),
             args: args.iter().map(|s| s.to_string()).collect(),
             env: vec![],
+            env_remove: vec![],
             cwd: std::env::current_dir().unwrap(),
             cols: 80,
             rows: 24,

@@ -120,11 +120,14 @@ pub fn post(url: &str, event: &str, token: &str, body: &str, timeout: Duration) 
         body.len()
     );
     s.write_all(head.as_bytes()).and_then(|_| s.write_all(body.as_bytes())).map_err(|e| format!("전송 실패: {e}"))?;
-    s.set_read_timeout(Some(left(deadline))).ok();
     let mut resp = Vec::new();
     let mut chunk = [0u8; 256];
-    // only the status line is needed
+    // only the status line is needed; each read gets only what is left of the 2 s budget
     while !resp.contains(&b'\n') {
+        if Instant::now() >= deadline {
+            return Err("응답 시간 초과".into());
+        }
+        s.set_read_timeout(Some(left(deadline))).ok();
         match s.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => resp.extend_from_slice(&chunk[..n]),
@@ -214,6 +217,28 @@ mod tests {
         assert!(head.contains(&"Authorization: Bearer tok".to_string()), "{head:?}");
         assert!(head.contains(&"Content-Type: application/json".to_string()));
         assert_eq!(serde_json::from_str::<Value>(&got).unwrap(), serde_json::from_str::<Value>(&body).unwrap());
+    }
+
+    #[test]
+    fn post_total_time_is_bounded_with_a_trickling_server() {
+        // the server sends the status line one byte every 150 ms: per-read timeouts alone
+        // would never fire; the overall deadline must
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let _keep = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = c.read(&mut buf);
+            for b in b"HTTP/1.1 204 No Content".iter().cycle().take(40) {
+                if c.write_all(&[*b]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        });
+        let t = Instant::now();
+        assert!(post(&format!("http://127.0.0.1:{port}"), "Stop", "t", "{}", Duration::from_millis(600)).is_err());
+        assert!(t.elapsed() < Duration::from_millis(1200), "{:?}", t.elapsed());
     }
 
     #[test]

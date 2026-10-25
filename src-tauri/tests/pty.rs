@@ -61,6 +61,7 @@ fn spec(cmd: &str, args: &[&str], cwd: PathBuf) -> SpawnSpec {
         cmd: PathBuf::from(cmd),
         args: args.iter().map(|s| s.to_string()).collect(),
         env: vec![],
+        env_remove: vec![],
         cwd,
         cols: 120,
         rows: 30,
@@ -96,6 +97,21 @@ fn spawn_echo_streams_output_and_exit_code() {
     assert!(!m.snapshot("p1").windows(4).any(|w| w == b"\x1b[6n"));
     assert!(String::from_utf8_lossy(&m.snapshot("p1")).contains("hello-agentboard"));
     assert!(!m.is_running("p1"));
+}
+
+#[test]
+fn env_remove_drops_inherited_variable_and_env_still_sets() {
+    std::env::set_var("AGENTBOARD_T4_INHERITED", "parent-value");
+    let (sink, m) = setup();
+    let mut s = spec("cmd.exe", &["/c", "echo [%AGENTBOARD_T4_INHERITED%][%AGENTBOARD_T4_SET%]"], cwd());
+    s.env_remove = vec!["AGENTBOARD_T4_INHERITED".into(), "AGENTBOARD_T4_SET".into()];
+    s.env = vec![("AGENTBOARD_T4_SET".into(), "child-value".into())];
+    m.spawn("envrm", s).unwrap();
+    assert!(wait_until(|| sink.exit("envrm").is_some()), "no exit");
+    let out = sink.text("envrm");
+    // cmd leaves an undefined %VAR% as-is
+    assert!(out.contains("[%AGENTBOARD_T4_INHERITED%][child-value]"), "got: {out:?}");
+    std::env::remove_var("AGENTBOARD_T4_INHERITED");
 }
 
 #[test]

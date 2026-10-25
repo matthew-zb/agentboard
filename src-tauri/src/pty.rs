@@ -45,6 +45,9 @@ pub struct SpawnSpec {
     pub cmd: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Inherited variables to drop before `env` is applied (role panes: `CLAUDECODE`,
+    /// `CLAUDE_CODE_*`, R18). Names set in `env` are set again afterwards.
+    pub env_remove: Vec<String>,
     pub cwd: PathBuf,
     pub cols: u16,
     pub rows: u16,
@@ -266,6 +269,9 @@ impl PtyManager {
         let mut cb = CommandBuilder::new(&spec.cmd);
         cb.args(&spec.args);
         cb.cwd(&spec.cwd);
+        for k in &spec.env_remove {
+            cb.env_remove(k);
+        }
         for (k, v) in &spec.env {
             cb.env(k, v);
         }

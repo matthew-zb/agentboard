@@ -107,8 +107,9 @@ pub fn plan_spawn(pane: &Pane, loaded: &Loaded, launch: &RoleLaunch) -> Result<S
     let mut args: Vec<String> = profile.args.clone();
     let mut env = profile.env.clone();
     let mut role_env = Vec::new();
+    let mut env_remove = Vec::new();
     if let Some(role) = pane.role {
-        let (extra_args, extra_env) = crate::agentcfg::role_spawn_extras(
+        let (mut extra_args, extra_env) = crate::agentcfg::role_spawn_extras(
             pane,
             role,
             loaded,
@@ -116,14 +117,30 @@ pub fn plan_spawn(pane: &Pane, loaded: &Loaded, launch: &RoleLaunch) -> Result<S
             launch.token,
             launch.run_dir,
         )?;
+        // R18: a .cmd/.bat shim runs through cmd.exe, which stops at the first newline — the
+        // prompt (the last extra) becomes one line there.
+        if crate::agentcfg::is_batch(&cmd) {
+            if let Some(prompt) = extra_args.last_mut() {
+                *prompt = crate::agentcfg::single_line(prompt);
+            }
+        }
         args.extend(extra_args);
         args.extend(loaded.config.role_config(role).args);
         role_env = extra_env;
+        env_remove = crate::agentcfg::inherited_claude_vars(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()));
     }
     args.extend(pane.args.iter().cloned());
     env.extend(pane.env.iter().map(|(k, v)| (k.clone(), v.clone())));
     env.extend(role_env); // the app's identity variables win over profile/pane env
-    Ok(SpawnSpec { cmd, args, env: env.into_iter().collect(), cwd: pane.cwd.clone(), cols: START_COLS, rows: START_ROWS })
+    Ok(SpawnSpec {
+        cmd,
+        args,
+        env: env.into_iter().collect(),
+        env_remove,
+        cwd: pane.cwd.clone(),
+        cols: START_COLS,
+        rows: START_ROWS,
+    })
 }
 
 /// First-prompt injection state machine for one pane (time is passed in, so it is testable).
@@ -595,6 +612,57 @@ mod tests {
         }
         assert_eq!(env.get("A").map(String::as_str), Some("profile"));
         assert!(run.path().join("p1.mcp.json").is_file() && run.path().join("p1.settings.json").is_file());
+    }
+
+    #[test]
+    fn plan_spawn_flattens_prompt_only_for_batch_shims() {
+        let mut fx = fixture();
+        let shim = fx.root.path().join("fakeclaude.cmd");
+        std::fs::write(&shim, "@echo off\r\n").unwrap();
+        let shim_s = shim.to_string_lossy().into_owned();
+        fx.loaded.profiles.insert("shim".into(), profile("shim", &shim_s, vec![], BTreeMap::new()));
+        let run = tempfile::tempdir().unwrap();
+        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:1", token: "t", run_dir: run.path() };
+        for (agent, batch) in [("shim", true), ("tool", false)] {
+            let mut p = pane(agent, fx.root.path().to_path_buf());
+            p.args = vec!["--pane".into()];
+            p.role = Some(Role::Manager);
+            p.session_name = Some("billing".into());
+            let spec = plan_spawn(&p, &fx.loaded, &launch).unwrap();
+            assert_eq!(crate::agentcfg::is_batch(&spec.cmd), batch, "{agent}: {}", spec.cmd.display());
+            let i = spec.args.iter().position(|a| a == "--append-system-prompt").unwrap();
+            assert!(spec.args[..i].contains(&"--settings".to_string()) && spec.args[..i].contains(&"--mcp-config".to_string()));
+            let prompt = &spec.args[i + 1];
+            let want = crate::agentcfg::default_role_prompt(Role::Manager);
+            if batch {
+                assert!(!prompt.contains('\n') && !prompt.contains('\r'), "{agent}: one line for cmd.exe");
+                assert_eq!(*prompt, crate::agentcfg::single_line(want));
+            } else {
+                assert_eq!(prompt, want, "{agent}: .exe keeps the newlines");
+            }
+            assert_eq!(spec.args.last().unwrap(), "--pane");
+        }
+    }
+
+    #[test]
+    fn role_spawn_spec_drops_inherited_claude_vars() {
+        // a unique name: other tests never read it
+        std::env::set_var("CLAUDE_CODE_AGENTBOARD_T4_PROBE", "stale");
+        let fx = fixture();
+        let run = tempfile::tempdir().unwrap();
+        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:1", token: "t", run_dir: run.path() };
+        let mut p = pane("tool", fx.root.path().to_path_buf());
+        let plain = plan_spawn(&p, &fx.loaded, &launch).unwrap();
+        assert!(plain.env_remove.is_empty(), "phase-1 panes inherit everything as before");
+        p.role = Some(Role::Manager);
+        p.session_name = Some("billing".into());
+        let spec = plan_spawn(&p, &fx.loaded, &launch).unwrap();
+        assert!(spec.env_remove.contains(&"CLAUDE_CODE_AGENTBOARD_T4_PROBE".to_string()), "{:?}", spec.env_remove);
+        if std::env::var_os("CLAUDECODE").is_some() {
+            assert!(spec.env_remove.contains(&"CLAUDECODE".to_string()));
+        }
+        assert!(spec.env_remove.iter().all(|k| k == "CLAUDECODE" || k.to_ascii_uppercase().starts_with("CLAUDE_CODE_")));
+        std::env::remove_var("CLAUDE_CODE_AGENTBOARD_T4_PROBE");
     }
 
     #[test]
