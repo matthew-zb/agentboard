@@ -1,6 +1,7 @@
 // 이후 태스크에서 pub mod 추가: layout, config, profiles,
 // workspace, launcher, persist
 
+pub mod layout;
 pub mod pty;
 pub mod ring;
 pub mod webview;
