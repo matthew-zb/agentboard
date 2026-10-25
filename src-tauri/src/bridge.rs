@@ -16,7 +16,8 @@
 //! * **PTY fallback (R6)**, only when the pipe is unavailable: no usable registration for
 //!   the current generation for [`FALLBACK_AFTER`], the pane idle (Stop seen for this
 //!   generation, no PTY output and no UserPromptSubmit since) and no keystroke for
-//!   [`INPUT_QUIET`]. Then the body is typed with the profile's submit encoding. Otherwise the
+//!   [`INPUT_QUIET`], and the profile submits with bracketed paste (R21). Then the body is
+//!   typed with the profile's submit encoding. Otherwise the
 //!   message stays queued — the fallback never interleaves with the user's typing.
 //! * Busy/idle: Stop → idle; UserPromptSubmit or any PTY output → busy. `last_input` is
 //!   updated only from real keystrokes (`pty_write` → [`note_input`]), never from
@@ -157,11 +158,15 @@ pub fn register_hooks(hooks: &HookRouter) {
 
 // ───────────────────────── wire format ─────────────────────────
 
+/// The message body (R21, the single choke point for both paths): `<` → `‹` and `>` → `›`
+/// first, so no text — including Manager-authored inbox fields relayed later — can close the
+/// envelope or forge another one; then the [`PREFIX`] unless the text already starts with it.
 fn body_of(text: &str) -> String {
-    if text.starts_with(PREFIX) {
-        text.to_string()
+    let safe = text.replace('<', "\u{2039}").replace('>', "\u{203A}");
+    if safe.starts_with(PREFIX) {
+        safe
     } else {
-        format!("{PREFIX}{text}")
+        format!("{PREFIX}{safe}")
     }
 }
 
@@ -237,7 +242,9 @@ pub fn send(state: &AppState, pane: &str, text: &str) -> Result<(), String> {
     enqueue(state, pane, text, None)
 }
 
-/// [`send`] plus a receiver that gets exactly one [`Outcome`]: `Ok(Via)` once delivered, or
+/// [`send`] plus a receiver that gets exactly one [`Outcome`]: `Ok(Via)` once the message
+/// was written to the session's pipe (`Via::Pipe`; the pipe sends no acknowledgement) or typed
+/// into its PTY (`Via::Pty`), or
 /// `Err` after [`QUEUE_TIMEOUT`] / when the pane leaves the model.
 pub fn send_tracked(state: &AppState, pane: &str, text: &str) -> Result<mpsc::Receiver<Outcome>, String> {
     let (tx, rx) = mpsc::channel();
@@ -285,14 +292,23 @@ enum Decision {
 
 /// What to do with the head message (pure): the pipe of a current-generation registration;
 /// else the PTY fallback (R6) once the short wait passed, the pane is idle and the user quiet.
-fn decide(reg: Option<&SessionReg>, cur_gen: Option<u64>, queued: Instant, now: Instant, last_input: Option<Instant>) -> Decision {
+/// `can_type`: the profile submits with bracketed paste — without it every newline would
+/// submit a separate prompt, so the fallback is refused (R21) and the message waits.
+fn decide(
+    reg: Option<&SessionReg>,
+    cur_gen: Option<u64>,
+    queued: Instant,
+    now: Instant,
+    last_input: Option<Instant>,
+    can_type: bool,
+) -> Decision {
     let Some(r) = reg.filter(|r| cur_gen == Some(r.gen)) else { return Decision::Wait };
     if r.has_pipe() {
         return Decision::Pipe;
     }
     let waited = now.saturating_duration_since(queued) >= FALLBACK_AFTER;
     let quiet = last_input.is_none_or(|t| now.saturating_duration_since(t) >= INPUT_QUIET);
-    if waited && r.idle && quiet {
+    if can_type && waited && r.idle && quiet {
         Decision::Pty
     } else {
         Decision::Wait
@@ -359,7 +375,7 @@ fn pump_pane(state: &AppState, pane: &str, now: Instant) {
                 None => Step::Wait,
                 Some((id, text, queued)) => {
                     let reg = g.regs.get(pane);
-                    match decide(reg, cur_gen, queued, now, last_input) {
+                    match decide(reg, cur_gen, queued, now, last_input, t.submit.bracketed_paste) {
                         Decision::Pipe => {
                             let r = reg.expect("decided on a registration");
                             Step::Pipe { id, socket: r.socket.clone(), token: r.token.clone(), text }
