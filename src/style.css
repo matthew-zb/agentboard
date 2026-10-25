@@ -52,6 +52,8 @@ body.dragging-v, body.dragging-v * { cursor: row-resize !important; user-select:
 /* ---- panes ---- */
 .pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; border: 2px solid transparent; box-sizing: border-box; background: var(--bg); }
 .pane.focused { border-color: var(--accent); }
+/* 300ms location highlight after a tab/group switch (focus.js flash) */
+.pane.flash { border-color: #ffffff; box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.35); }
 .pane-header { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; height: 22px; padding: 0 4px 0 8px; background: var(--chrome); font-size: 12px; user-select: none; white-space: nowrap; overflow: hidden; }
 .pane.focused .pane-header { background: #1f3550; }
 .pane-name { font-weight: 600; }

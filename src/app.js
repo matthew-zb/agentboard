@@ -9,7 +9,7 @@ import {
   staleIds,
   setPaneVisible,
   fitPane,
-  focusPane,
+  restartPane,
 } from './pane.js';
 import {
   renderGroups,
@@ -21,6 +21,9 @@ import {
   tabGroups,
   statusParts,
 } from './groups.js';
+import { buildKeymap, installKeyRouter } from './keys.js';
+import { planCommand, registerCommand, runCommand, CORE_IDS } from './commands.js';
+import { applyFocus, requestFocus, settleFocus, flash, focusLocation } from './focus.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -55,7 +58,81 @@ function showError(err) {
 }
 
 function setFocus(group, tab, pane) {
-  quiet(sendCmd({ type: 'setFocus', group, tab, pane }));
+  quiet(execute([{ type: 'setFocus', group, tab, pane }]));
+}
+
+/**
+ * Run WsCommands in order (stops at the first error). A SetFocus is tracked as a pending user
+ * focus request so a background snapshot cannot pull DOM focus back meanwhile. RestartPane goes
+ * through pane.js (re-attach marking). Flashes the focused pane when the tab/group changed.
+ */
+async function execute(cmds) {
+  const before = current && focusLocation(current.workspace);
+  for (const cmd of cmds) {
+    if (cmd.type === 'restartPane') {
+      await restartPane(cmd.pane);
+      continue;
+    }
+    const isFocus = cmd.type === 'setFocus';
+    if (isFocus) requestFocus(cmd);
+    try {
+      await sendCmd(cmd);
+    } catch (_) {
+      if (isFocus) settleFocus(current);
+      return; // sendCmd already showed the error
+    }
+    if (isFocus) settleFocus(current);
+  }
+  const ws = current && current.workspace;
+  if (ws && focusLocation(ws) !== before) {
+    requestAnimationFrame(() => flash(focusedPaneId(current.workspace)));
+  }
+}
+
+// Key commands run one after another, each planned against the snapshot the previous one
+// produced (fast repeated Alt+l moves twice, not to the same target twice).
+let queue = Promise.resolve();
+let queued = 0;
+const MAX_QUEUED = 8;
+function enqueue(fn) {
+  if (queued >= MAX_QUEUED) return; // a held key outran the backend: drop repeats
+  queued++;
+  queue = queue.then(fn).catch(() => {}).finally(() => queued--);
+}
+
+/** On-screen rects of visible panes and groups (DOM order irrelevant). */
+function geometry() {
+  const rects = (sel, key) =>
+    [...document.querySelectorAll(sel)]
+      .filter((el) => !el.closest('#parking'))
+      .map((el) => {
+        const b = el.getBoundingClientRect();
+        return { id: el.dataset[key], left: b.left, top: b.top, right: b.right, bottom: b.bottom };
+      })
+      .filter((r) => r.right > r.left && r.bottom > r.top);
+  return { paneRects: rects('#groups .pane[data-pane]', 'pane'), groupRects: rects('#groups .group[data-group]', 'group') };
+}
+
+for (const id of CORE_IDS) {
+  registerCommand(id, () =>
+    enqueue(() => {
+      const cmds = current && planCommand(id, current.workspace, geometry());
+      return cmds && cmds.length ? execute(cmds) : undefined;
+    }),
+  );
+}
+
+// passthroughKeys per pane (profile-defined, fixed for the pane's life): fetched once.
+const passthroughCache = new Map();
+function getPassthrough(paneId) {
+  if (!passthroughCache.has(paneId)) {
+    passthroughCache.set(paneId, []);
+    api.passthrough(paneId).then(
+      (keys) => passthroughCache.has(paneId) && passthroughCache.set(paneId, Array.isArray(keys) ? keys : []),
+      () => {},
+    );
+  }
+  return passthroughCache.get(paneId);
 }
 
 /**
@@ -68,7 +145,11 @@ export function render(snap) {
   current = snap;
   const ws = snap.workspace;
 
-  for (const id of staleIds(knownPaneIds(), ws.panes)) disposePane(id);
+  for (const id of staleIds(knownPaneIds(), ws.panes)) {
+    disposePane(id);
+    passthroughCache.delete(id);
+  }
+  for (const id of Object.keys(ws.panes)) getPassthrough(id);
 
   const focusedId = focusedPaneId(ws);
   const groupOf = tabGroups(ws);
@@ -95,7 +176,7 @@ export function render(snap) {
 
   requestAnimationFrame(() => {
     for (const id of visible) fitPane(id);
-    applyFocus();
+    applyFocus(current);
   });
 }
 
@@ -140,23 +221,23 @@ function refreshConfigErrors() {
     .finally(() => (errorsPending = false));
 }
 
-function isTextInput(el) {
-  if (!el || el === document.body) return false;
-  if (el.closest && el.closest('.xterm')) return false; // xterm's helper textarea
-  return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable;
-}
+const router = installKeyRouter({
+  keymap: new Map(),
+  getPassthrough,
+  focusedPane: () => (current ? focusedPaneId(current.workspace) : null),
+  // Unregistered ids (overlays, palette, … until Tasks 13–15) are swallowed as no-ops.
+  run: (id, event) => runCommand(id, { id, event, snapshot: current }),
+});
 
-/** DOM focus → focused group's active tab's last focused pane, unless an input has focus. */
-function applyFocus() {
-  if (!current) return;
-  if (isTextInput(document.activeElement)) return;
-  const id = focusedPaneId(current.workspace);
-  if (id) focusPane(id);
-}
-
-configurePanes({ send: sendCmd, onFocus: setFocus, report: showError });
+configurePanes({
+  send: sendCmd,
+  onFocus: setFocus,
+  report: showError,
+  keyFilter: (paneId, ev) => router.termKeyFilter(paneId, ev),
+});
 api.onWorkspaceChanged(render);
 api.snapshot().then(render, showError);
+api.keybindings().then((b) => router.setKeymap(buildKeymap(b)), showError);
 refreshConfigErrors();
 // Re-activating the app window returns DOM focus to the current pane (spec §6.4).
-window.addEventListener('focus', () => applyFocus());
+window.addEventListener('focus', () => applyFocus(current));

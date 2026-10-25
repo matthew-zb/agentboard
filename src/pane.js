@@ -88,11 +88,14 @@ let hooks = {
   send: (cmd) => api.send(cmd),
   onFocus: () => {},
   report: (e) => console.error('[agentboard]', e),
+  keyFilter: () => true,
 };
 
 /**
  * Wire the module to the app: `send(cmd)` (renders its result), `onFocus(group, tab, pane)`
- * (pane clicked while not focused), `report(error)` (status bar message).
+ * (pane clicked while not focused), `report(error)` (status bar message),
+ * `keyFilter(paneId, KeyboardEvent) -> bool` (xterm attachCustomKeyEventHandler: false = an app
+ * shortcut, xterm must not process it).
  */
 export function configurePanes(h) {
   hooks = { ...hooks, ...h };
@@ -157,6 +160,8 @@ function createEntry(id) {
   term.loadAddon(search);
   term.unicode.activeVersion = '11';
   term.open(inner);
+  // App shortcuts never reach xterm (the document capture router already handles them).
+  term.attachCustomKeyEventHandler((ev) => hooks.keyFilter(id, ev));
   try {
     const gl = new WebglAddon();
     gl.onContextLoss(() => gl.dispose()); // falls back to the DOM renderer
