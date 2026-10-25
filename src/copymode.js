@@ -16,6 +16,8 @@
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const lastRow = (b) => Math.max(0, b.lineCount - 1);
 const lineLen = (b, row) => (b.lineText(row) ?? '').length;
+/** Window height, guarded against undefined/0/NaN. */
+const rowsOf = (b) => Math.max(1, b.rows | 0);
 const maxCol = (b, row) => Math.max(0, lineLen(b, row) - 1);
 
 /** New copy state from a buffer snapshot; cursor starts at `buffer.cursor` (clamped), no selection. */
@@ -44,7 +46,8 @@ export function selectionRange(state) {
  * change relative to `buffer.viewportTop`.
  */
 export function viewportFor(state) {
-  const { viewportTop, rows } = state.buffer;
+  const { viewportTop } = state.buffer;
+  const rows = rowsOf(state.buffer);
   const row = state.cursor.row;
   if (row < viewportTop) return row;
   if (row > viewportTop + rows - 1) return row - rows + 1;
@@ -93,9 +96,9 @@ export function copyKey(state, key) {
     case 'ArrowUp':
       return step(moveTo(state, row - 1, col));
     case 'PageUp':
-      return step(moveTo(state, row - b.rows, col));
+      return step(moveTo(state, row - rowsOf(b), col));
     case 'PageDown':
-      return step(moveTo(state, row + b.rows, col));
+      return step(moveTo(state, row + rowsOf(b), col));
     case 'g':
       return step(moveTo(state, 0, col));
     case 'G':
@@ -119,4 +122,47 @@ export function copyKey(state, key) {
     default:
       return step(state);
   }
+}
+
+const LETTER_KEYS = { KeyH: 'h', KeyJ: 'j', KeyK: 'k', KeyL: 'l', KeyG: 'g', KeyV: 'v', KeyY: 'y', KeyN: 'n', KeyQ: 'q' };
+const NAMED_KEYS = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Escape'];
+
+/**
+ * KeyboardEvent -> key string for {@link copyKey}, from `e.code` (IME-safe: Hangul composition
+ * changes `e.key` but not `e.code`). Shift+letter gives the upper-case key (G, N). Ctrl/Alt/Meta
+ * chords and unmapped keys give null.
+ */
+export function copyKeyFromEvent(e) {
+  if (!e || e.ctrlKey || e.altKey || e.metaKey) return null;
+  const c = e.code;
+  if (LETTER_KEYS[c]) return e.shiftKey ? LETTER_KEYS[c].toUpperCase() : LETTER_KEYS[c];
+  if (c === 'Slash') return e.shiftKey ? null : '/';
+  return NAMED_KEYS.includes(c) ? c : null;
+}
+
+/**
+ * CopyBuffer over xterm's `term.buffer.active` (rows are absolute buffer lines). The cursor
+ * starts at the terminal's cursor row. Column is a cell index; wide (Korean) characters make it
+ * differ from the string index, which only matters for the (line-level) cursor marker.
+ */
+export function makeCopyBuffer(active, rows) {
+  return {
+    lineCount: active.length,
+    lineText: (i) => {
+      const line = active.getLine(i);
+      return line ? line.translateToString(true) : '';
+    },
+    viewportTop: active.viewportY,
+    rows,
+    cursor: { row: active.baseY + active.cursorY, col: active.cursorX },
+  };
+}
+
+/** Same state over a fresh buffer snapshot (live output may have grown it); cursor/anchor clamped. */
+export function refreshBuffer(state, buffer) {
+  const fix = (p) => {
+    const row = clamp(p.row, 0, lastRow(buffer));
+    return { row, col: clamp(p.col, 0, maxCol(buffer, row)) };
+  };
+  return { ...state, buffer, cursor: fix(state.cursor), anchor: state.anchor ? fix(state.anchor) : null };
 }

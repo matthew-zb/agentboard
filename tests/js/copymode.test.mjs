@@ -108,3 +108,59 @@ test('viewportFor keeps cursor visible with minimal scroll', () => {
   assert.equal(viewportFor({ ...s, cursor: { row: 2, col: 0 } }), 2);
   assert.equal(viewportFor({ ...s, cursor: { row: 12, col: 0 } }), 9);
 });
+
+// ---- Task 14 additions
+import { copyKeyFromEvent, makeCopyBuffer, refreshBuffer } from '../../src/copymode.js';
+
+test('rows undefined/0 is guarded (PageUp moves one row, viewportFor is finite)', () => {
+  for (const rows of [undefined, 0, NaN]) {
+    const s = createCopyState(makeBuffer(LINES, { rows }));
+    assert.equal(press(s, 'PageUp').state.cursor.row, 3);
+    assert.ok(Number.isFinite(viewportFor(s)));
+  }
+});
+
+test('copyKeyFromEvent maps KeyboardEvent.code (IME-safe), modifiers excluded', () => {
+  const e = (code, o = {}) => ({ code, key: 'ㅓ', ctrlKey: false, altKey: false, shiftKey: false, metaKey: false, ...o });
+  assert.equal(copyKeyFromEvent(e('KeyJ')), 'j');
+  assert.equal(copyKeyFromEvent(e('KeyG', { shiftKey: true })), 'G');
+  assert.equal(copyKeyFromEvent(e('KeyN', { shiftKey: true })), 'N');
+  assert.equal(copyKeyFromEvent(e('Slash')), '/');
+  assert.equal(copyKeyFromEvent(e('Slash', { shiftKey: true })), null);
+  assert.equal(copyKeyFromEvent(e('Escape')), 'Escape');
+  assert.equal(copyKeyFromEvent(e('PageUp')), 'PageUp');
+  assert.equal(copyKeyFromEvent(e('ArrowLeft')), 'ArrowLeft');
+  assert.equal(copyKeyFromEvent(e('KeyJ', { ctrlKey: true })), null);
+  assert.equal(copyKeyFromEvent(e('KeyZ')), null);
+});
+
+test('makeCopyBuffer adapts xterm active buffer (absolute rows, cursor row)', () => {
+  const lines = ['한글 줄  ', 'abc', ''];
+  const active = {
+    length: 3,
+    viewportY: 1,
+    baseY: 1,
+    cursorY: 1,
+    cursorX: 2,
+    getLine: (i) => (lines[i] === undefined ? undefined : { translateToString: (trim) => (trim ? lines[i].trimEnd() : lines[i]) }),
+  };
+  const b = makeCopyBuffer(active, 2);
+  assert.equal(b.lineCount, 3);
+  assert.equal(b.lineText(0), '한글 줄');
+  assert.equal(b.lineText(9), '');
+  assert.equal(b.viewportTop, 1);
+  assert.equal(b.rows, 2);
+  assert.deepEqual(b.cursor, { row: 2, col: 2 });
+});
+
+test('refreshBuffer keeps cursor/anchor/search, clamps to the new buffer', () => {
+  let s = createCopyState(makeBuffer(LINES));
+  s = setSearch(press(s, 'v', 'k').state, 'x');
+  const smaller = makeBuffer(['a', 'b'], { cursor: { row: 0, col: 0 } });
+  const r = refreshBuffer(s, smaller);
+  assert.equal(r.buffer, smaller);
+  assert.equal(r.cursor.row, 1);
+  assert.equal(r.anchor.row, 1);
+  assert.equal(r.search.query, 'x');
+  assert.equal(refreshBuffer(s, makeBuffer(LINES)).cursor.row, 3);
+});

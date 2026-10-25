@@ -10,6 +10,8 @@ import {
   setPaneVisible,
   fitPane,
   restartPane,
+  syncTargets,
+  pasteText,
 } from './pane.js';
 import {
   renderGroups,
@@ -39,6 +41,7 @@ import {
   toast,
   newTabWizard,
 } from './overlays.js';
+import { configureCopyMode, toggleCopyMode, copyActive, pruneCopySessions } from './copy-ui.js';
 import { pickCommands, paletteItems, missingDirsFlow } from './overlay-logic.js';
 
 const $ = (id) => document.getElementById(id);
@@ -218,6 +221,31 @@ registerCommand('pane.breakToTab', () =>
   }),
 );
 
+// ---------------------------------------------------------------- copy mode · sync · paste (Task 14)
+
+registerCommand('pane.copyMode', () => {
+  const pane = current && focusedPaneId(current.workspace);
+  if (pane && !overlayOpen()) toggleCopyMode(pane);
+});
+registerCommand('tab.syncInput', () =>
+  enqueue(() => {
+    const ws = current && current.workspace;
+    const g = ws && ws.focus && ws.groups[ws.focus.groupId];
+    const tab = g && ws.tabs[g.activeTabId];
+    return tab ? execute([{ type: 'setSyncInput', tab: tab.id, on: !tab.syncInput }]) : undefined;
+  }),
+);
+registerCommand('pane.paste', async () => {
+  const pane = current && focusedPaneId(current.workspace);
+  if (!pane || copyActive(pane)) return;
+  try {
+    // term.paste -> onData -> normal input path (sync input fans it out once per pane).
+    pasteText(pane, await api.readClipboardText());
+  } catch (err) {
+    showError(err);
+  }
+});
+
 /** Spec §4.2: ask (one folder at a time) to create each missing workspace folder. */
 function checkMissingDirs() {
   return missingDirsFlow({
@@ -264,6 +292,7 @@ export function render(snap) {
 
   for (const id of staleIds(knownPaneIds(), ws.panes)) {
     disposePane(id);
+    pruneCopySessions();
     passthroughCache.delete(id);
   }
   for (const id of Object.keys(ws.panes)) getPassthrough(id);
@@ -352,11 +381,21 @@ const router = installKeyRouter({
 });
 
 configureOverlays({
-  setModal: (fn) => router.setModal(fn),
+  pushModal: (fn) => router.pushModal(fn),
+  popModal: (t) => router.popModal(t),
   restoreFocus: () => applyFocus(current),
   createTab: (cmd) => execute([cmd]),
 });
+configureCopyMode({
+  pushModal: (fn) => router.pushModal(fn),
+  popModal: (t) => router.popModal(t),
+  isAppKey: (e) => router.isAppKey(e),
+  focusedPane: () => (current ? focusedPaneId(current.workspace) : null),
+  prompt,
+  toast,
+});
 configurePanes({
+  syncTargets: (id) => (current ? syncTargets(current.workspace, id) : null),
   send: sendCmd,
   onFocus: setFocus,
   report: showError,

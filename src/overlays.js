@@ -7,15 +7,18 @@ import { fuzzyRank } from './fuzzy.js';
 import { PICK_TIMEOUT_MS, TOAST_MS, pickerKey, listMove, dirChoices, newTabFlow } from './overlay-logic.js';
 
 const cfg = {
-  /** router.setModal */
-  setModal() {},
+  /** router.pushModal(fn) -> token / router.popModal(token): a stack, copy mode may sit below. */
+  pushModal() {
+    return null;
+  },
+  popModal() {},
   /** Give DOM focus back to the focused pane after the last overlay closed. */
   restoreFocus() {},
   /** Send CreateTab; resolves true on success, false after the error was toasted. */
   createTab: async () => false,
 };
 
-/** `{setModal(fn|null), restoreFocus(), createTab(cmd) → Promise<bool>}` (set by app.js). */
+/** `{pushModal(fn) → token, popModal(token), restoreFocus(), createTab(cmd) → Promise<bool>}` (set by app.js). */
 export function configureOverlays(c) {
   Object.assign(cfg, c);
 }
@@ -56,14 +59,13 @@ function open(build) {
     const cleanups = [];
     let done = false;
     let spec = null;
+    let token = null;
     const entry = { cancel: () => finish(spec ? spec.cancelValue : null) };
     function finish(value) {
       if (done) return;
       done = true;
-      if (active === entry) {
-        active = null;
-        cfg.setModal(null);
-      }
+      if (token !== null) cfg.popModal(token);
+      if (active === entry) active = null;
       for (const f of cleanups.splice(0)) {
         try {
           f();
@@ -84,7 +86,7 @@ function open(build) {
       finish(null);
       return;
     }
-    if (!done) cfg.setModal((e) => (done ? false : spec.onKey(e))); // build may have finished
+    if (!done) token = cfg.pushModal((e) => (done ? false : spec.onKey(e))); // build may have finished
   });
 }
 

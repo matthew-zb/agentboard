@@ -245,3 +245,29 @@ test('sidebarTree: groups > tabs > panes with marks and symbols', () => {
     ['● lead', '● coder', '○ tests'],
   );
 });
+
+// ---- Task 14: sync input fan-out
+import { syncTargets } from '../../src/pane.js';
+
+const wsSync = (on) => ({
+  tabs: { t1: { id: 't1', syncInput: on }, t2: { id: 't2', syncInput: true } },
+  panes: {
+    a: { id: 'a', tab: 't1', status: { state: 'running' } },
+    b: { id: 'b', tab: 't1', status: { state: 'running' } },
+    c: { id: 'c', tab: 't1', status: { state: 'exited', code: 0 } },
+    d: { id: 'd', tab: 't1', status: { state: 'starting' } },
+    e: { id: 'e', tab: 't2', status: { state: 'running' } },
+  },
+});
+
+test('syncTargets: null when sync is off or unknown pane', () => {
+  assert.equal(syncTargets(wsSync(false), 'a'), null);
+  assert.equal(syncTargets(wsSync(true), 'zz'), null);
+  assert.equal(syncTargets(null, 'a'), null);
+});
+
+test('syncTargets: every running pane of the tab exactly once, no other tabs', () => {
+  const t = syncTargets(wsSync(true), 'a');
+  assert.deepEqual([...t].sort(), ['a', 'b']);
+  assert.equal(new Set(t).size, t.length);
+});

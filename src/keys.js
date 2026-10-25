@@ -125,6 +125,50 @@ export function isRepeatable(id) {
   return REPEATABLE.test(id);
 }
 
+// ---------------------------------------------------------------- modal stack (pure)
+
+/**
+ * Stack of keyboard owners (overlays, copy mode). The top one sees a key first; its `fn(e)`
+ * returns true (consume), false (leave the default action) or null (not mine: ask the next one,
+ * finally the app commands). Popping by token works for any entry, so an overlay closing over
+ * copy mode restores copy mode, and the other way round.
+ */
+export function createModalStack() {
+  const items = [];
+  let seq = 0;
+  let legacy = null;
+  const pop = (token) => {
+    const i = items.findIndex((x) => x.token === token);
+    if (i < 0) return false;
+    items.splice(i, 1);
+    return true;
+  };
+  const stack = {
+    push(fn) {
+      const token = ++seq;
+      items.push({ token, fn });
+      return token;
+    },
+    pop,
+    /** Back-compat single slot: replaces the previous setLegacy entry; null removes it. */
+    setLegacy(fn) {
+      if (legacy !== null) pop(legacy);
+      legacy = fn ? stack.push(fn) : null;
+    },
+    get size() {
+      return items.length;
+    },
+    handle(e) {
+      for (let i = items.length - 1; i >= 0; i--) {
+        const r = items[i].fn(e);
+        if (r !== null) return { handled: true, consumed: !!r };
+      }
+      return { handled: false, consumed: false };
+    },
+  };
+  return stack;
+}
+
 // ---------------------------------------------------------------- DOM router
 
 let router = null;
@@ -136,12 +180,12 @@ let router = null;
  * not inside a `.pane`).
  * A matched key is swallowed (preventDefault + stopPropagation) and `run(id)` is called, also
  * during IME composition; ids without a handler are swallowed as no-ops by the caller.
- * Returns `{setKeymap(km), setModal(fn|null), termKeyFilter(paneId, e), dispose()}`.
+ * Returns `{setKeymap, setModal, pushModal, popModal, isAppKey, termKeyFilter, dispose}`.
  */
 export function installKeyRouter(opts) {
   if (router) router.dispose();
   let keymap = opts.keymap || new Map();
-  let modal = null;
+  const modals = createModalStack();
 
   const paneOf = (e) => {
     const el = e && e.target && e.target.closest ? e.target.closest('.pane[data-pane]') : null;
@@ -158,10 +202,12 @@ export function installKeyRouter(opts) {
   };
 
   const onKeyDown = (e) => {
-    if (modal) {
-      // An overlay owns the keyboard: no app shortcut fires underneath. Keys the overlay does not
-      // consume (false) keep their default action, e.g. typing into the overlay's text input.
-      if (modal(e)) {
+    // A modal (overlay / copy mode) owns the keyboard: no app shortcut fires underneath. Keys it
+    // does not consume (false) keep their default action, e.g. typing into an overlay's input.
+    // A modal answering null passes the key on (copy mode lets app chords through).
+    const m = modals.handle(e);
+    if (m.handled) {
+      if (m.consumed) {
         e.preventDefault();
         e.stopPropagation();
       }
@@ -195,7 +241,19 @@ export function installKeyRouter(opts) {
      * consumes the key (preventDefault + stopPropagation); false leaves its default action.
      */
     setModal(fn) {
-      modal = fn || null;
+      modals.setLegacy(fn);
+    },
+    /** Push a keyboard owner on top of the stack (see createModalStack); returns its token. */
+    pushModal(fn) {
+      return modals.push(fn);
+    },
+    /** Remove the entry for `token` (any position); false if already gone. */
+    popModal(token) {
+      return modals.pop(token);
+    },
+    /** True when the event is an app chord for the pane it targets (not passthrough). */
+    isAppKey(e) {
+      return !!appId(e, paneOf(e));
     },
     /** For xterm attachCustomKeyEventHandler: false = xterm must not process the key. */
     termKeyFilter(paneId, e) {

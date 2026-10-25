@@ -26,3 +26,21 @@ test('separate gates are independent', () => {
   a.accept({ version: 9 });
   assert.equal(b.accept({ version: 1 }), true);
 });
+
+import { readClipboardText, writeClipboardText } from '../../src/api.js';
+
+test('clipboard wrappers go through __TAURI__.clipboardManager', async () => {
+  const calls = [];
+  globalThis.__TAURI__ = {
+    clipboardManager: {
+      writeText: async (t) => calls.push(['w', t]),
+      readText: async () => '붙여넣기',
+    },
+  };
+  await writeClipboardText('복사');
+  assert.equal(await readClipboardText(), '붙여넣기');
+  assert.deepEqual(calls, [['w', '복사']]);
+  globalThis.__TAURI__.clipboardManager.readText = async () => null;
+  assert.equal(await readClipboardText(), '');
+  delete globalThis.__TAURI__;
+});

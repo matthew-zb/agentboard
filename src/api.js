@@ -123,3 +123,14 @@ export function missingDirs() {
 export function on(event, fn) {
   return tauri().event.listen(event, (e) => fn(e.payload));
 }
+
+/** Write text to the system clipboard (clipboard-manager plugin). */
+export function writeClipboardText(text) {
+  return tauri().clipboardManager.writeText(text);
+}
+
+/** Clipboard text, '' when empty / not text. */
+export async function readClipboardText() {
+  const t = await tauri().clipboardManager.readText();
+  return typeof t === 'string' ? t : '';
+}

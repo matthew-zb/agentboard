@@ -81,6 +81,19 @@ export function sizeChanged(last, cols, rows) {
   return !last || last.cols !== cols || last.rows !== rows;
 }
 
+/**
+ * Sync input (spec 6.3): panes that receive what is typed in `paneId`. null when the pane's tab
+ * has sync off (normal single-pane path); otherwise every Running pane of the tab, each once.
+ */
+export function syncTargets(ws, paneId) {
+  const p = ws && ws.panes && ws.panes[paneId];
+  const tab = p && ws.tabs && ws.tabs[p.tab];
+  if (!tab || !tab.syncInput) return null;
+  return Object.values(ws.panes)
+    .filter((q) => q.tab === p.tab && q.status && q.status.state === 'running')
+    .map((q) => q.id);
+}
+
 // ---------------------------------------------------------------- runtime
 
 const entries = new Map();
@@ -89,13 +102,14 @@ let hooks = {
   onFocus: () => {},
   report: (e) => console.error('[agentboard]', e),
   keyFilter: () => true,
+  syncTargets: () => null,
 };
 
 /**
  * Wire the module to the app: `send(cmd)` (renders its result), `onFocus(group, tab, pane)`
  * (pane clicked while not focused), `report(error)` (status bar message),
  * `keyFilter(paneId, KeyboardEvent) -> bool` (xterm attachCustomKeyEventHandler: false = an app
- * shortcut, xterm must not process it).
+ * shortcut, xterm must not process it), `syncTargets(paneId) -> paneId[] | null` (sync input).
  */
 export function configurePanes(h) {
   hooks = { ...hooks, ...h };
@@ -194,25 +208,41 @@ function createEntry(id) {
     fitQueued: false,
     resizeTimer: null,
     writeFailed: false,
+    inputBlocked: false, // copy mode: nothing typed/pasted/composed may reach any PTY
     ro: null,
   };
 
+  const toPty = (target, d) => {
+    api.write(target, d).catch((err) => {
+      const t = entries.get(target);
+      if (t && !t.writeFailed) {
+        t.writeFailed = true;
+        t.term.write(`\r\n\x1b[31m[입력 전달 실패: ${err}]\x1b[0m\r\n`);
+      }
+    });
+  };
   const input = (d) => {
+    if (e.inputBlocked) return;
     if (isDead(e.model)) {
       if (d === '\r') restartPane(id);
       return;
     }
     if (e.suppressInput) return;
-    api.write(id, d).catch((err) => {
-      if (!e.writeFailed) {
-        e.writeFailed = true;
-        term.write(`\r\n\x1b[31m[입력 전달 실패: ${err}]\x1b[0m\r\n`);
+    // Sync input: one write per Running pane of the tab (the source included). Other panes'
+    // onData is not involved, so there is no echo loop.
+    const targets = hooks.syncTargets(id);
+    if (targets && targets.length) {
+      for (const t of targets) {
+        const te = entries.get(t);
+        if (t === id || (te && !te.suppressInput)) toPty(t, d);
       }
-    });
+      return;
+    }
+    toPty(id, d);
   };
   term.onData(input);
   term.onBinary((d) => {
-    if (!isDead(e.model) && !e.suppressInput) api.write(id, d).catch(() => {});
+    if (!e.inputBlocked && !isDead(e.model) && !e.suppressInput) api.write(id, d).catch(() => {});
   });
 
   el.addEventListener('mousedown', () => {
@@ -222,6 +252,24 @@ function createEntry(id) {
   e.ro = new ResizeObserver(() => scheduleFit(e));
   e.ro.observe(host);
   return e;
+}
+
+/** Block/unblock all input of a pane (copy mode); its terminal still renders output. */
+export function setInputBlocked(paneId, blocked) {
+  const e = entries.get(paneId);
+  if (e) e.inputBlocked = !!blocked;
+}
+
+/**
+ * Paste text into a pane through xterm (bracketed paste when the app enabled it). The resulting
+ * onData goes through the normal input path, so sync input fans it out exactly once per pane.
+ * Ignored in copy mode.
+ */
+export function pasteText(paneId, text) {
+  const e = entries.get(paneId);
+  if (!e || e.inputBlocked || !text) return false;
+  e.term.paste(text);
+  return true;
 }
 
 /** Header element for a Pane model: name, profile, status symbol, ⚠, ⟳, ✕. */
