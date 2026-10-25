@@ -11,6 +11,8 @@ import {
   canDo,
   moveSelection,
   keepSelection,
+  isFocusTrapKey,
+  focusLost,
   saveStep,
   parsePaths,
   timelineLabel,
@@ -157,6 +159,7 @@ function refresh() {
       for (const v of store.views) v.render();
     },
     (err) => {
+      if (seq !== store.seq) return; // a newer request already answered
       store.error = String(err);
       for (const v of store.views) v.render();
     },
@@ -221,7 +224,7 @@ export function mountInbox() {
   const root = document.createElement('div');
   root.className = 'inbox view-list';
   root.tabIndex = -1; // keydown target while the applet pane is focused
-  const st = { sel: null, view: 'list', hideDone: loadHideDone(), busy: false, disposed: false };
+  const st = { sel: null, selIndex: 0, view: 'list', hideDone: loadHideDone(), busy: false, disposed: false };
 
   const list = () => visibleItems(store.items, { hideDone: st.hideDone });
   const selected = () => store.items.find((it) => it.id === st.sel) || null;
@@ -230,10 +233,16 @@ export function mountInbox() {
     render() {
       if (st.disposed) return;
       const items = list();
-      st.sel = keepSelection(items, st.sel);
+      const sel = keepSelection(items, st.sel, st.selIndex);
+      if (st.sel !== null && sel !== st.sel && st.view === 'detail') st.view = 'list'; // its item left the list: no silent switch
+      st.sel = sel;
+      st.selIndex = items.findIndex((it) => it.id === sel);
       const item = selected();
+      const hadFocus = root.contains(document.activeElement);
       const oldDetail = root.querySelector('.inbox-detail');
       const keepScroll = oldDetail && oldDetail.dataset.id === (item && item.id) ? oldDetail.scrollTop : 0;
+      const oldRows = root.querySelector('.inbox-rows');
+      const rowsScroll = oldRows ? oldRows.scrollTop : 0;
       const l = buildList(document, items, { selected: st.sel, hideDone: st.hideDone, total: store.items.length });
       const d = buildDetail(document, item, { focused: st.view === 'detail' });
       d.dataset.id = item ? item.id : '';
@@ -241,6 +250,10 @@ export function mountInbox() {
       if (store.error) parts.unshift(el(document, 'div', 'inbox-error', `인박스를 읽을 수 없습니다: ${store.error}`));
       root.replaceChildren(...parts);
       d.scrollTop = keepScroll;
+      const rows = l.querySelector('.inbox-rows');
+      if (rows) rows.scrollTop = rowsScroll;
+      // replaced nodes may have held focus (a focusable scroller): keep the applet's keys alive
+      if (focusLost(hadFocus, document.activeElement, root, document.body)) root.focus({ preventScroll: true });
       root.classList.toggle('view-list', st.view === 'list');
       root.classList.toggle('view-detail', st.view === 'detail');
       const row = l.querySelector('.inbox-row.sel');
@@ -370,6 +383,10 @@ export function mountInbox() {
 
   const onKey = (e) => {
     if (e.defaultPrevented || editable(e.target)) return; // the app key router / an input owns it
+    if (isFocusTrapKey(e)) {
+      e.preventDefault(); // no focus traversal into a neighbouring terminal (Task 14 may give Tab a job)
+      return;
+    }
     const a = keyAction(e);
     if (!a) return;
     const r = actions[a]();

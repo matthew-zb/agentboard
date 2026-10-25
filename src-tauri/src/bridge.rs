@@ -468,6 +468,8 @@ fn expire(state: &AppState, t: &Target, p: Pending) {
 // is missing, exited or failed is refused up front with a Korean error (nothing recorded), so
 // the applet can tell the user instead of the message silently waiting for a process that will
 // never come. Locks: `ws` (released) → inbox → bridge, one at a time.
+// The action is recorded before `send`; `send` can then only fail if the dispatcher pane left
+// the model in between (a tiny window) — the command still returns that error.
 
 /// The dispatcher's role pane when its process is running or starting.
 pub fn dispatcher_pane(state: &AppState) -> Result<PaneId, String> {

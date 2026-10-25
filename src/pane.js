@@ -252,7 +252,13 @@ function createAppletEntry(id, model) {
     applet,
   };
   el.tabIndex = -1; // focusable, so pane focus has somewhere to go
-  el.addEventListener('mousedown', () => {
+  el.addEventListener('mousedown', (ev) => {
+    // A click outside the applet view (header, border) would focus the pane element, where
+    // applet keys never arrive: keep/put focus on the applet instead (also when already focused).
+    if (applet && !applet.el.contains(ev.target)) {
+      ev.preventDefault();
+      applet.focus();
+    }
     if (e.ctx && (!e.ctx.focused || e.ctx.attention)) hooks.onFocus(e.ctx.group, e.ctx.tab, id);
   });
   return e;
@@ -579,13 +585,20 @@ function sendResize(e) {
   });
 }
 
-/** Give the pane's terminal DOM focus unless it already has it. */
+/**
+ * Give the pane's terminal DOM focus unless it already has it. An applet always gets its own
+ * root focused (a click on the header focuses the pane element, where applet keys never arrive);
+ * `applet.focus()` does nothing when focus is already inside the applet.
+ */
 export function focusPane(paneId) {
   const e = entries.get(paneId);
   if (!e || !e.el.isConnected) return;
+  if (e.applet) {
+    e.applet.focus();
+    return;
+  }
   if (e.el.contains(document.activeElement)) return;
   if (e.term) e.term.focus();
-  else if (e.applet) e.applet.focus();
   else e.el.focus({ preventScroll: true });
 }
 

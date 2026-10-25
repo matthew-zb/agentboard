@@ -8,6 +8,8 @@ import {
   canDo,
   moveSelection,
   keepSelection,
+  isFocusTrapKey,
+  focusLost,
   saveStep,
   parsePaths,
   timelineLabel,
@@ -267,4 +269,34 @@ test('detail buttons follow canDo (c only when close_proposed) and show their ke
   assert.ok(byAction.instruct.textContent.includes('(i)'));
   const empty = buildDetail(fakeDoc(), null, {});
   assert.ok(empty.textContent.includes('항목을 선택'));
+});
+
+test('isFocusTrapKey: plain Tab / Shift+Tab stay in the applet; chords and other keys do not', () => {
+  assert.equal(isFocusTrapKey(key('Tab')), true);
+  assert.equal(isFocusTrapKey(key('Tab', { shiftKey: true })), true);
+  assert.equal(isFocusTrapKey(key('Tab', { ctrlKey: true })), false);
+  assert.equal(isFocusTrapKey(key('Tab', { altKey: true })), false);
+  assert.equal(isFocusTrapKey(key('Tab', { metaKey: true })), false);
+  assert.equal(isFocusTrapKey(key('KeyJ')), false);
+  assert.equal(isFocusTrapKey(null), false);
+});
+
+test('focusLost: refocus the root only when focus was inside it and is now nowhere useful', () => {
+  const body = { id: 'body' };
+  const root = { contains: (x) => x === root || x === inner };
+  const inner = { id: 'inner' };
+  const other = { id: 'xterm' };
+  assert.equal(focusLost(true, body, root, body), true, 'replaced child → body');
+  assert.equal(focusLost(true, null, root, body), true);
+  assert.equal(focusLost(true, inner, root, body), false, 'still inside');
+  assert.equal(focusLost(true, other, root, body), false, 'user moved elsewhere');
+  assert.equal(focusLost(false, body, root, body), false, 'was not ours');
+});
+
+test('keepSelection: a vanished item selects its neighbour at the old position', () => {
+  const list = [item('12:00', 'new', false), item('11:00', 'new', false), item('10:00', 'new', false)];
+  assert.equal(keepSelection(list, 'gone', 1), '11:00');
+  assert.equal(keepSelection(list, 'gone', 7), '10:00', 'clamped to the last');
+  assert.equal(keepSelection(list, 'gone', -1), '12:00');
+  assert.equal(keepSelection(list, '10:00', 0), '10:00', 'still listed → unchanged');
 });

@@ -86,10 +86,34 @@ export function moveSelection(list, selId, delta) {
   return list[Math.max(0, Math.min(list.length - 1, i + delta))].id;
 }
 
-/** Keep `selId` when it is still listed, else the first item (null for an empty list). */
-export function keepSelection(list, selId) {
+/**
+ * Keep `selId` when it is still listed; otherwise the item now at `prevIndex` (its old
+ * position, clamped), or the first item without one. Null for an empty list.
+ */
+export function keepSelection(list, selId, prevIndex = 0) {
   if (!list || !list.length) return null;
-  return list.some((it) => it.id === selId) ? selId : list[0].id;
+  if (list.some((it) => it.id === selId)) return selId;
+  const i = Math.max(0, Math.min(list.length - 1, Number.isInteger(prevIndex) ? prevIndex : 0));
+  return list[i].id;
+}
+
+/**
+ * Plain Tab / Shift+Tab inside the applet: swallowed so the browser's focus traversal cannot
+ * move DOM focus into a neighbouring terminal (whose prompt would then receive j/i/c…).
+ * Chords with Ctrl/Alt/Meta are left to the app key router.
+ */
+export function isFocusTrapKey(e) {
+  return !!e && e.code === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey;
+}
+
+/**
+ * After a re-render replaced the applet's nodes: give focus back to the root when it was inside
+ * before (`hadFocus`) and is now on `body`/nowhere — not when the user moved it elsewhere.
+ */
+export function focusLost(hadFocus, active, root, body) {
+  if (!hadFocus) return false;
+  if (!active || active === body) return true;
+  return false;
 }
 
 /** `s`: 'save' when the item has an issue folder, 'needIssue' when it must be requested first. */
