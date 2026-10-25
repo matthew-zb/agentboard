@@ -42,8 +42,8 @@
 
 [Claude Code cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging)을 쓴다. 같은 PC 세션끼리 `SendMessage`/`ListAgents`, 받는 세션이 작업 중이면 도구 호출 사이에, 쉬고 있으면 새 턴으로 전달되며 **입력란을 건드리지 않는다**(반목표 충족).
 
-- **요구 버전**: Windows 네이티브 Claude Code **v2.1.234 이상**. 현재 이 PC는 2.1.215 → 업데이트 필요. 앱은 시작 시 `claude --version`을 확인해 미달이면 상태 표시줄 오류 + 2단계 기능 비활성(1단계 기능은 계속 동작).
-- **세션 이름**: 앱이 각 에이전트를 `--name <에이전트 이름>`으로 띄운다. 이름 규칙 **[설계자 판단]**: 상시 에이전트는 탭 이름(`dispatcher`, `handover`, `billing` …), 팀은 `<탭>-lead`, `<탭>-m1`, `<탭>-m2` …. 다른 세션이 이 이름으로 메시지를 보낸다.
+- **요구 버전**: Windows 네이티브 Claude Code **v2.1.234 이상**. 현재 이 PC는 2.1.215 → 업데이트 필요. 앱은 시작 시 `claude --version`을 확인해 미달이면 상태 표시줄 오류를 띄운다. **이때도 role 탭은 정상으로 띄우고 MCP·인박스도 동작한다**; 에이전트끼리 메시지만 안 되며, 앱→세션 메시지는 §3 대안(PTY) 경로를 쓴다 **[설계자 판단]**.
+- **세션 이름**: 앱이 각 에이전트를 `--name <에이전트 이름>`으로 띄운다. 이름 규칙 **[설계자 판단]**: 상시 에이전트는 탭 이름(`dispatcher`, `handover`, `billing` …), 팀은 `<탭>-<팀id>-lead`, `<탭>-<팀id>-m1`, `<탭>-<팀id>-m2` … (팀id는 Manager가 정하는 짧은 이름, 예: `batch`). 다른 세션이 이 이름으로 메시지를 보낸다.
 - **수신 설정**: 사용자는 auto 모드 위주로 쓰므로 기본값으로 전달된다. 앱이 띄우는 세션에는 `--settings`로 `crossSessionInbound: "accept"`를 명시해 모드와 무관하게 받게 한다. **[설계자 판단]**
 - **앱 → 세션 메시지** (사용자 지시 전달, 야간 정리 신호): 세션의 inbox 소켓(Windows named pipe)에 쓴다. Windows는 연결 첫 줄에 `CLAUDE_CODE_MESSAGING_TOKEN` 인증이 필요하므로, 앱이 각 세션에 **SessionStart hook**을 넣어 hook이 `CLAUDE_CODE_MESSAGING_SOCKET`·`CLAUDE_CODE_MESSAGING_TOKEN`을 앱의 로컬 엔드포인트로 보고하게 한다. 앱은 그 소켓·토큰으로 메시지를 쓴다. **[설계자 판단 — 스파이크 P1로 먼저 검증]**
   - 대안(P1 실패 시): 대상 세션이 idle(Stop hook)이고 **입력란이 비어 있다고 확인될 때만** PTY로 입력·제출. 확인 불가 시 대기. 사용자 입력과 섞이면 안 된다(반목표).
@@ -60,15 +60,19 @@
 | `inbox_propose_close(item, final_opinion)` | 담당 Manager | 상태 → 종료 제안됨, 최종 의견 기록 |
 | `inbox_list(state?)` | 모두 | 자기 담당(또는 dispatcher는 전체) 항목 조회 |
 | `issue_create(item?, title)` | Manager | `<Manager 작업폴더>/issues/<id>/{input,output}` 생성, 항목이 있으면 연결. 반환: 경로 |
-| `hire_lead(brief_path, extra_prompt?)` | Manager | 자기 탭에 팀 리드 창 추가(팀 영역 분할) |
-| `hire_member(extra_prompt?)` | 팀 리드 | 같은 탭 팀 영역에 팀원 창 추가 |
-| `dismiss(agent)` | Manager(리드·팀원), 팀 리드(팀원) | 해당 창 종료 |
-| `list_team()` | Manager·팀 리드 | 탭 안 팀 구성과 상태 |
+| `hire_lead(team, brief_path, extra_prompt?)` | Manager | 자기 탭에 팀 `team`을 만들고 팀 리드 창 추가(팀 영역 분할). 한 Manager가 **팀을 개수 제한 없이** 동시에 둘 수 있다 [사용자 결정] |
+| `hire_member(extra_prompt?)` | 팀 리드 | 자기 팀 영역에 팀원 창 추가 (팀당 상한 `roles.member.maxPerTeam`) |
+| `dismiss(agent)` / `dismiss_team(team)` | Manager(자기 탭의 리드·팀원·팀 전체), 팀 리드(자기 팀원) | 해당 창(들) 종료, 팀 해산 시 팀 영역 제거 |
+| `list_team(team?)` | Manager·팀 리드 | 탭 안 팀들(또는 한 팀)의 구성과 상태 |
 | `handoff_done()` | Manager·dispatcher·handover | 야간 정리 완료 신호(§7) |
+| `create_manager_tab(name, dir, template?)` | dispatcher | 새 상시업무 탭 + Manager를 실행 중에 생성하고 `config.json`의 `tabs`에 role `manager`로 추가. 탭은 dispatcher가 있지 않은 그룹(기본 `defaultGroup`)에 열리고 포커스·활성 탭을 바꾸지 않는다(1단계 R12) |
+
+- **상시업무 추가 [원래 요구사항]**: 새 업무 영역이 생기면 dispatcher가 `create_manager_tab`으로 탭과 Manager를 만들고 설정을 갱신한다. 사용자도 1단계 `Alt+n`으로 만들 수 있다(마법사에 역할 선택 추가). **상시업무 제거 [설계자 판단]**: 2단계 범위 밖 — 사용자가 탭을 닫고 `config.json`에서 지운다. 남은 이슈 폴더·인박스 항목은 그대로 둔다.
+- **팀 창의 프로필·인자 [설계자 판단]**: `roles.<역할>`에 `agent`(기본 `claude`)·`args`를 둔다. 채용 도구는 이 기본값을 쓰고, `hire_*`에 `args` 덮어쓰기는 두지 않는다. 탭당 팀원 상한 `roles.member.maxPerTeam`(기본 4).
 
 - 채용·해산은 1단계 `WsCommand`(SplitPane/ClosePane)를 재사용한다. 1단계 후속 과제의 "Tauri 명령 안의 apply→submit→publish를 `launcher::execute`로 분리"를 먼저 한다.
 - 1단계 후속 과제 중 **창 재시작 경합(spawn generation)**은 MCP가 동시에 명령을 보내므로 2단계 착수 시 반드시 해결한다.
-- **팀 업무 문서 [사용자 결정 → 형식은 설계자 판단]**: Manager는 팀 리드를 채용하기 전에 팀 업무 문서(`<작업폴더>/team/brief.md` 등)를 쓰고 `hire_lead`에 경로를 넘긴다. 팀 리드는 그 문서를 기준으로 일한다. 야간 정리로 Manager가 새로 떠도 이 문서로 팀을 이어 관리한다.
+- **팀 업무 문서 [사용자 결정 → 형식은 설계자 판단]**: Manager는 팀 리드를 채용하기 전에 팀 업무 문서(`<작업폴더>/teams/<팀id>/brief.md`)를 쓰고 `hire_lead`에 경로를 넘긴다. 팀 구성(팀id, 팀원 수, 각 역할 한 줄)도 같은 폴더의 `roster.md`에 Manager가 기록한다. 팀 리드는 그 문서를 기준으로 일한다. 야간 정리로 Manager가 새로 떠도 이 문서로 팀을 이어 관리한다.
 
 ## 5. 인박스 애플릿 (C안: 인박스 + 상세) [사용자 결정]
 
@@ -84,6 +88,12 @@ dispatcher 탭을 분할해 오른쪽에 둔다. 터미널이 아닌 **앱 화�
   - **종료 확인(`c`)**: 종료 제안됨 상태에서만. 완료로 전환, 담당 Manager에게 알림.
   - 목록 `j/k`, Enter 상세, `Esc` 목록으로. 터미널↔애플릿은 1단계 `Alt+h/l`.
 - **저장 위치 [설계자 판단]**: `<workspaceRoot>/.agentboard/inbox/<id>.json`(항목 + 타임라인). 원자적 쓰기. 애플릿은 1단계 스냅샷 방식으로 변경 이벤트를 받아 다시 그린다.
+
+## 5-1. 보이지 않는 창의 주의 표시 [사용자 결정]
+
+- 사용자는 dispatcher 창에 머무르므로, 다른 탭 에이전트가 **권한 승인 대기·질문 대기**로 멈추면 그 **탭에 ⚠ 표시**로 알린다(인박스 항목으로 올리지 않는다).
+- 감지: 1단계 터미널 벨에 더해 Claude Code **Notification hook**(권한 요청·입력 대기)을 앱이 각 세션에 넣어 SetAttention을 정확히 보낸다.
+- **탭은 항상 보여야 한다 [사용자 결정]**: dispatcher 화면에서도 모든 탭의 ⚠가 보여야 한다. 그룹이 최대화되어 다른 그룹 탭 바가 가려지면, 상태 표시줄에 ⚠ 탭 목록(`⚠ billing, api`)을 띄운다 **[설계자 판단]**. `Alt+a`로 이동(1단계 기능).
 
 ## 6. 이슈 폴더 [사용자 결정]
 
@@ -116,6 +126,8 @@ dispatcher 탭을 분할해 오른쪽에 둔다. 터미널이 아닌 **앱 화�
 - 시작 시 **상시 에이전트만** 띄운다(dispatcher, handover, 각 Manager). 팀 영역은 비어 있음. 모두 새 세션. [사용자 결정]
 - 각 상시 에이전트의 시작 프롬프트: "handover 인덱스(경로)를 읽고 내 작업 계획·진행 내역을 리뷰해 진행 준비하라" + 역할별 추가 지시. handover의 시작 프롬프트에는 `/loop <간격> <확인 작업>`이 들어간다(사용자가 템플릿에서 관리).
 - 앱이 강제 종료·재부팅된 경우에도 같은 시작 절차(문서 기반)로 이어간다.
+- **재부팅 후 팀 자동 재채용 [사용자 결정]**: 재시작 때 팀 창은 띄우지 않는다. 각 Manager는 시작 리뷰 중 `teams/*/brief.md`·`roster.md`에 진행 중인 팀이 있으면 **자동으로 팀 리드를 다시 채용**하고, 팀 리드는 roster대로 팀원을 다시 채용해 brief와 산출물을 보고 이어서 일한다. 완료된 팀은 Manager가 brief에 `상태: 완료`를 적어 재채용 대상에서 뺀다.
+- **1단계식 탭(role 없음)** 은 1단계 방식 그대로 `workspace.json`에서 복원한다. role 탭은 복원 시 레이아웃·탭 위치만 복원하고 프로세스는 위 시작 절차(새 세션 + 시작 프롬프트)로 띄우며 팀 영역은 비운다 **[설계자 판단]**.
 
 ## 10. 설정 추가
 
