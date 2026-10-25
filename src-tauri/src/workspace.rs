@@ -146,8 +146,6 @@ pub enum WsCommand {
     SetGroupMaximized { group: Option<GroupId> },
 }
 
-const UNSUPPORTED: &str = "아직 지원하지 않는 명령입니다";
-
 fn no_pane(id: &str) -> String {
     format!("창 '{id}'을(를) 찾을 수 없습니다")
 }
@@ -470,26 +468,11 @@ impl Workspace {
                         return Err(format!("창 '{p}'이(가) 탭 '{tid}'에 없습니다"));
                     }
                 }
-                let prev = self.groups.get(&self.focus.group_id).map(|pg| Location {
-                    group_id: pg.id.clone(),
-                    tab_id: pg.active_tab_id.clone(),
-                });
-                let new = Location { group_id: group.clone(), tab_id: tid.clone() };
-                if let Some(prev) = prev {
-                    if prev != new {
-                        self.last_location = Some(prev);
-                    }
-                }
-                self.focus.group_id = group.clone();
-                self.groups.get_mut(&group).unwrap().active_tab_id = tid.clone();
-                let t = self.tabs.get_mut(&tid).unwrap();
+                let prev = self.focus_location();
                 if let Some(p) = pane {
-                    t.last_focused_pane_id = p;
+                    self.tabs.get_mut(&tid).unwrap().last_focused_pane_id = p;
                 }
-                let focused = t.last_focused_pane_id.clone();
-                if let Some(p) = self.panes.get_mut(&focused) {
-                    p.attention = false;
-                }
+                self.move_focus(prev, &group, &tid);
             }
             SetMaximized { tab, pane } => {
                 let t = self.tab(&tab)?;
@@ -512,8 +495,67 @@ impl Workspace {
                 self.pane(&pane)?;
                 self.panes.get_mut(&pane).unwrap().attention = on;
             }
-            MoveTab { .. } | SplitGroupWith { .. } | MergeGroup { .. } | CloseGroup { .. } | SetGroupMaximized { .. } => {
-                return Err(UNSUPPORTED.into());
+            MoveTab { tab, group, index } => {
+                self.tab(&tab)?;
+                self.group(&group)?;
+                let src = self.group_of_tab(&tab).cloned().ok_or_else(|| no_tab(&tab))?;
+                let prev = self.focus_location();
+                if src == group {
+                    let g = self.groups.get_mut(&group).unwrap();
+                    g.tab_ids.retain(|t| *t != tab);
+                    let at = index.min(g.tab_ids.len());
+                    g.tab_ids.insert(at, tab.clone());
+                } else {
+                    self.take_tab_from_group(&src, &tab);
+                    let g = self.groups.get_mut(&group).unwrap();
+                    let at = index.min(g.tab_ids.len());
+                    g.tab_ids.insert(at, tab.clone());
+                    self.remove_group_if_empty(&src);
+                }
+                self.move_focus(prev, &group, &tab);
+            }
+            SplitGroupWith { tab, group, dir, before } => {
+                self.tab(&tab)?;
+                let target = self.group(&group)?;
+                let src = self.group_of_tab(&tab).cloned().ok_or_else(|| no_tab(&tab))?;
+                if src == group && target.tab_ids.len() == 1 {
+                    return Err("탭이 하나뿐인 그룹은 분할할 수 없습니다".into());
+                }
+                let prev = self.focus_location();
+                let gid = self.new_group_id();
+                let mut n = self.counters.group;
+                let name = loop {
+                    let candidate = format!("group-{n}");
+                    if !self.groups.values().any(|g| g.name == candidate) {
+                        break candidate;
+                    }
+                    n += 1;
+                };
+                self.take_tab_from_group(&src, &tab);
+                self.groups.insert(
+                    gid.clone(),
+                    Group { id: gid.clone(), name, tab_ids: vec![tab.clone()], active_tab_id: tab.clone() },
+                );
+                if !self.group_layout.split_leaf(&group, gid.clone(), dir, before) {
+                    return Err(no_group(&group));
+                }
+                self.remove_group_if_empty(&src);
+                self.move_focus(prev, &gid, &tab);
+            }
+            MergeGroup { src, dst } => self.merge_groups(&src, &dst)?,
+            CloseGroup { group } => {
+                self.group(&group)?;
+                let mut probe = self.group_layout.clone();
+                let Some(Some(sibling)) = probe.remove_leaf(&group) else {
+                    return Err("그룹이 하나뿐입니다".into());
+                };
+                self.merge_groups(&group, &sibling)?;
+            }
+            SetGroupMaximized { group } => {
+                if let Some(g) = &group {
+                    self.group(g)?;
+                }
+                self.group_maximized = group;
             }
         }
         Ok(fx)
@@ -531,7 +573,6 @@ impl Workspace {
         self.groups.get(id).ok_or_else(|| no_group(id))
     }
 
-    #[allow(dead_code)] // used by the group commands (Task 8)
     fn new_group_id(&mut self) -> GroupId {
         self.counters.group += 1;
         format!("g{}", self.counters.group)
@@ -633,13 +674,66 @@ impl Workspace {
             self.last_location = None;
         }
         let Some(gid) = self.group_of_tab(tab).cloned() else { return };
-        let g = self.groups.get_mut(&gid).unwrap();
+        self.take_tab_from_group(&gid, tab);
+        self.remove_group_if_empty(&gid);
+    }
+
+    /// Take `tab` out of group `gid`'s tab list (the tab stays in the tab map). If it was the
+    /// group's active tab, the right neighbour becomes active, else the left one. The group may
+    /// be left empty; callers decide whether to remove it.
+    fn take_tab_from_group(&mut self, gid: &GroupId, tab: &str) {
+        let g = self.groups.get_mut(gid).unwrap();
         let idx = g.tab_ids.iter().position(|t| t == tab).unwrap();
         g.tab_ids.remove(idx);
         if g.active_tab_id == tab {
             g.active_tab_id = g.tab_ids.get(idx).or_else(|| idx.checked_sub(1).and_then(|i| g.tab_ids.get(i))).cloned().unwrap_or_default();
         }
-        self.remove_group_if_empty(&gid);
+    }
+
+    /// The focused group's active tab as a location.
+    fn focus_location(&self) -> Option<Location> {
+        self.groups.get(&self.focus.group_id).map(|g| Location { group_id: g.id.clone(), tab_id: g.active_tab_id.clone() })
+    }
+
+    /// Focus `(gid, tid)`: that tab becomes the group's active tab, `prev` (the location before the
+    /// command) becomes `last_location` when it differs and still exists, a `last_location` equal to
+    /// the new focus is stale and cleared, and the tab's last focused pane loses its attention mark.
+    fn move_focus(&mut self, prev: Option<Location>, gid: &GroupId, tid: &TabId) {
+        let new = Location { group_id: gid.clone(), tab_id: tid.clone() };
+        if let Some(prev) = prev {
+            let alive = self.groups.get(&prev.group_id).is_some_and(|g| g.tab_ids.contains(&prev.tab_id));
+            if alive && prev != new {
+                self.last_location = Some(prev);
+            }
+        }
+        if self.last_location.as_ref() == Some(&new) {
+            self.last_location = None;
+        }
+        self.focus.group_id = gid.clone();
+        self.groups.get_mut(gid).unwrap().active_tab_id = tid.clone();
+        let focused = self.tabs[tid].last_focused_pane_id.clone();
+        if let Some(p) = self.panes.get_mut(&focused) {
+            p.attention = false;
+        }
+    }
+
+    /// Append `src`'s tabs to `dst` (name and active tab of `dst` kept) and remove `src`. Focus
+    /// stays on the originally focused tab, now in whichever group holds it.
+    fn merge_groups(&mut self, src: &GroupId, dst: &GroupId) -> Result<(), String> {
+        self.group(src)?;
+        self.group(dst)?;
+        if src == dst {
+            return Err("같은 그룹끼리는 병합할 수 없습니다".into());
+        }
+        let prev = self.focus_location();
+        let moved = std::mem::take(&mut self.groups.get_mut(src).unwrap().tab_ids);
+        self.groups.get_mut(dst).unwrap().tab_ids.extend(moved);
+        self.remove_group_if_empty(src);
+        if let Some(p) = &prev {
+            let gid = self.group_of_tab(&p.tab_id).cloned().ok_or_else(|| no_tab(&p.tab_id))?;
+            self.move_focus(prev.clone(), &gid, &p.tab_id);
+        }
+        Ok(())
     }
 
     /// Remove `g` from the group layout and the group map when it has no tabs. A focused group
@@ -1107,23 +1201,301 @@ mod tests {
         assert!(ws.apply(WsCommand::SetMaximized { tab: api, pane: Some(d) }, &l).is_err());
     }
 
+    fn gid_named(ws: &Workspace, name: &str) -> GroupId {
+        ws.groups.values().find(|g| g.name == name).unwrap_or_else(|| panic!("no group {name}")).id.clone()
+    }
+    fn tab_names(ws: &Workspace, g: &str) -> Vec<String> {
+        ws.groups[g].tab_ids.iter().map(|t| ws.tabs[t].name.clone()).collect()
+    }
+    fn create_in(name: &str, group: &str) -> WsCommand {
+        WsCommand::CreateTab { name: name.into(), dir: name.into(), template: Some("solo".into()), group: Some(group.into()) }
+    }
+
     #[test]
-    fn group_commands_not_supported_yet() {
+    fn move_tab_between_groups_and_remove_empty() {
+        let l = loaded_groups();
+        let mut ws = Workspace::from_config(&l);
+        let control = gid_named(&ws, "control");
+        let work = gid_named(&ws, "work");
+        let api = tab(&ws, "api").id.clone();
+        let d = tab(&ws, "dispatcher").id.clone();
+        let fx = ws.apply(WsCommand::MoveTab { tab: api.clone(), group: control.clone(), index: 0 }, &l).unwrap();
+        assert_eq!(fx, Effects::default());
+        assert_eq!(tab_names(&ws, &control), ["api", "dispatcher"]);
+        assert!(!ws.groups.contains_key(&work));
+        assert_eq!(ws.group_layout, LayoutNode::Leaf(control.clone()));
+        assert_eq!(ws.groups[&control].active_tab_id, api);
+        assert_eq!(ws.focus.group_id, control);
+        assert_eq!(ws.last_location, Some(Location { group_id: control.clone(), tab_id: d }));
+        // source group survives; its active tab follows the CloseTab rule (right, else left)
+        let mut ws = Workspace::from_config(&l);
+        ws.apply(create_in("x", &work), &l).unwrap();
+        ws.apply(create_in("y", &work), &l).unwrap();
+        let x = tab(&ws, "x").id.clone();
+        ws.apply(WsCommand::SetFocus { group: work.clone(), tab: Some(x.clone()), pane: None }, &l).unwrap();
+        let before_loc = ws.last_location.clone();
+        assert!(before_loc.is_some());
+        ws.apply(WsCommand::MoveTab { tab: x.clone(), group: control.clone(), index: 1 }, &l).unwrap();
+        assert_eq!(tab_names(&ws, &work), ["api", "y"]);
+        assert_eq!(ws.groups[&work].active_tab_id, tab(&ws, "y").id);
+        assert_eq!(tab_names(&ws, &control), ["dispatcher", "x"]);
+        assert_eq!(ws.groups[&control].active_tab_id, x);
+        assert_eq!(ws.focus.group_id, control);
+        // the previous location (work, x) no longer exists → lastLocation is left alone
+        assert_eq!(ws.last_location, before_loc);
+        // errors leave the model unchanged
+        let before = ws.clone();
+        assert!(ws.apply(WsCommand::MoveTab { tab: "t99".into(), group: control.clone(), index: 0 }, &l).is_err());
+        assert!(ws.apply(WsCommand::MoveTab { tab: x, group: "g99".into(), index: 0 }, &l).is_err());
+        assert_eq!(ws, before);
+    }
+
+    #[test]
+    fn move_tab_reorders_within_group() {
+        let l = loaded_fixture();
+        let mut ws = Workspace::from_config(&l);
+        ws.apply(create("b", "solo"), &l).unwrap();
+        ws.apply(create("c", "solo"), &l).unwrap();
+        let g = ws.focus.group_id.clone();
+        let c = tab(&ws, "c").id.clone();
+        let d = tab(&ws, "dispatcher").id.clone();
+        let fx = ws.apply(WsCommand::MoveTab { tab: c.clone(), group: g.clone(), index: 1 }, &l).unwrap();
+        assert_eq!(fx, Effects::default());
+        assert_eq!(tab_names(&ws, &g), ["dispatcher", "c", "api", "b"]);
+        assert_eq!(ws.groups[&g].active_tab_id, c);
+        assert_eq!(ws.groups.len(), 1);
+        // the dispatcher can be reordered too
+        ws.apply(WsCommand::MoveTab { tab: d, group: g.clone(), index: 2 }, &l).unwrap();
+        assert_eq!(tab_names(&ws, &g), ["c", "api", "dispatcher", "b"]);
+    }
+
+    #[test]
+    fn move_tab_index_out_of_range_appends() {
+        let l = loaded_groups();
+        let mut ws = Workspace::from_config(&l);
+        let control = gid_named(&ws, "control");
+        let api = tab(&ws, "api").id.clone();
+        ws.apply(create_in("x", &gid_named(&ws, "work")), &l).unwrap();
+        ws.apply(WsCommand::MoveTab { tab: api, group: control.clone(), index: 99 }, &l).unwrap();
+        assert_eq!(tab_names(&ws, &control), ["dispatcher", "api"]);
+        // same group, out of range → end
+        let d = tab(&ws, "dispatcher").id.clone();
+        ws.apply(WsCommand::MoveTab { tab: d, group: control.clone(), index: 99 }, &l).unwrap();
+        assert_eq!(tab_names(&ws, &control), ["api", "dispatcher"]);
+    }
+
+    #[test]
+    fn split_group_with_creates_group_before_and_after() {
+        let l = loaded_fixture();
+        let mut ws = Workspace::from_config(&l);
+        ws.apply(create("b", "solo"), &l).unwrap();
+        ws.apply(create("c", "solo"), &l).unwrap();
+        let old = ws.focus.group_id.clone();
+        let b = tab(&ws, "b").id.clone();
+        let c = tab(&ws, "c").id.clone();
+        let fx = ws
+            .apply(WsCommand::SplitGroupWith { tab: b.clone(), group: old.clone(), dir: Dir::Horizontal, before: true }, &l)
+            .unwrap();
+        assert_eq!(fx, Effects::default());
+        let leaves = ws.group_layout.leaves();
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(leaves[1], old);
+        let new1 = leaves[0].clone();
+        assert_ne!(new1, old);
+        assert_eq!(ws.groups[&new1].tab_ids, vec![b.clone()]);
+        assert_eq!(ws.groups[&new1].active_tab_id, b);
+        assert!(ws.groups[&new1].name.starts_with("group-"));
+        assert_eq!(tab_names(&ws, &old), ["dispatcher", "api", "c"]);
+        assert_eq!(ws.focus.group_id, new1);
+        // after
+        ws.apply(WsCommand::SplitGroupWith { tab: c.clone(), group: old.clone(), dir: Dir::Horizontal, before: false }, &l)
+            .unwrap();
+        let leaves = ws.group_layout.leaves();
+        assert_eq!(leaves.len(), 3);
+        assert_eq!(&leaves[..2], &[new1.clone(), old.clone()]);
+        let new2 = leaves[2].clone();
+        assert_eq!(ws.groups[&new2].tab_ids, vec![c]);
+        assert_ne!(ws.groups[&new1].name, ws.groups[&new2].name);
+        // a different direction nests
+        let api = tab(&ws, "api").id.clone();
+        ws.apply(WsCommand::SplitGroupWith { tab: api, group: old, dir: Dir::Vertical, before: false }, &l).unwrap();
+        assert_eq!(ws.group_layout.leaf_count(), 4);
+    }
+
+    #[test]
+    fn split_group_with_single_tab_errors() {
+        let l = loaded_groups();
+        let mut ws = Workspace::from_config(&l);
+        let work = gid_named(&ws, "work");
+        let api = tab(&ws, "api").id.clone();
+        let before = ws.clone();
+        let e = ws
+            .apply(WsCommand::SplitGroupWith { tab: api, group: work, dir: Dir::Horizontal, before: false }, &l)
+            .unwrap_err();
+        assert_eq!(e, "탭이 하나뿐인 그룹은 분할할 수 없습니다");
+        assert_eq!(ws, before);
+    }
+
+    #[test]
+    fn split_group_with_moves_only_tab_to_other_group_edge() {
+        // R4: a group's only tab may go to another group's edge; the emptied source is removed
+        let l = loaded_groups();
+        let mut ws = Workspace::from_config(&l);
+        let control = gid_named(&ws, "control");
+        let work = gid_named(&ws, "work");
+        let api = tab(&ws, "api").id.clone();
+        let fx = ws
+            .apply(WsCommand::SplitGroupWith { tab: api.clone(), group: control.clone(), dir: Dir::Vertical, before: true }, &l)
+            .unwrap();
+        assert_eq!(fx, Effects::default());
+        assert!(!ws.groups.contains_key(&work));
+        let leaves = ws.group_layout.leaves();
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(leaves[1], control);
+        assert_eq!(ws.groups[&leaves[0]].tab_ids, vec![api]);
+        assert_eq!(ws.groups.len(), 2);
+        assert_eq!(ws.focus.group_id, leaves[0]);
+    }
+
+    #[test]
+    fn merge_group_appends_in_order_keeps_dst_name() {
+        let l = loaded_groups();
+        let mut ws = Workspace::from_config(&l);
+        let control = gid_named(&ws, "control");
+        let work = gid_named(&ws, "work");
+        ws.apply(create_in("x", &work), &l).unwrap();
+        ws.apply(create_in("y", &work), &l).unwrap();
+        let d = tab(&ws, "dispatcher").id.clone();
+        let fx = ws.apply(WsCommand::MergeGroup { src: work.clone(), dst: control.clone() }, &l).unwrap();
+        assert_eq!(fx, Effects::default());
+        assert_eq!(tab_names(&ws, &control), ["dispatcher", "api", "x", "y"]);
+        assert_eq!(ws.groups[&control].name, "control");
+        assert_eq!(ws.groups[&control].active_tab_id, d);
+        assert!(!ws.groups.contains_key(&work));
+        assert_eq!(ws.group_layout, LayoutNode::Leaf(control.clone()));
+        assert_eq!(ws.focus.group_id, control);
+        // focus on the src group keeps its focused tab, now living in dst
+        let mut ws = Workspace::from_config(&l);
+        let api = tab(&ws, "api").id.clone();
+        ws.apply(WsCommand::SetFocus { group: work.clone(), tab: None, pane: None }, &l).unwrap();
+        ws.apply(WsCommand::MergeGroup { src: work.clone(), dst: control.clone() }, &l).unwrap();
+        assert_eq!(ws.focus.group_id, control);
+        assert_eq!(ws.groups[&control].active_tab_id, api);
+        assert_eq!(ws.last_location, Some(Location { group_id: control.clone(), tab_id: d }));
+        // errors
+        let before = ws.clone();
+        assert!(ws.apply(WsCommand::MergeGroup { src: control.clone(), dst: control.clone() }, &l).is_err());
+        assert!(ws.apply(WsCommand::MergeGroup { src: "g99".into(), dst: control }, &l).is_err());
+        assert_eq!(ws, before);
+    }
+
+    #[test]
+    fn close_group_merges_into_sibling() {
+        let l = loaded_groups();
+        let mut ws = Workspace::from_config(&l);
+        let control = gid_named(&ws, "control");
+        let work = gid_named(&ws, "work");
+        let fx = ws.apply(WsCommand::CloseGroup { group: work.clone() }, &l).unwrap();
+        assert_eq!(fx, Effects::default());
+        assert_eq!(tab_names(&ws, &control), ["dispatcher", "api"]);
+        assert_eq!(ws.group_layout, LayoutNode::Leaf(control.clone()));
+        assert!(!ws.groups.contains_key(&work));
+        // closing the first of three merges into its adjacent sibling
+        let l = loaded_with(
+            r#"{"tabs":[{"name":"a","dir":"a"},{"name":"b","dir":"b"}],
+                "groups":{"split":"horizontal","children":[
+                    {"group":{"name":"one","tabs":["dispatcher"]}},
+                    {"group":{"name":"two","tabs":["a"]}},
+                    {"group":{"name":"three","tabs":["b"]}}]}}"#,
+        );
+        let mut ws = Workspace::from_config(&l);
+        let (one, two) = (gid_named(&ws, "one"), gid_named(&ws, "two"));
+        ws.apply(WsCommand::CloseGroup { group: one }, &l).unwrap();
+        assert_eq!(tab_names(&ws, &two), ["a", "dispatcher"]);
+        assert_eq!(ws.group_layout.leaf_count(), 2);
+    }
+
+    #[test]
+    fn close_only_group_errors() {
         let l = loaded_fixture();
         let mut ws = Workspace::from_config(&l);
         let before = ws.clone();
         let g = ws.focus.group_id.clone();
-        let t = tab(&ws, "api").id.clone();
-        for cmd in [
-            WsCommand::MoveTab { tab: t.clone(), group: g.clone(), index: 0 },
-            WsCommand::SplitGroupWith { tab: t.clone(), group: g.clone(), dir: Dir::Horizontal, before: false },
-            WsCommand::MergeGroup { src: g.clone(), dst: g.clone() },
-            WsCommand::CloseGroup { group: g.clone() },
-            WsCommand::SetGroupMaximized { group: Some(g.clone()) },
-        ] {
-            assert_eq!(ws.apply(cmd, &l), Err("아직 지원하지 않는 명령입니다".to_string()));
-            assert_eq!(ws, before);
+        assert_eq!(ws.apply(WsCommand::CloseGroup { group: g }, &l), Err("그룹이 하나뿐입니다".to_string()));
+        assert_eq!(ws, before);
+        assert!(ws.apply(WsCommand::CloseGroup { group: "g99".into() }, &l).is_err());
+        assert_eq!(ws, before);
+    }
+
+    #[test]
+    fn dispatcher_tab_can_move_groups() {
+        let l = loaded_groups();
+        let mut ws = Workspace::from_config(&l);
+        let work = gid_named(&ws, "work");
+        let d = tab(&ws, "dispatcher").id.clone();
+        ws.apply(WsCommand::MoveTab { tab: d.clone(), group: work.clone(), index: 0 }, &l).unwrap();
+        assert_eq!(tab_names(&ws, &work), ["dispatcher", "api"]);
+        assert_eq!(group_of(&ws, &d), work);
+        assert!(ws.tabs[&d].is_dispatcher);
+        assert_eq!(ws.groups.len(), 1);
+        assert_eq!(ws.group_layout, LayoutNode::Leaf(work));
+    }
+
+    #[test]
+    fn merge_never_kills_processes() {
+        let l = loaded_groups();
+        let mut ws = Workspace::from_config(&l);
+        let control = gid_named(&ws, "control");
+        let work = gid_named(&ws, "work");
+        let api = tab(&ws, "api").id.clone();
+        ws.apply(create_in("x", &work), &l).unwrap();
+        let alive = ws.running_count();
+        let x = tab(&ws, "x").id.clone();
+        let cmds = vec![
+            WsCommand::SetGroupMaximized { group: Some(work.clone()) },
+            WsCommand::MoveTab { tab: api, group: control.clone(), index: 0 },
+            WsCommand::SplitGroupWith { tab: x, group: control, dir: Dir::Horizontal, before: false },
+        ];
+        for c in cmds {
+            assert_eq!(ws.apply(c, &l).unwrap(), Effects::default());
         }
+        let groups = ws.group_layout.leaves();
+        let fx = ws.apply(WsCommand::MergeGroup { src: groups[1].clone(), dst: groups[0].clone() }, &l).unwrap();
+        assert_eq!(fx, Effects::default());
+        assert_eq!(ws.group_layout.leaf_count(), 1);
+        assert_eq!(ws.running_count(), alive);
+        // CloseGroup too
+        let mut ws = Workspace::from_config(&l);
+        let before = ws.running_count();
+        assert_eq!(ws.apply(WsCommand::CloseGroup { group: work }, &l).unwrap(), Effects::default());
+        assert_eq!(ws.running_count(), before);
+    }
+
+    #[test]
+    fn group_removal_clears_stale_last_location_and_maximized() {
+        let l = loaded_groups();
+        let mut ws = Workspace::from_config(&l);
+        let control = gid_named(&ws, "control");
+        let work = gid_named(&ws, "work");
+        ws.apply(create_in("b", &control), &l).unwrap();
+        let (d, b) = (tab(&ws, "dispatcher").id.clone(), tab(&ws, "b").id.clone());
+        ws.apply(WsCommand::SetFocus { group: control.clone(), tab: Some(d.clone()), pane: None }, &l).unwrap();
+        ws.apply(WsCommand::SetFocus { group: control.clone(), tab: Some(b.clone()), pane: None }, &l).unwrap();
+        assert_eq!(ws.last_location, Some(Location { group_id: control.clone(), tab_id: d.clone() }));
+        // closing the focused tab falls back to the dispatcher → lastLocation now equals the focus
+        ws.apply(WsCommand::CloseTab { tab: b }, &l).unwrap();
+        assert_eq!(ws.groups[&control].active_tab_id, d);
+        assert_eq!(ws.last_location, Some(Location { group_id: control.clone(), tab_id: d }));
+        ws.apply(WsCommand::SetGroupMaximized { group: Some(work.clone()) }, &l).unwrap();
+        assert_eq!(ws.group_maximized, Some(work.clone()));
+        ws.apply(WsCommand::CloseGroup { group: work.clone() }, &l).unwrap();
+        assert_eq!(ws.last_location, None);
+        assert_eq!(ws.group_maximized, None);
+        // SetGroupMaximized validates the group
+        let before = ws.clone();
+        assert!(ws.apply(WsCommand::SetGroupMaximized { group: Some(work) }, &l).is_err());
+        assert_eq!(ws, before);
+        ws.apply(WsCommand::SetGroupMaximized { group: None }, &l).unwrap();
     }
 
     #[test]
