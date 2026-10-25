@@ -387,10 +387,33 @@ fn inbox_mark_read(state: State<'_, AppState>, id: String) -> Result<(), String>
     state.inbox.mark_read(&id)
 }
 
-/// The user confirms a proposed close (`close_proposed` → `done`).
+/// The user confirms a proposed close (`close_proposed` → `done`) and the owner Manager is told
+/// via the dispatcher. Returns a Korean warning when that notice could not be queued.
 #[tauri::command]
-fn inbox_confirm_done(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    state.inbox.confirm_done(&id)
+fn inbox_confirm_done(state: State<'_, AppState>, id: String) -> Result<Option<String>, String> {
+    bridge::confirm_done(&state, &id)
+}
+
+/// The user's instruction for an item: recorded (state → in_progress) and relayed to the
+/// dispatcher, which passes it to the owner Manager. Err (Korean) when the dispatcher is not
+/// running, the text is empty/too long, or the item is done.
+#[tauri::command]
+fn inbox_instruct(state: State<'_, AppState>, id: String, text: String) -> Result<(), String> {
+    bridge::relay_instruct(&state, &id, &text)
+}
+
+/// Ask (via the dispatcher) the owner Manager to create an issue for the item.
+#[tauri::command]
+fn inbox_request_issue(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    bridge::relay_issue_request(&state, &id)
+}
+
+/// Result of `inbox_add_files`: the copied files and, when the dispatcher could not be told,
+/// a Korean warning (the files stay copied).
+#[derive(serde::Serialize)]
+struct AddFilesResult {
+    files: Vec<String>,
+    warning: Option<String>,
 }
 
 /// Copy files into the item's issue `input/` or `output/` (never overwriting); returns the new
@@ -401,9 +424,11 @@ async fn inbox_add_files(
     id: String,
     paths: Vec<String>,
     target: inbox::Target,
-) -> Result<Vec<String>, String> {
+) -> Result<AddFilesResult, String> {
     let paths: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
+    let (id2, app2) = (id.clone(), app.clone());
     let res = tauri::async_runtime::spawn_blocking(move || {
+        let app = app2;
         let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
         let owner = state.inbox.get(&id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))?.owner_tab;
         // ws taken and released here; the inbox is called without it
@@ -412,7 +437,14 @@ async fn inbox_add_files(
     })
     .await
     .map_err(|e| format!("파일 복사 작업이 중단되었습니다 — {e}"))??;
-    Ok(res.into_iter().map(|p| p.to_string_lossy().into_owned()).collect())
+    let files: Vec<String> = res.into_iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    // spec §5: the owner Manager hears about the new files through the dispatcher
+    let warning = match app.try_state::<AppState>() {
+        Some(state) => bridge::notify_files_saved(&state, &id2, &files).err(),
+        None => Some("앱 상태가 아직 준비되지 않았습니다".into()),
+    }
+    .map(|e| format!("파일은 복사했지만 담당 Manager에게 알리지 못했습니다 — {e}"));
+    Ok(AddFilesResult { files, warning })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -440,6 +472,8 @@ pub fn run() {
             inbox_mark_read,
             inbox_confirm_done,
             inbox_add_files,
+            inbox_instruct,
+            inbox_request_issue,
         ])
         .setup(|app| {
             // load_all = load_settings + ensure_dotdir (incl. powershell profile) + load

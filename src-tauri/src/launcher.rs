@@ -66,6 +66,8 @@
 //!   taken one at a time, each released before the next; the pipe write and the PTY fallback
 //!   `PtyManager::write` run holding only `pump_lock` (R13: write is allowed off the worker).
 //!   Hook handlers take only `panes` (released) then `inner`/`wake`; they never write pipes.
+//!   Inbox relay (Task 10, `bridge::relay_*` from Tauri commands): `ws` (released), then the
+//!   inbox, then `inner`/`wake` via `send` — one at a time, never nested.
 //! * Attention (attention.rs, Task 9): `AppState::trust` (folder-trust timers) is a leaf.
 //!   `spawn_pane` arms it after `spawn` returns (no app lock held); `poll_trust` (prompt timer
 //!   thread) and the SessionStart / Notification handlers take it, release it, then read

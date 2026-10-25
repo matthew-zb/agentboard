@@ -50,7 +50,10 @@ import {
   showErrors,
   toast,
   newTabWizard,
+  promptText,
+  choose,
 } from './overlays.js';
+import { mountInbox, configureInbox } from './inbox.js';
 import { configureCopyMode, toggleCopyMode, copyActive, pruneCopySessions } from './copy-ui.js';
 import { pickCommands, paletteItems, missingDirsFlow, closeFlow } from './overlay-logic.js';
 import { hiddenAttentionTabs, statusEntryText } from './attention-logic.js';
@@ -470,7 +473,11 @@ configurePanes({
   report: showError,
   keyFilter: (paneId, ev) => router.termKeyFilter(paneId, ev),
   onBell,
+  // Applet panes (Task 10): the inbox view replaces the xterm. Its keys are handled on the
+  // applet element (bubble phase), so the router's app chords always win.
+  mountApplet: (kind) => (kind === 'inbox' ? mountInbox() : null),
 });
+configureInbox({ toast, confirm, promptText, choose });
 // Tab drag & drop (spec 6.6). Errors from MoveTab/SplitGroupWith are toasted by sendCmd.
 installDnd($('groups'), {
   getWs: () => (current ? current.workspace : null),

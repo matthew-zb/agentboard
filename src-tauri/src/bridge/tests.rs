@@ -433,3 +433,113 @@ fn only_named_pipes_are_written() {
     let r = fx.state.bridge.reg(&fx.pane).expect("registered without a pipe");
     assert!(r.socket.is_empty() && r.token.is_empty());
 }
+
+// ── inbox relay (Task 10) ──
+
+impl Fx {
+    fn dispatcher(&self) -> String {
+        let ws = self.state.ws.lock().unwrap();
+        ws.panes.values().find(|p| p.role == Some(Role::Dispatcher)).expect("dispatcher pane").id.clone()
+    }
+    fn set_status(&self, pane: &str, st: crate::workspace::PaneStatus) {
+        self.state.ws.lock().unwrap().panes.get_mut(pane).unwrap().status = st;
+    }
+    fn queued_texts(&self, pane: &str) -> Vec<String> {
+        let g = self.state.bridge.inner.lock().unwrap();
+        g.queues.get(pane).map(|q| q.iter().map(|p| p.text.clone()).collect()).unwrap_or_default()
+    }
+    fn post(&self, title: &str) -> String {
+        let item = crate::inbox::NewItem {
+            title: title.into(),
+            check: vec!["재실행 가능 시간".into()],
+            risk: vec!["익일 정산 누락".into()],
+            source: "slack #ops".into(),
+            refs: vec![],
+        };
+        self.state.inbox.post(&self.caller(), "billing", item).unwrap()
+    }
+}
+
+#[test]
+fn inbox_instruct_relays_to_dispatcher_and_records() {
+    use crate::inbox::{ItemState, TimelineKind};
+    use crate::workspace::PaneStatus;
+    let fx = fixture();
+    let disp = fx.dispatcher();
+    fx.set_status(&disp, PaneStatus::Running);
+    let id = fx.post("정산 배치 지연");
+    relay_instruct(&fx.state, &id, "  오늘 안에\r\n재실행\u{7}  ").unwrap();
+    let it = fx.state.inbox.get(&id).unwrap();
+    assert_eq!(it.state, ItemState::InProgress);
+    let last = it.timeline.last().unwrap();
+    assert_eq!((last.kind.clone(), last.text.as_str()), (TimelineKind::Instruction, "오늘 안에\n재실행"));
+    let texts = fx.queued_texts(&disp);
+    assert_eq!(texts.len(), 1, "one message queued for the dispatcher");
+    let expected = crate::inbox::instruct_message(&it, "billing", "오늘 안에\n재실행");
+    assert_eq!(texts[0], expected);
+    assert!(texts[0].ends_with("담당 Manager(@billing)에게 전달하라."), "{}", texts[0]);
+    assert_eq!(fx.state.bridge.queued(&fx.pane), 0, "nothing goes to the Manager directly");
+    // a starting dispatcher is fine too: the bridge queues until its session registers
+    fx.set_status(&disp, PaneStatus::Starting);
+    relay_instruct(&fx.state, &id, "두 번째").unwrap();
+    assert_eq!(fx.queued_texts(&disp).len(), 2);
+}
+
+#[test]
+fn inbox_relay_refuses_when_dispatcher_is_not_running() {
+    use crate::workspace::PaneStatus;
+    let fx = fixture();
+    let disp = fx.dispatcher();
+    let id = fx.post("정산 배치 지연");
+    let before = fx.state.inbox.get(&id).unwrap();
+    for st in [PaneStatus::Exited { code: 1 }, PaneStatus::Failed { message: "x".into() }] {
+        fx.set_status(&disp, st);
+        let e = relay_instruct(&fx.state, &id, "지시").unwrap_err();
+        assert!(e.contains("dispatcher") && e.contains("실행 중이 아닙니다"), "{e}");
+        let e = relay_issue_request(&fx.state, &id).unwrap_err();
+        assert!(e.contains("실행 중이 아닙니다"), "{e}");
+    }
+    assert_eq!(fx.state.inbox.get(&id).unwrap(), before, "nothing recorded");
+    assert!(fx.queued_texts(&disp).is_empty(), "nothing queued");
+    // no dispatcher pane at all (a phase-1 workspace without roles)
+    fx.state.ws.lock().unwrap().panes.get_mut(&disp).unwrap().role = None;
+    let e = relay_instruct(&fx.state, &id, "지시").unwrap_err();
+    assert!(e.contains("dispatcher"), "{e}");
+    // invalid text never reaches the bridge either
+    fx.state.ws.lock().unwrap().panes.get_mut(&disp).unwrap().role = Some(Role::Dispatcher);
+    fx.set_status(&disp, PaneStatus::Running);
+    assert!(relay_instruct(&fx.state, &id, " \u{1b} ").is_err());
+    assert!(relay_instruct(&fx.state, "nope", "x").is_err());
+    assert!(fx.queued_texts(&disp).is_empty());
+}
+
+#[test]
+fn inbox_issue_request_files_and_done_notices_go_to_dispatcher() {
+    use crate::inbox::TimelineKind;
+    use crate::workspace::PaneStatus;
+    let fx = fixture();
+    let disp = fx.dispatcher();
+    fx.set_status(&disp, PaneStatus::Running);
+    let id = fx.post("정산 배치 지연");
+    relay_issue_request(&fx.state, &id).unwrap();
+    let it = fx.state.inbox.get(&id).unwrap();
+    assert_eq!(it.timeline.last().unwrap().kind, TimelineKind::IssueRequested);
+    let files = vec![r"C:\w\issues\x\input\a.md".to_string()];
+    notify_files_saved(&fx.state, &id, &files).unwrap();
+    fx.state.inbox.propose_close(&fx.caller(), &id, "끝").unwrap();
+    confirm_done(&fx.state, &id).unwrap();
+    assert_eq!(fx.state.inbox.get(&id).unwrap().state, crate::inbox::ItemState::Done);
+    let texts = fx.queued_texts(&disp);
+    assert_eq!(texts.len(), 3, "{texts:?}");
+    assert_eq!(texts[0], crate::inbox::issue_request_message(&it, "billing"));
+    assert_eq!(texts[1], crate::inbox::files_saved_message(&it, &files));
+    assert!(texts[2].starts_with("[AgentBoard] 인박스 종료 확인 — 항목 "), "{}", texts[2]);
+    // done is recorded even when the notice cannot be sent; the warning comes back
+    let id2 = fx.post("다른 건");
+    fx.state.inbox.propose_close(&fx.caller(), &id2, "끝").unwrap();
+    fx.set_status(&disp, PaneStatus::Exited { code: 0 });
+    let warn = confirm_done(&fx.state, &id2).unwrap();
+    assert!(warn.is_some_and(|w| w.contains("실행 중이 아닙니다")));
+    assert_eq!(fx.state.inbox.get(&id2).unwrap().state, crate::inbox::ItemState::Done);
+    assert!(notify_files_saved(&fx.state, &id2, &files).is_err());
+}

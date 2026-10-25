@@ -72,6 +72,8 @@ pub enum TimelineKind {
     Instruction,
     FilesAdded,
     IssueLinked,
+    /// The user asked (via the dispatcher) the owner Manager to create an issue (Task 10).
+    IssueRequested,
     CloseProposed { opinion: String },
     Reopened,
     Done,
@@ -258,6 +260,94 @@ fn copy_unique(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
         };
     }
     Err(format!("같은 이름의 파일이 너무 많습니다: {name}"))
+}
+
+// ───────────────────────── messages to the dispatcher (Task 10) ─────────────────────────
+//
+// The applet's actions reach the owner Manager through the dispatcher (spec §5): the backend
+// builds the text here and hands it to `bridge::send` (which neutralises `<`/`>`). Item fields
+// are written by Managers, so line breaks inside them are flattened: only the instruction itself
+// (the user's own text) may span lines, and no field can fake a "지시:" line.
+
+/// Longest accepted user instruction (characters).
+pub const INSTRUCT_MAX_CHARS: usize = 4000;
+
+/// The user's instruction as relayed: `\r\n`/`\r` → `\n`, tab → space, every other control
+/// character dropped, trimmed. Empty → Err; over [`INSTRUCT_MAX_CHARS`] → Err (never cut).
+pub fn clean_instruction(text: &str) -> Result<String, String> {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let out: String = text
+        .chars()
+        .filter_map(|c| match c {
+            '\n' => Some('\n'),
+            '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect();
+    let out = out.trim().to_string();
+    if out.is_empty() {
+        return Err("지시가 비어 있습니다".into());
+    }
+    let n = out.chars().count();
+    if n > INSTRUCT_MAX_CHARS {
+        return Err(format!("지시가 너무 깁니다 ({n}자, 최대 {INSTRUCT_MAX_CHARS}자)"));
+    }
+    Ok(out)
+}
+
+/// One line: line breaks and other control characters become spaces, runs collapsed.
+fn one_line(s: &str) -> String {
+    s.split(|c: char| c.is_control() || c.is_whitespace()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
+fn joined(list: &[String]) -> String {
+    let v: Vec<String> = list.iter().map(|s| one_line(s)).filter(|s| !s.is_empty()).collect();
+    if v.is_empty() {
+        "없음".into()
+    } else {
+        v.join(" / ")
+    }
+}
+
+fn head(kind: &str, it: &InboxItem) -> String {
+    format!("[AgentBoard] {kind} — 항목 {} ({}): {}", it.id, one_line(&it.owner_name), one_line(&it.title))
+}
+
+/// `inbox_instruct` → dispatcher. `owner_session`: the owner Manager's session name.
+pub fn instruct_message(it: &InboxItem, owner_session: &str, text: &str) -> String {
+    format!(
+        "{}\n확인할 것: {}\n리스크: {}\n지시: {text}\n담당 Manager(@{})에게 전달하라.",
+        head("인박스 지시", it),
+        joined(&it.check),
+        joined(&it.risk),
+        one_line(owner_session)
+    )
+}
+
+/// `inbox_request_issue` → dispatcher.
+pub fn issue_request_message(it: &InboxItem, owner_session: &str) -> String {
+    format!(
+        "{}\n이 항목을 이슈로 등록하라 (issue_create, item: {}).\n담당 Manager(@{})에게 전달하라.",
+        head("인박스 이슈 등록 요청", it),
+        it.id,
+        one_line(owner_session)
+    )
+}
+
+/// After `inbox_add_files` copied `files` (absolute paths) → dispatcher (spec §5).
+pub fn files_saved_message(it: &InboxItem, files: &[String]) -> String {
+    let files: Vec<String> = files.iter().map(|f| one_line(f)).collect();
+    format!("[AgentBoard] 항목 {}에 자료 저장: {} — 담당 Manager에게 알려라", it.id, files.join(", "))
+}
+
+/// After `inbox_confirm_done` → dispatcher (spec §5 "완료로 전환, 담당 Manager에게 알림").
+pub fn done_message(it: &InboxItem, owner_session: &str) -> String {
+    format!(
+        "{}\n사용자가 종료를 확인했다. 담당 Manager(@{})에게 알려라.",
+        head("인박스 종료 확인", it),
+        one_line(owner_session)
+    )
 }
 
 impl Inbox {
@@ -482,6 +572,20 @@ impl Inbox {
             }
             it.state = ItemState::InProgress;
             it.timeline.push(entry(WHO_USER, TimelineKind::Instruction, &text));
+            it.read = true;
+            Ok(true)
+        })
+    }
+
+    /// The user asks for an issue (the applet relays it to the dispatcher, Task 10): recorded as
+    /// `issue_requested`; refused on done items and items that already have an issue.
+    pub fn request_issue(&self, id: &str) -> Result<(), String> {
+        self.update(id, |it| {
+            not_done(it)?;
+            if let Some(cur) = &it.issue {
+                return Err(format!("이미 이슈({cur})가 연결된 항목입니다"));
+            }
+            it.timeline.push(entry(WHO_USER, TimelineKind::IssueRequested, ""));
             it.read = true;
             Ok(true)
         })
@@ -953,5 +1057,92 @@ mod tests {
         assert!(l.items.iter().any(|i| i.id == id2));
         assert_eq!(l.version, f.last.load(Ordering::SeqCst));
         assert!(f.inbox.mark_read("nope").is_err());
+    }
+
+    fn sample_item() -> InboxItem {
+        InboxItem {
+            id: "20261025-140307-a1b2".into(),
+            owner_tab: "t-billing".into(),
+            owner_name: "billing".into(),
+            title: "정산 배치 지연".into(),
+            check: vec!["재실행 가능 시간".into(), "영향 받는\n거래처".into()],
+            risk: vec!["익일 정산 누락".into()],
+            source: "slack #ops".into(),
+            refs: vec![],
+            state: ItemState::New,
+            read: false,
+            issue: None,
+            issue_path: None,
+            created: String::new(),
+            timeline: vec![],
+        }
+    }
+
+    #[test]
+    fn relay_messages_have_the_exact_format() {
+        let it = sample_item();
+        assert_eq!(
+            instruct_message(&it, "billing", "오늘 안에 재실행\n결과 보고"),
+            "[AgentBoard] 인박스 지시 — 항목 20261025-140307-a1b2 (billing): 정산 배치 지연\n\
+             확인할 것: 재실행 가능 시간 / 영향 받는 거래처\n\
+             리스크: 익일 정산 누락\n\
+             지시: 오늘 안에 재실행\n결과 보고\n\
+             담당 Manager(@billing)에게 전달하라."
+        );
+        let mut empty = sample_item();
+        empty.check.clear();
+        empty.risk.clear();
+        empty.title = "줄\n바꿈 제목".into();
+        let m = instruct_message(&empty, "billing", "x");
+        assert!(m.contains("): 줄 바꿈 제목\n확인할 것: 없음\n리스크: 없음\n지시: x\n"), "{m}");
+        assert_eq!(
+            issue_request_message(&it, "billing"),
+            "[AgentBoard] 인박스 이슈 등록 요청 — 항목 20261025-140307-a1b2 (billing): 정산 배치 지연\n\
+             이 항목을 이슈로 등록하라 (issue_create, item: 20261025-140307-a1b2).\n\
+             담당 Manager(@billing)에게 전달하라."
+        );
+        assert_eq!(
+            files_saved_message(&it, &["C:\\w\\issues\\x\\input\\a.md".into(), "C:\\w\\issues\\x\\input\\b.pdf".into()]),
+            "[AgentBoard] 항목 20261025-140307-a1b2에 자료 저장: C:\\w\\issues\\x\\input\\a.md, C:\\w\\issues\\x\\input\\b.pdf — 담당 Manager에게 알려라"
+        );
+        assert_eq!(
+            done_message(&it, "billing"),
+            "[AgentBoard] 인박스 종료 확인 — 항목 20261025-140307-a1b2 (billing): 정산 배치 지연\n\
+             사용자가 종료를 확인했다. 담당 Manager(@billing)에게 알려라."
+        );
+    }
+
+    #[test]
+    fn instruction_text_is_cleaned_and_capped() {
+        assert_eq!(clean_instruction("  a\r\nb\rc\td\u{7}e\u{1b}[31m  ").unwrap(), "a\nb\nc de[31m");
+        assert!(clean_instruction(" \n\u{7} ").unwrap_err().contains("비어"));
+        let max = "가".repeat(INSTRUCT_MAX_CHARS);
+        assert_eq!(clean_instruction(&max).unwrap().chars().count(), INSTRUCT_MAX_CHARS);
+        assert!(clean_instruction(&format!("{max}a")).unwrap_err().contains(&INSTRUCT_MAX_CHARS.to_string()));
+    }
+
+    #[test]
+    fn request_issue_records_timeline() {
+        let f = fx();
+        let m = mgr();
+        let id = f.inbox.post(&m, "billing", new_item("결제 실패")).unwrap();
+        let v = f.last.load(Ordering::SeqCst);
+        f.inbox.request_issue(&id).unwrap();
+        let it = f.inbox.get(&id).unwrap();
+        let last = it.timeline.last().unwrap();
+        assert_eq!((last.kind.clone(), last.who.as_str()), (TimelineKind::IssueRequested, WHO_USER));
+        assert_eq!(it.state, ItemState::New, "requesting an issue does not change the state");
+        assert!(f.last.load(Ordering::SeqCst) > v, "emits inbox-changed");
+        // wire name
+        assert_eq!(serde_json::to_value(&last.kind).unwrap(), serde_json::json!({"type":"issue_requested"}));
+        // a linked item refuses (the issue exists already)
+        f.inbox.link_issue(&m, &id, "20261025-결제-실패", Path::new("C:/x/issues/20261025-결제-실패")).unwrap();
+        assert!(f.inbox.request_issue(&id).unwrap_err().contains("이미"));
+        // a done item refuses
+        let id2 = f.inbox.post(&m, "billing", new_item("다른 건")).unwrap();
+        f.inbox.propose_close(&m, &id2, "끝").unwrap();
+        f.inbox.confirm_done(&id2).unwrap();
+        assert!(f.inbox.request_issue(&id2).unwrap_err().contains("완료"));
+        assert!(f.inbox.request_issue("nope").is_err());
     }
 }

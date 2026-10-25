@@ -30,6 +30,7 @@
 //! happen with no lock but `pump_lock`. `launcher::on_output` calls [`on_output`] under the
 //! PTY flush lock (`flush_lock -> bridge inner`).
 use crate::control::{Caller, HookRouter, StateHost};
+use crate::inbox::{self, InboxItem, ItemState};
 use crate::profiles::{encode_submit, Submit};
 use crate::workspace::{PaneId, TabId};
 use crate::AppState;
@@ -456,6 +457,103 @@ fn expire(state: &AppState, t: &Target, p: Pending) {
         eprintln!("[agentboard] 인박스 시스템 항목을 만들 수 없습니다: {e}");
     }
     p.finish(Err(format!("{} 창의 세션에 10분 동안 메시지를 전달하지 못했습니다", t.name)));
+}
+
+// ───────────────────────── inbox relay (Task 10) ─────────────────────────
+//
+// The inbox applet's actions go to the owner Manager **through the dispatcher** (spec §5): the
+// app records the action on the item and queues one message for the dispatcher's role pane.
+// Delivery follows the queue rules above (a starting or restarting dispatcher gets it once its
+// session registers; after QUEUE_TIMEOUT it becomes a system inbox item). A dispatcher pane that
+// is missing, exited or failed is refused up front with a Korean error (nothing recorded), so
+// the applet can tell the user instead of the message silently waiting for a process that will
+// never come. Locks: `ws` (released) → inbox → bridge, one at a time.
+
+/// The dispatcher's role pane when its process is running or starting.
+pub fn dispatcher_pane(state: &AppState) -> Result<PaneId, String> {
+    use crate::workspace::PaneStatus;
+    let ws = state.ws.lock().unwrap();
+    let p = ws
+        .panes
+        .values()
+        .find(|p| p.role == Some(crate::roles::Role::Dispatcher) && !p.kind.is_applet())
+        .ok_or("dispatcher 창을 찾을 수 없습니다 — 담당 Manager에게 전달할 수 없습니다")?;
+    match p.status {
+        PaneStatus::Running | PaneStatus::Starting => Ok(p.id.clone()),
+        _ => Err("dispatcher 세션이 실행 중이 아닙니다 — dispatcher 창에서 Enter로 재시작한 뒤 다시 시도하세요".into()),
+    }
+}
+
+/// Session name of the owner tab's standing agent (`@<session>`); the item's owner name when
+/// the tab or its agent is gone.
+fn owner_session(state: &AppState, it: &InboxItem) -> String {
+    let ws = state.ws.lock().unwrap();
+    ws.panes
+        .values()
+        .find(|p| p.tab == it.owner_tab && p.role.is_some_and(|r| r.is_standing()))
+        .and_then(|p| p.session_name.clone())
+        .unwrap_or_else(|| it.owner_name.clone())
+}
+
+fn open_item(state: &AppState, id: &str) -> Result<InboxItem, String> {
+    let it = state.inbox.get(id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))?;
+    if it.state == ItemState::Done {
+        return Err(format!("완료된 항목입니다: {id}"));
+    }
+    Ok(it)
+}
+
+fn fits(msg: &str) -> Result<(), String> {
+    if msg.len() > MAX_TEXT {
+        return Err(format!("전달할 메시지가 너무 깁니다 (최대 {}KB)", MAX_TEXT / 1024));
+    }
+    Ok(())
+}
+
+/// `inbox_instruct`: clean the text, record the instruction (state → in_progress) and queue
+/// "[AgentBoard] 인박스 지시 — …" for the dispatcher.
+pub fn relay_instruct(state: &AppState, id: &str, text: &str) -> Result<(), String> {
+    let text = inbox::clean_instruction(text)?;
+    let it = open_item(state, id)?;
+    let disp = dispatcher_pane(state)?;
+    let msg = inbox::instruct_message(&it, &owner_session(state, &it), &text);
+    fits(&msg)?;
+    state.inbox.instruct(id, &text)?;
+    send(state, &disp, &msg)
+}
+
+/// `inbox_request_issue`: record `issue_requested` and ask the dispatcher to have the owner
+/// Manager create the issue.
+pub fn relay_issue_request(state: &AppState, id: &str) -> Result<(), String> {
+    let it = open_item(state, id)?;
+    let disp = dispatcher_pane(state)?;
+    let msg = inbox::issue_request_message(&it, &owner_session(state, &it));
+    fits(&msg)?;
+    state.inbox.request_issue(id)?;
+    send(state, &disp, &msg)
+}
+
+/// After `inbox_add_files` copied `files`: "[AgentBoard] 항목 <id>에 자료 저장: …" to the
+/// dispatcher (the `files_added` timeline entry is written by the copy itself).
+pub fn notify_files_saved(state: &AppState, id: &str, files: &[String]) -> Result<(), String> {
+    let it = state.inbox.get(id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))?;
+    let disp = dispatcher_pane(state)?;
+    let msg = inbox::files_saved_message(&it, files);
+    fits(&msg)?;
+    send(state, &disp, &msg)
+}
+
+/// `inbox_confirm_done`: `close_proposed` → `done` (Err otherwise), then tell the owner Manager
+/// via the dispatcher. The item stays done if the notice cannot be queued; the returned warning
+/// says so (`Ok(None)` = notice queued).
+pub fn confirm_done(state: &AppState, id: &str) -> Result<Option<String>, String> {
+    state.inbox.confirm_done(id)?;
+    let notice = (|| {
+        let it = state.inbox.get(id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))?;
+        let disp = dispatcher_pane(state)?;
+        send(state, &disp, &inbox::done_message(&it, &owner_session(state, &it)))
+    })();
+    Ok(notice.err().map(|e| format!("완료로 바꿨지만 담당 Manager에게 알리지 못했습니다 — {e}")))
 }
 
 // ───────────────────────── signals ─────────────────────────

@@ -158,13 +158,15 @@ let hooks = {
   keyFilter: () => true,
   syncTargets: () => null,
   onBell: () => {},
+  mountApplet: () => null,
 };
 
 /**
  * Wire the module to the app: `send(cmd)` (renders its result), `onFocus(group, tab, pane)`
  * (pane clicked while not focused), `report(error)` (status bar message),
  * `keyFilter(paneId, KeyboardEvent) -> bool` (xterm attachCustomKeyEventHandler: false = an app
- * shortcut, xterm must not process it), `syncTargets(paneId) -> paneId[] | null` (sync input), `onBell(paneId)` (terminal bell in a live pane).
+ * shortcut, xterm must not process it), `syncTargets(paneId) -> paneId[] | null` (sync input), `onBell(paneId)` (terminal bell in a live pane),
+ * `mountApplet(kind, paneId) -> {el, focus(), dispose()} | null` (applet view; null keeps the placeholder).
  */
 export function configurePanes(h) {
   hooks = { ...hooks, ...h };
@@ -196,16 +198,30 @@ export function getPane(paneId, model) {
 
 /**
  * Entry for an applet pane: same element/header shape as a terminal entry but `term: null`
- * (no xterm, no attach, no input). Placeholder content until the applet view lands (Task 10).
+ * (no xterm, no attach, no input). The view comes from `hooks.mountApplet` (inbox.js) and is
+ * mounted exactly once per pane id: the pane element is only moved between `#parking` and the
+ * layout (tab switch, maximize, re-render), so the view and its listeners survive; it is
+ * disposed with the pane (disposePane). Unknown kinds keep a placeholder.
  */
 function createAppletEntry(id, model) {
   const el = div('pane applet');
   el.dataset.pane = id;
   const header = div('pane-header');
   const host = div('applet-host');
-  const body = div('applet-placeholder');
-  body.textContent = appletLabel(model);
-  host.appendChild(body);
+  let applet = null;
+  try {
+    applet = hooks.mountApplet(model && model.kind && model.kind.kind, id);
+  } catch (err) {
+    hooks.report(err);
+  }
+  if (applet && applet.el) {
+    host.appendChild(applet.el);
+  } else {
+    applet = null;
+    const body = div('applet-placeholder');
+    body.textContent = appletLabel(model);
+    host.appendChild(body);
+  }
   el.append(header, host);
   parking().appendChild(el);
   const e = {
@@ -233,6 +249,7 @@ function createAppletEntry(id, model) {
     writeFailed: false,
     inputBlocked: false,
     ro: null,
+    applet,
   };
   el.tabIndex = -1; // focusable, so pane focus has somewhere to go
   el.addEventListener('mousedown', () => {
@@ -568,6 +585,7 @@ export function focusPane(paneId) {
   if (!e || !e.el.isConnected) return;
   if (e.el.contains(document.activeElement)) return;
   if (e.term) e.term.focus();
+  else if (e.applet) e.applet.focus();
   else e.el.focus({ preventScroll: true });
 }
 
@@ -581,6 +599,7 @@ export function disposePane(paneId) {
   if (e.ro) e.ro.disconnect();
   try {
     if (e.term) e.term.dispose();
+    if (e.applet) e.applet.dispose();
   } catch (_) {
     /* already gone */
   }
