@@ -15,6 +15,8 @@
 //! * `ws -> emit_lock` (R16): `publish` stamps a version under `ws`, takes `emit_lock`,
 //!   releases `ws`, emits, then releases `emit_lock` — emits go out in version order and
 //!   never while `ws` is held.
+//! * `Saver` (persist.rs): `notify` is a channel send (leaf). Its thread takes `ws` only to
+//!   clone, releases it, then writes the file — never `ws` during IO, never `emit_lock`.
 //! * `prompts`, `channels`, `effects` and `emit_lock` are leaves: nothing is acquired while
 //!   holding them.
 //! * Never call `PtyManager::spawn/kill/write/resize/attach_with` while holding `ws`,
@@ -134,6 +136,7 @@ pub fn check_dir_name(name: &str) -> Result<(), String> {
 /// Config errors as display lines, plus the job object problem (if any) as a non-file line.
 pub fn error_lines(state: &AppState) -> Vec<String> {
     let mut v: Vec<String> = state.loaded.read().unwrap().errors.iter().map(|e| e.to_string()).collect();
+    v.extend(state.startup_errors.iter().cloned());
     if let Some(e) = state.pty.job_error() {
         v.push(format!("프로세스 관리(Job Object) — {e}"));
     }
@@ -163,6 +166,7 @@ pub fn publish(state: &AppState) -> Snapshot {
     let snap = versioned(&ws, &state.version, errors);
     let _emit = state.emit_lock.lock().unwrap();
     drop(ws);
+    state.saver.notify(); // every model change is published; the saver debounces (500ms)
     let _ = state.app.emit(WORKSPACE_CHANGED, snap.clone());
     snap
 }

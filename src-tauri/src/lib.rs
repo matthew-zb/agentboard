@@ -1,8 +1,7 @@
-// 이후 태스크에서 pub mod 추가: persist
-
 pub mod config;
 pub mod launcher;
 pub mod layout;
+pub mod persist;
 pub mod profiles;
 pub mod workspace;
 pub mod pty;
@@ -49,6 +48,10 @@ pub struct AppState {
     pub version: AtomicU64,
     /// Serializes "versioned snapshot + emit" (order ws -> emit_lock; leaf).
     pub emit_lock: Mutex<()>,
+    /// Debounced workspace.json writer (leaf: `notify` is a channel send).
+    pub saver: persist::Saver,
+    /// Startup problems outside config files (e.g. a discarded workspace.json), shown in the error list.
+    pub startup_errors: Vec<String>,
 }
 
 /// Delivers PTY output to the attached frontend channel as raw binary and forwards
@@ -214,9 +217,31 @@ pub fn run() {
             // load_all = load_settings + ensure_dotdir (incl. powershell profile) + load
             let appdata = appdata_dir();
             let loaded = config::load_all(&appdata);
-            // Task 10 replaces this with restore-or-from_config.
-            let ws = Workspace::from_config(&loaded);
-            let initial = launcher::initial_effects(&ws);
+            let ws_path = appdata.join("workspace.json");
+            let mut startup_errors = Vec::new();
+            let (ws, initial) = match persist::load(&ws_path) {
+                Ok(Some(mut ws)) => {
+                    let fx = persist::prepare_restored(&mut ws);
+                    (ws, fx)
+                }
+                Ok(None) => {
+                    let ws = Workspace::from_config(&loaded);
+                    let fx = launcher::initial_effects(&ws);
+                    (ws, fx)
+                }
+                Err(e) => {
+                    eprintln!("[agentboard] workspace.json 복원 실패: {e}");
+                    startup_errors.push(persist::CORRUPT_MESSAGE.to_string());
+                    let ws = Workspace::from_config(&loaded);
+                    let fx = launcher::initial_effects(&ws);
+                    (ws, fx)
+                }
+            };
+            let handle = app.handle().clone();
+            // clone under `ws`, released before the saver writes (no lock held during IO)
+            let saver = persist::Saver::new(ws_path, move || {
+                handle.try_state::<AppState>().map(|s| s.ws.lock().unwrap().clone())
+            });
 
             let sink = Arc::new(AppSink::new(app.handle().clone()));
             let pty = PtyManager::new(sink.clone());
@@ -231,6 +256,8 @@ pub fn run() {
                 sink,
                 version: AtomicU64::new(0),
                 emit_lock: Mutex::new(()),
+                saver,
+                startup_errors,
             });
             // spawning happens on the launcher thread: window creation is not blocked
             launcher::start(app.handle(), rx, initial);
@@ -241,8 +268,16 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running AgentBoard");
+        .build(tauri::generate_context!())
+        .expect("error while building AgentBoard")
+        .run(|app, event| {
+            // Flush the pending save on every way out (Task 17 may veto the exit; an extra save is harmless).
+            if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.saver.flush();
+                }
+            }
+        });
 }
 
 /// `%APPDATA%/agentboard` (settings.json, workspace.json) — not Tauri's identifier-based dir.

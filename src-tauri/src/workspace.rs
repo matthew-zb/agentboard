@@ -269,6 +269,92 @@ impl Workspace {
         }
     }
 
+    /// Make a deserialized workspace safe to use (R11): normalize the group layout and every tab
+    /// layout (serde does not), check referential integrity, and raise each id counter to at least
+    /// the highest existing id number (a hand-edited file may be behind). `Err` (Korean message)
+    /// means the file must be treated as corrupt; `self` may be partially normalized then.
+    pub fn normalize_and_validate(&mut self) -> Result<(), String> {
+        self.group_layout.normalize();
+        for t in self.tabs.values_mut() {
+            t.layout.normalize();
+        }
+        let bad = |m: String| Err(format!("작업 상태 파일의 구조가 올바르지 않습니다: {m}"));
+
+        // groups <-> group layout
+        let leaves = self.group_layout.leaves();
+        let leaf_set: BTreeSet<&GroupId> = leaves.iter().collect();
+        if leaf_set.len() != leaves.len() || leaf_set.len() != self.groups.len() || !self.groups.keys().all(|g| leaf_set.contains(g)) {
+            return bad("그룹 배치와 그룹 목록이 맞지 않습니다".into());
+        }
+        // tabs <-> groups
+        let mut seen_tabs = BTreeSet::new();
+        for (gid, g) in &self.groups {
+            if *gid != g.id || g.tab_ids.is_empty() || !g.tab_ids.contains(&g.active_tab_id) {
+                return bad(format!("그룹 '{gid}'"));
+            }
+            for t in &g.tab_ids {
+                if !self.tabs.contains_key(t) || !seen_tabs.insert(t) {
+                    return bad(format!("그룹 '{gid}'의 탭 '{t}'"));
+                }
+            }
+        }
+        if seen_tabs.len() != self.tabs.len() {
+            return bad("어느 그룹에도 속하지 않은 탭이 있습니다".into());
+        }
+        // panes <-> tab layouts
+        let mut seen_panes = BTreeSet::new();
+        for (tid, t) in &self.tabs {
+            if *tid != t.id {
+                return bad(format!("탭 '{tid}'"));
+            }
+            let leaves = t.layout.leaves();
+            if !leaves.contains(&t.last_focused_pane_id) || t.maximized_pane_id.as_ref().is_some_and(|m| !leaves.contains(m)) {
+                return bad(format!("탭 '{tid}'의 포커스 창"));
+            }
+            for p in leaves {
+                match self.panes.get(&p) {
+                    Some(pane) if pane.tab == *tid && seen_panes.insert(p.clone()) => {}
+                    _ => return bad(format!("탭 '{tid}'의 창 '{p}'")),
+                }
+            }
+        }
+        if seen_panes.len() != self.panes.len() || self.panes.iter().any(|(k, p)| *k != p.id) {
+            return bad("어느 탭에도 속하지 않은 창이 있습니다".into());
+        }
+        if self.tabs.values().filter(|t| t.is_dispatcher).count() != 1 {
+            return bad("Dispatcher 탭이 없습니다".into());
+        }
+        // focus
+        if !self.groups.contains_key(&self.focus.group_id) {
+            return bad("포커스 그룹".into());
+        }
+        if self.group_maximized.as_ref().is_some_and(|g| !self.groups.contains_key(g)) {
+            return bad("최대화된 그룹".into());
+        }
+        if let Some(l) = &self.last_location {
+            if !self.groups.get(&l.group_id).is_some_and(|g| g.tab_ids.contains(&l.tab_id)) {
+                return bad("이전 위치".into());
+            }
+        }
+        // counters never behind existing ids
+        let max_of = |ids: Vec<&String>| ids.iter().filter_map(|i| i.get(1..)?.parse::<u64>().ok()).max().unwrap_or(0);
+        self.counters.group = self.counters.group.max(max_of(self.groups.keys().collect()));
+        self.counters.tab = self.counters.tab.max(max_of(self.tabs.keys().collect()));
+        self.counters.pane = self.counters.pane.max(max_of(self.panes.keys().collect()));
+        Ok(())
+    }
+
+    /// Runtime state of a restored workspace: every pane `Starting` with attention and prompt
+    /// warning cleared. Returns the spawn effects for all panes, without prompt injection.
+    pub fn reset_runtime_state(&mut self) -> Effects {
+        for p in self.panes.values_mut() {
+            p.status = PaneStatus::Starting;
+            p.attention = false;
+            p.prompt_warning = false;
+        }
+        Effects { spawn: self.panes.keys().map(|id| (id.clone(), false)).collect(), kill: Vec::new() }
+    }
+
     /// Panes whose process is alive (`starting` or `running`).
     pub fn running_count(&self) -> usize {
         self.panes.values().filter(|p| matches!(p.status, PaneStatus::Starting | PaneStatus::Running)).count()
