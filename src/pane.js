@@ -87,6 +87,11 @@ export function appletLabel(pane) {
   return APPLET_LABELS[k] || `애플릿 '${k}' (준비 중)`;
 }
 
+/** Header buttons of a pane: applets have nothing to restart. */
+export function headerButtons(pane) {
+  return isApplet(pane) ? ['close'] : ['restart', 'close'];
+}
+
 /** Known pane ids that are no longer in the snapshot's `panes` map. */
 export function staleIds(knownIds, panes) {
   return [...knownIds].filter((id) => !Object.prototype.hasOwnProperty.call(panes, id));
@@ -391,7 +396,7 @@ export function paneHeader(pane) {
   const spacer = document.createElement('span');
   spacer.className = 'spacer';
   h.appendChild(spacer);
-  h.appendChild(button('restart', '⟳', '재시작', () => restartPane(pane.id)));
+  if (headerButtons(pane).includes('restart')) h.appendChild(button('restart', '⟳', '재시작', () => restartPane(pane.id)));
   h.appendChild(button('close', '✕', '창 닫기', () => run({ type: 'closePane', pane: pane.id })));
   return h;
 }

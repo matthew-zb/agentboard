@@ -359,6 +359,9 @@ impl Workspace {
         if self.tabs.values().filter(|t| t.is_dispatcher).count() != 1 {
             return bad("Dispatcher 탭이 없습니다".into());
         }
+        if let Err(m) = self.check_roles() {
+            return bad(m);
+        }
         // focus
         if !self.groups.contains_key(&self.focus.group_id) {
             return bad("포커스 그룹".into());
@@ -376,6 +379,56 @@ impl Workspace {
         self.counters.group = self.counters.group.max(max_of(self.groups.keys().collect()));
         self.counters.tab = self.counters.tab.max(max_of(self.tabs.keys().collect()));
         self.counters.pane = self.counters.pane.max(max_of(self.panes.keys().collect()));
+        Ok(())
+    }
+
+    /// Phase-2 invariants: applets carry no agent/role/team/session name; the Dispatcher role
+    /// belongs to the Dispatcher tab only; at most one handover tab; per tab at most one
+    /// standing-role pane, and its role equals the tab's role; session names are unique.
+    fn check_roles(&self) -> Result<(), String> {
+        for (pid, p) in &self.panes {
+            if p.kind.is_applet() && (p.role.is_some() || p.team.is_some() || p.session_name.is_some() || !p.agent.is_empty()) {
+                return Err(format!("애플릿 창 '{pid}'에 에이전트·역할·팀·세션 이름이 있습니다"));
+            }
+        }
+        if self.tabs.values().filter(|t| t.role == Some(Role::Handover)).count() > 1 {
+            return Err("handover 탭이 둘 이상입니다".into());
+        }
+        for (tid, t) in &self.tabs {
+            // Dispatcher role <=> Dispatcher tab (a phase-1 Dispatcher tab has no role); tab
+            // roles are standing roles only
+            let role_ok = match t.role {
+                None => true,
+                Some(Role::Dispatcher) => t.is_dispatcher,
+                Some(r) => !t.is_dispatcher && r.is_standing(),
+            };
+            if !role_ok {
+                return Err(format!("탭 '{tid}'의 역할"));
+            }
+            let standing: Vec<&Pane> = t
+                .layout
+                .leaves()
+                .iter()
+                .filter_map(|p| self.panes.get(p))
+                .filter(|p| p.role.is_some_and(|r| r.is_standing()))
+                .collect();
+            if standing.len() > 1 {
+                return Err(format!("탭 '{tid}'에 상시 에이전트 창이 둘 이상입니다"));
+            }
+            if let Some(p) = standing.first() {
+                if p.role != t.role {
+                    return Err(format!("창 '{}'의 역할이 탭 '{tid}'의 역할과 다릅니다", p.id));
+                }
+            }
+        }
+        let mut names = BTreeSet::new();
+        for p in self.panes.values() {
+            if let Some(n) = &p.session_name {
+                if !names.insert(n) {
+                    return Err(format!("세션 이름 '{n}'이(가) 중복됩니다"));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -484,6 +537,7 @@ impl Workspace {
                 fx.spawn.push((id, false));
             }
             ClosePane { pane } => {
+                self.check_not_standing(&pane)?;
                 let tid = self.pane(&pane)?.tab.clone();
                 let t = self.tabs.get_mut(&tid).unwrap();
                 match t.layout.remove_leaf(&pane) {
@@ -537,6 +591,7 @@ impl Workspace {
                 }
             }
             BreakPaneToTab { pane } => {
+                self.check_not_standing(&pane)?;
                 let tid = self.pane(&pane)?.tab.clone();
                 let pane_name = self.panes[&pane].name.clone();
                 let origin = self.tabs[&tid].clone();
@@ -712,6 +767,15 @@ impl Workspace {
     }
     fn group(&self, id: &str) -> Result<&Group, String> {
         self.groups.get(id).ok_or_else(|| no_group(id))
+    }
+
+    /// R16: a standing agent pane (Dispatcher/Handover/Manager) is never closed or broken off on
+    /// its own — the standing task goes away with its tab (CloseTab). Restart is allowed.
+    fn check_not_standing(&self, pane: &str) -> Result<(), String> {
+        if self.pane(pane)?.role.is_some_and(|r| r.is_standing()) {
+            return Err("상시 에이전트 창은 따로 닫거나 떼어낼 수 없습니다 — 탭을 닫으세요".into());
+        }
+        Ok(())
     }
 
     fn new_group_id(&mut self) -> GroupId {
@@ -1377,6 +1441,103 @@ mod tests {
         ws2.apply(create("web", "solo"), &l).unwrap();
         assert_eq!(tab(&ws2, "web").role, None);
         assert!(ws2.panes[&pane(&ws2, "web", "main")].role.is_none());
+    }
+
+    fn role_ws() -> (Loaded, Workspace) {
+        let l = loaded_files(
+            r#"{"dispatcher":{"template":"dispatcher-inbox"},
+                "tabs":[{"name":"handover","role":"handover","dir":""},
+                        {"name":"billing","role":"manager","dir":"billing","template":"manager"}]}"#,
+            &[("dispatcher-inbox.json", INBOX_TPL), ("manager.json", MANAGER_TPL)],
+        );
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        let ws = Workspace::from_config(&l);
+        (l, ws)
+    }
+
+    #[test]
+    fn validate_rejects_broken_role_invariants() {
+        let (_, good) = role_ws();
+        let mut ok = good.clone();
+        assert_eq!(ok.normalize_and_validate(), Ok(()));
+        type M = (&'static str, Box<dyn Fn(&mut Workspace)>);
+        let p = |w: &Workspace, t: &str, n: &str| pane(w, t, n);
+        let cases: Vec<M> = vec![
+            ("applet with a role", Box::new(move |w| {
+                let id = p(w, "dispatcher", "inbox");
+                w.panes.get_mut(&id).unwrap().role = Some(Role::Member);
+            })),
+            ("applet with a team", Box::new(move |w| {
+                let id = p(w, "dispatcher", "inbox");
+                w.panes.get_mut(&id).unwrap().team = Some("t".into());
+            })),
+            ("applet with a session name", Box::new(move |w| {
+                let id = p(w, "dispatcher", "inbox");
+                w.panes.get_mut(&id).unwrap().session_name = Some("x".into());
+            })),
+            ("applet with an agent", Box::new(move |w| {
+                let id = p(w, "dispatcher", "inbox");
+                w.panes.get_mut(&id).unwrap().agent = "claude".into();
+            })),
+            ("two handover tabs", Box::new(|w| {
+                let id = tab(w, "billing").id.clone();
+                w.tabs.get_mut(&id).unwrap().role = Some(Role::Handover);
+                for pid in w.tabs[&id].layout.leaves() {
+                    if w.panes[&pid].role.is_some() {
+                        w.panes.get_mut(&pid).unwrap().role = Some(Role::Handover);
+                    }
+                }
+            })),
+            ("two standing panes in a tab", Box::new(move |w| {
+                let id = p(w, "billing", "extra");
+                let q = w.panes.get_mut(&id).unwrap();
+                q.role = Some(Role::Manager);
+                q.session_name = Some("billing-2".into());
+            })),
+            ("standing role mismatching the tab", Box::new(move |w| {
+                let id = p(w, "billing", "manager");
+                w.panes.get_mut(&id).unwrap().role = Some(Role::Handover);
+            })),
+            ("dispatcher role outside the dispatcher tab", Box::new(|w| {
+                let id = tab(w, "billing").id.clone();
+                w.tabs.get_mut(&id).unwrap().role = Some(Role::Dispatcher);
+            })),
+            ("duplicate sessionName", Box::new(move |w| {
+                let id = p(w, "billing", "shell");
+                w.panes.get_mut(&id).unwrap().session_name = Some("handover".into());
+            })),
+        ];
+        for (name, f) in cases {
+            let mut bad = good.clone();
+            f(&mut bad);
+            assert!(bad.normalize_and_validate().is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn standing_pane_cannot_be_closed_or_broken_off() {
+        let (l, mut ws) = role_ws();
+        for (t, n) in [("billing", "manager"), ("handover", "main"), ("dispatcher", "dispatcher")] {
+            let id = pane(&ws, t, n);
+            for cmd in [WsCommand::ClosePane { pane: id.clone() }, WsCommand::BreakPaneToTab { pane: id.clone() }] {
+                let before = ws.clone();
+                let err = ws.apply(cmd, &l).unwrap_err();
+                assert!(err.contains("상시 에이전트 창"), "{t}/{n}: {err}");
+                assert_eq!(ws, before);
+            }
+            // restart stays allowed
+            ws.apply(WsCommand::RestartPane { pane: id.clone() }, &l).unwrap();
+        }
+        // helper panes and applets of a role tab still close / break off normally
+        ws.apply(WsCommand::ClosePane { pane: pane(&ws, "billing", "extra") }, &l).unwrap();
+        ws.apply(WsCommand::BreakPaneToTab { pane: pane(&ws, "billing", "shell") }, &l).unwrap();
+        ws.apply(WsCommand::ClosePane { pane: pane(&ws, "dispatcher", "inbox") }, &l).unwrap();
+        // the whole standing task goes away with CloseTab
+        let b = tab(&ws, "billing").id.clone();
+        ws.apply(WsCommand::CloseTab { tab: b }, &l).unwrap();
+        assert!(!has_tab(&ws, "billing"));
+        let mut v = ws.clone();
+        assert_eq!(v.normalize_and_validate(), Ok(()));
     }
 
     #[test]

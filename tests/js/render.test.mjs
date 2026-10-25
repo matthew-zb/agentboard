@@ -320,3 +320,11 @@ test('syncTargets: applet panes never receive input', () => {
   ws.panes.app = { id: 'app', tab: 't1', status: { state: 'running' }, kind: { type: 'applet', kind: 'inbox' } };
   assert.deepEqual([...syncTargets(ws, 'a')].sort(), ['a', 'b']);
 });
+
+import { headerButtons } from '../../src/pane.js';
+
+test('headerButtons: no restart button on applet panes', () => {
+  assert.deepEqual(headerButtons({ kind: { type: 'applet', kind: 'inbox' } }), ['close']);
+  assert.deepEqual(headerButtons({ kind: { type: 'terminal' } }), ['restart', 'close']);
+  assert.deepEqual(headerButtons({}), ['restart', 'close']);
+});

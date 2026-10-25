@@ -485,6 +485,27 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path(&dir)).unwrap()).unwrap();
         assert_eq!(v["panes"]["p1"]["kind"], serde_json::json!({"type": "terminal"}));
         assert_eq!(load(&path(&dir)).unwrap().unwrap(), ws);
+
+        // phase-2 invariants are checked on load
+        let base: serde_json::Value = serde_json::from_str(phase1).unwrap();
+        let cases: [(&str, fn(&mut serde_json::Value)); 2] = [
+            ("applet with a role", |v| {
+                v["panes"]["p3"]["kind"] = serde_json::json!({"type": "applet", "kind": "inbox"});
+                v["panes"]["p3"]["agent"] = serde_json::json!("");
+                v["panes"]["p3"]["role"] = serde_json::json!("member");
+            }),
+            ("duplicate sessionName", |v| {
+                v["panes"]["p2"]["sessionName"] = serde_json::json!("s");
+                v["panes"]["p3"]["sessionName"] = serde_json::json!("s");
+            }),
+        ];
+        for (name, f) in cases {
+            let mut v = base.clone();
+            f(&mut v);
+            std::fs::write(path(&dir), v.to_string()).unwrap();
+            let r = load(&path(&dir));
+            assert!(matches!(r, Err(LoadError::Corrupt(_))), "{name}: {r:?}");
+        }
     }
 
     #[test]

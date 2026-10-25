@@ -253,6 +253,9 @@ fn get_keybindings(state: State<'_, AppState>) -> BTreeMap<String, String> {
 #[tauri::command]
 fn get_passthrough(state: State<'_, AppState>, pane: String) -> Vec<String> {
     let Some(p) = state.ws.lock().unwrap().pane_by_id(&pane).cloned() else { return Vec::new() };
+    if p.kind.is_applet() {
+        return Vec::new(); // no terminal, no profile
+    }
     let loaded = state.loaded.read().unwrap();
     launcher::profile_for(&p, &loaded).map(|prof| prof.passthrough_keys.clone()).unwrap_or_default()
 }
