@@ -52,7 +52,7 @@ import {
   newTabWizard,
 } from './overlays.js';
 import { configureCopyMode, toggleCopyMode, copyActive, pruneCopySessions } from './copy-ui.js';
-import { pickCommands, paletteItems, missingDirsFlow } from './overlay-logic.js';
+import { pickCommands, paletteItems, missingDirsFlow, closeFlow } from './overlay-logic.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -476,3 +476,20 @@ window.addEventListener('focus', () => {
     return execute([{ type: 'setFocus', group: r.group, tab: r.tab, pane: r.pane }]);
   });
 });
+
+// App close (spec §8): the window never closes by itself; ask when agents are running, then
+// app_exit (save → kill all panes → exit). A failed lookup falls back to asking (safe side).
+const closeState = { busy: false };
+const closeWin = globalThis.__TAURI__ && globalThis.__TAURI__.window;
+if (closeWin) {
+  closeWin.getCurrentWindow().onCloseRequested((e) => {
+    e.preventDefault();
+    if (closeState.busy) return undefined; // dialog already open: ignore repeats
+    closeOverlays();
+    return closeFlow(closeState, {
+      runningCount: () => api.runningCount().catch(() => 1),
+      confirm,
+      exit: () => api.appExit(),
+    }).catch(showError);
+  });
+}

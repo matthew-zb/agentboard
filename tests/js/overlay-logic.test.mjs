@@ -16,6 +16,7 @@ import {
   newTabFlow,
   groupMissing,
   missingDirsFlow,
+  closeFlow,
 } from '../../src/overlay-logic.js';
 
 const leaf = (id) => ({ leaf: id });
@@ -375,4 +376,49 @@ test('app.js passes alive: () => true to the startup missing-dir flow (R19)', ()
   const src = readFileSync(new URL('../../src/app.js', import.meta.url), 'utf8');
   const call = src.slice(src.indexOf('missingDirsFlow({'), src.indexOf('missingDirsFlow({') + 200);
   assert.match(call, /alive: \(\) => true/);
+});
+
+test('closeFlow: no running agents exits without asking', async () => {
+  const calls = [];
+  const ok = await closeFlow({ busy: false }, {
+    runningCount: async () => 0,
+    confirm: async () => { calls.push('confirm'); return true; },
+    exit: async () => { calls.push('exit'); },
+  });
+  assert.equal(ok, true);
+  assert.deepEqual(calls, ['exit']);
+});
+
+test('closeFlow: asks with the count; yes exits, no stays', async () => {
+  const msgs = [];
+  let exited = 0;
+  const mk = (answer) => ({
+    runningCount: async () => 3,
+    confirm: async (m) => { msgs.push(m); return answer; },
+    exit: async () => { exited++; },
+  });
+  const st = { busy: false };
+  assert.equal(await closeFlow(st, mk(false)), false);
+  assert.equal(exited, 0);
+  assert.equal(st.busy, false);
+  assert.equal(await closeFlow(st, mk(true)), true);
+  assert.equal(exited, 1);
+  assert.deepEqual(msgs, ['실행 중인 에이전트 3개를 종료하고 닫을까요?', '실행 중인 에이전트 3개를 종료하고 닫을까요?']);
+});
+
+test('closeFlow: a second request while the dialog is open is ignored; busy clears after a failure', async () => {
+  const st = { busy: false };
+  let release;
+  const deps = {
+    runningCount: async () => 2,
+    confirm: () => new Promise((r) => (release = r)),
+    exit: async () => {},
+  };
+  const first = closeFlow(st, deps);
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(await closeFlow(st, deps), false);
+  release(false);
+  assert.equal(await first, false);
+  await assert.rejects(closeFlow(st, { ...deps, runningCount: async () => 0, exit: async () => { throw new Error('x'); } }));
+  assert.equal(st.busy, false);
 });

@@ -134,3 +134,11 @@ export async function readClipboardText() {
   const t = await tauri().clipboardManager.readText();
   return typeof t === 'string' ? t : '';
 }
+
+export function runningCount() {
+  return invoke('running_count');
+}
+
+export function appExit() {
+  return invoke('app_exit');
+}

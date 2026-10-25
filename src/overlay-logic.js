@@ -322,3 +322,21 @@ export async function missingDirsFlow(d) {
     if (ids.length) await d.restart(ids);
   }
 }
+
+/**
+ * Window close request (spec §8): ask only when agents are running. `st.busy` guards against a
+ * second close request while the dialog is open. Resolves true when the app was told to exit.
+ * deps: { runningCount(), confirm(msg), exit() }
+ */
+export async function closeFlow(st, deps) {
+  if (st.busy) return false;
+  st.busy = true;
+  try {
+    const n = await deps.runningCount();
+    if (n > 0 && !(await deps.confirm(`실행 중인 에이전트 ${n}개를 종료하고 닫을까요?`))) return false;
+    await deps.exit();
+    return true;
+  } finally {
+    st.busy = false;
+  }
+}

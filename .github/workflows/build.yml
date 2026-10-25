@@ -14,11 +14,16 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - uses: dtolnay/rust-toolchain@stable
 
       - run: npm ci
+
+      - name: Test
+        run: |
+          npm run test:js
+          cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Build (Windows)
         run: npx tauri build

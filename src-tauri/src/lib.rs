@@ -201,6 +201,20 @@ fn missing_dirs(state: State<'_, AppState>) -> Vec<(TabId, String)> {
     launcher::missing_dirs(&state.ws.lock().unwrap())
 }
 
+/// Number of running agents (panes with a live process) for the close confirmation.
+#[tauri::command]
+fn running_count(state: State<'_, AppState>) -> usize {
+    state.ws.lock().unwrap().running_count()
+}
+
+/// Confirmed app exit: save workspace.json, kill every pane process, exit.
+#[tauri::command]
+fn app_exit(app: AppHandle, state: State<'_, AppState>) {
+    state.saver.flush();
+    state.pty.kill_all();
+    app.exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -219,6 +233,8 @@ pub fn run() {
             list_templates,
             default_template,
             missing_dirs,
+            running_count,
+            app_exit,
         ])
         .setup(|app| {
             // load_all = load_settings + ensure_dotdir (incl. powershell profile) + load

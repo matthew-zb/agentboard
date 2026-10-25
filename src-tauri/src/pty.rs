@@ -344,6 +344,14 @@ impl PtyManager {
         }
     }
 
+    /// Kill every pane's process (app exit). The Job Object still reaps grandchildren.
+    pub fn kill_all(&self) {
+        let entries: Vec<Arc<Entry>> = self.panes.lock().unwrap().values().cloned().collect();
+        for e in entries {
+            let _ = e.killer.lock().unwrap().kill();
+        }
+    }
+
     pub fn snapshot(&self, id: &str) -> Vec<u8> {
         self.entry(id).map(|e| e.ring.lock().unwrap().snapshot()).unwrap_or_default()
     }
