@@ -676,7 +676,8 @@ fn embedded_template(name: &str) -> Template {
     parse_template(text, Path::new(file)).expect("embedded template is valid")
 }
 
-/// Create `.agentboard/` and copy embedded defaults — never overwrites existing files.
+/// Create `.agentboard/` and copy embedded defaults (keybindings.json starts as `{}`: user
+/// overrides only) — never overwrites existing files.
 pub fn ensure_dotdir(root: &Path) -> Result<(), String> {
     let dot = root.join(".agentboard");
     let tdir = dot.join("templates");
@@ -687,7 +688,9 @@ pub fn ensure_dotdir(root: &Path) -> Result<(), String> {
         DEFAULT_TEMPLATES.iter().map(|(n, c)| (tdir.join(n), *c)).collect();
     files.extend(DEFAULT_AGENTS.iter().map(|(n, c)| (adir.join(n), *c)));
     crate::profiles::ensure_powershell_profile(&adir);
-    files.push((dot.join("keybindings.json"), DEFAULT_KEYBINDINGS));
+    // Overrides only: defaults always come from the embedded file, so a full copy here would
+    // shadow future default changes. Existing files (incl. phase-1 full copies) stay as they are.
+    files.push((dot.join("keybindings.json"), "{}\n"));
     for (path, content) in files {
         if !path.exists() {
             std::fs::write(&path, content).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -985,6 +988,27 @@ mod tests {
         std::fs::write(dot.join("templates/solo.json"), "MINE").unwrap();
         ensure_dotdir(d.path()).unwrap();
         assert_eq!(std::fs::read_to_string(dot.join("templates/solo.json")).unwrap(), "MINE");
+    }
+
+    #[test]
+    fn new_install_keybindings_file_is_empty_object() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_dotdir(root.path()).unwrap();
+        let kb = root.path().join(".agentboard/keybindings.json");
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&kb).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({}), "new installs get an empty override file");
+        // an empty user file = all embedded defaults, no errors
+        let a = appdata_with_root(root.path());
+        let l = load_all(a.path());
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        assert_eq!(l.keybindings.0, load_keybindings(None, &kb).0 .0);
+        // an existing file (e.g. a phase-1 full copy or user edits) is never touched
+        std::fs::write(&kb, r#"{"pane.focusLeft":"Alt+y"}"#).unwrap();
+        ensure_dotdir(root.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&kb).unwrap(), r#"{"pane.focusLeft":"Alt+y"}"#);
+        let l = load_all(a.path());
+        assert_eq!(l.keybindings.0["pane.focusLeft"], "Alt+y");
+        assert_eq!(l.keybindings.0["pane.focusDown"], "Alt+j", "non-overridden ids keep defaults");
     }
 
     fn appdata_with_root(root: &Path) -> tempfile::TempDir {

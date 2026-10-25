@@ -5,13 +5,28 @@
 //!
 //! App locks: `AppState::ws` (Mutex), `AppState::loaded` (RwLock, read-only in phase 1),
 //! `AppState::prompts` (Mutex), `AppState::effects` (Mutex<Sender>), `AppSink::channels`
-//! (Mutex). PtyManager-internal locks: per-pane `flush_lock`, the `panes` map,
-//! writer/master/killer.
+//! (Mutex, reached through `AppState::ui` / the managed `Arc<AppSink>`). PtyManager-internal
+//! locks: per-pane `flush_lock`, the `panes` map, writer/master/killer.
 //!
 //! * Allowed nestings (outer -> inner): `ws -> loaded(read)`, `ws -> prompts`,
-//!   `ws -> PtyManager::is_running/job_error` (only the `panes` map lock / job_error lock +
-//!   an atomic; never blocks on a process), `flush_lock -> prompts` (sink `output` feeds the
-//!   ReadyDetector), `flush_lock -> channels` (sink `output` and `pty_attach`).
+//!   `ws -> PtyManager::is_running/current_gen/job_error` (only the `panes` map lock /
+//!   job_error lock + an atomic; never blocks on a process), `flush_lock -> panes`
+//!   (sink `output` checks `current_gen`; `attach_with` re-checks the generation),
+//!   `flush_lock -> prompts` (sink `output` feeds the ReadyDetector), `flush_lock -> channels`
+//!   (sink `output` and `pty_attach`). The `panes` map lock is a leaf: PtyManager never
+//!   takes `flush_lock` or any app lock while holding it.
+//!
+//! # Spawn generations
+//!
+//! Every `PtyManager::spawn` attempt gets a fresh generation (manager-global u64, from 1,
+//! never reused) and registers it under `panes` before the process starts; the PTY threads
+//! tag `output`/`exited` with it. `current_gen(id)` is the latest registration — `None`
+//! after `remove` or a failed spawn. `on_output`/`on_exited` ignore any event whose
+//! generation is not current (a late exit of a restarted/retired process never touches the
+//! model, prompts or the frontend channel). A restart whose plan fails retires the old
+//! generation (`remove`) before writing `Failed`, so the message survives the old exit. If
+//! the old process will not die within `KILL_WAIT`, its generation stays current: when it
+//! finally exits, `Exited` replaces the "won't terminate" failure (truthful; restartable).
 //! * `ws -> emit_lock` (R16): `publish` stamps a version under `ws`, takes `emit_lock`,
 //!   releases `ws`, emits, then releases `emit_lock` — emits go out in version order and
 //!   never while `ws` is held.
@@ -32,12 +47,12 @@
 use crate::config::Loaded;
 use crate::profiles::{encode_submit, AgentProfile, ReadyDetector, READY_TIMEOUT};
 use crate::pty::SpawnSpec;
-use crate::workspace::{Effects, Pane, PaneStatus, TabId, Workspace};
+use crate::workspace::{Effects, Pane, PaneStatus, TabId, Workspace, WsCommand};
 use crate::{AppState, Snapshot};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 pub const START_COLS: u16 = 80;
 pub const START_ROWS: u16 = 24;
@@ -168,8 +183,21 @@ pub fn publish(state: &AppState) -> Snapshot {
     let _emit = state.emit_lock.lock().unwrap();
     drop(ws);
     state.saver.notify(); // every model change is published; the saver debounces (500ms)
-    let _ = state.app.emit(WORKSPACE_CHANGED, snap.clone());
+    state.ui.workspace_changed(&snap);
     snap
+}
+
+/// The one command path (Tauri `ws_command`, phase-2 MCP tools): apply under `ws` (+ `loaded`
+/// read), release both, queue the effects for the launcher worker, then publish. Returns the
+/// exact snapshot that was emitted. A rejected command changes nothing, emits nothing.
+pub fn execute(state: &AppState, cmd: WsCommand) -> Result<Snapshot, String> {
+    let fx = {
+        let mut ws = state.ws.lock().unwrap();
+        let loaded = state.loaded.read().unwrap();
+        ws.apply(cmd, &loaded)?
+    };
+    submit(state, fx);
+    Ok(publish(state))
 }
 
 pub fn emit_changed(state: &AppState) {
@@ -234,7 +262,7 @@ pub fn run_effects(state: &AppState, fx: Effects) {
         let gone = state.ws.lock().unwrap().pane_by_id(id).is_none();
         if gone {
             state.pty.remove(id);
-            state.sink.drop_channel(id);
+            state.ui.drop_channel(id);
         } else {
             state.pty.kill(id);
         }
@@ -274,6 +302,10 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
     let spec = match plan {
         Ok(s) => s,
         Err(message) => {
+            // The old process (if any) is dead but its `exited` may still be in flight. Forget
+            // its generation first, so that event is stale and cannot overwrite the failure.
+            state.pty.remove(id);
+            state.ui.drop_channel(id);
             state.ws.lock().unwrap().set_status(id, PaneStatus::Failed { message });
             return;
         }
@@ -282,13 +314,14 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
     if let Some(job) = job {
         state.prompts.lock().unwrap().insert(id.to_string(), job);
     }
+    // A failed spawn leaves the id unregistered (see PtyManager::spawn): old events are stale.
     match state.pty.spawn(id, spec) {
-        Ok(()) => {
-            // A very fast exit may already have happened: claim Running only while alive
-            // (otherwise `on_exited` sets / has set Exited). Checked under `ws` so it is
-            // ordered against `on_exited`, which also decides under `ws`.
+        Ok(gen) => {
+            // A very fast exit may already have happened: claim Running only while this
+            // generation is current and alive (otherwise `on_exited` sets / has set Exited).
+            // Checked under `ws` so it is ordered against `on_exited`, which decides under `ws`.
             let mut ws = state.ws.lock().unwrap();
-            if state.pty.is_running(id) {
+            if state.pty.current_gen(id) == Some(gen) && state.pty.is_running(id) {
                 ws.set_status(id, PaneStatus::Running);
             }
         }
@@ -300,19 +333,25 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
 }
 
 /// Sink `output`: runs on the PTY flush path under `flush_lock` — only feeds a detector.
-pub fn on_output(state: &AppState, id: &str, bytes: &[u8]) {
+/// Returns false (and does nothing) when `gen` is not the id's current generation; the sink
+/// then must not forward the bytes either.
+pub fn on_output(state: &AppState, id: &str, gen: u64, bytes: &[u8]) -> bool {
+    if state.pty.current_gen(id) != Some(gen) {
+        return false;
+    }
     let mut jobs = state.prompts.lock().unwrap();
     if let Some(job) = jobs.get_mut(id) {
         job.feed(bytes, Instant::now());
     }
+    true
 }
 
-/// Sink `exited`. Returns false when the event is stale — a restarted process for the same
-/// id is already running — and was ignored.
-pub fn on_exited(state: &AppState, id: &str, code: i32) -> bool {
+/// Sink `exited`. Returns false when the event is stale — `gen` is not the id's current
+/// generation (a newer spawn owns the id, or a failed restart retired it) — and was ignored.
+pub fn on_exited(state: &AppState, id: &str, gen: u64, code: i32) -> bool {
     {
         let mut ws = state.ws.lock().unwrap();
-        if state.pty.is_running(id) {
+        if state.pty.current_gen(id) != Some(gen) {
             return false;
         }
         ws.set_status(id, PaneStatus::Exited { code });
@@ -356,7 +395,7 @@ mod tests {
     use super::*;
     use crate::config::{load_all, ensure_dotdir};
     use crate::profiles::{encode_submit, Ready, READY_TIMEOUT};
-    use crate::workspace::PaneStatus;
+    use crate::workspace::{PaneStatus, WsCommand};
     use regex::Regex;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -524,6 +563,146 @@ mod tests {
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["version"], 6);
         assert!(json.get("workspace").is_some());
+    }
+
+    // ── runtime tests: a real AppState without Tauri (recording Ui, silent PTY sink) ──
+
+    #[derive(Default)]
+    struct RecUi {
+        snaps: std::sync::Mutex<Vec<Snapshot>>,
+        dropped: std::sync::Mutex<Vec<String>>,
+    }
+    impl crate::Ui for RecUi {
+        fn workspace_changed(&self, snap: &Snapshot) {
+            self.snaps.lock().unwrap().push(snap.clone());
+        }
+        fn drop_channel(&self, id: &str) {
+            self.dropped.lock().unwrap().push(id.to_string());
+        }
+    }
+
+    /// PTY events are not routed back: tests deliver (stale) events by hand, deterministically.
+    struct NullSink;
+    impl crate::pty::PtySink for NullSink {
+        fn output(&self, _: &str, _: u64, _: &[u8]) {}
+        fn exited(&self, _: &str, _: u64, _: i32) {}
+    }
+
+    struct Rt {
+        state: AppState,
+        ui: std::sync::Arc<RecUi>,
+        rx: mpsc::Receiver<Effects>,
+        pane: String,
+        _keep: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    impl Drop for Rt {
+        fn drop(&mut self) {
+            let ids: Vec<String> = self.state.ws.lock().unwrap().panes.keys().cloned().collect();
+            for id in ids {
+                self.state.pty.remove(&id);
+            }
+        }
+    }
+
+    /// Workspace from config with every pane running `cmd.exe` in an existing folder.
+    fn runtime() -> Rt {
+        let Fx { loaded, root, _appdata } = fixture();
+        let mut ws = Workspace::from_config(&loaded);
+        for p in ws.panes.values_mut() {
+            p.agent = "cmd".into();
+            std::fs::create_dir_all(&p.cwd).unwrap();
+        }
+        let pane = ws.panes.keys().next().expect("dispatcher pane").clone();
+        let ui = std::sync::Arc::new(RecUi::default());
+        let (tx, rx) = mpsc::channel();
+        let pty = crate::pty::PtyManager::new_per_child_job(std::sync::Arc::new(NullSink));
+        let state = AppState::new(ws, loaded, pty, ui.clone(), tx, crate::persist::Saver::disabled(), Vec::new());
+        Rt { state, ui, rx, pane, _keep: (root, _appdata) }
+    }
+
+    fn status(state: &AppState, id: &str) -> PaneStatus {
+        state.ws.lock().unwrap().pane_by_id(id).unwrap().status.clone()
+    }
+
+    fn restart(rt: &Rt) {
+        execute(&rt.state, WsCommand::RestartPane { pane: rt.pane.clone() }).unwrap();
+        run_effects(&rt.state, rt.rx.try_recv().expect("restart effects submitted"));
+    }
+
+    #[test]
+    fn stale_exit_does_not_mark_respawned_pane() {
+        let rt = runtime();
+        let (state, id) = (&rt.state, rt.pane.as_str());
+        let fx = initial_effects(&state.ws.lock().unwrap()); // guard dropped before run_effects
+        run_effects(state, fx);
+        let gen1 = state.pty.current_gen(id).expect("spawned");
+        assert_eq!(status(state, id), PaneStatus::Running);
+
+        restart(&rt);
+        let gen2 = state.pty.current_gen(id).expect("respawned");
+        assert_ne!(gen1, gen2);
+        assert_eq!(status(state, id), PaneStatus::Running);
+
+        // the old process's events arrive late: ignored
+        assert!(!on_output(state, id, gen1, b"old"));
+        assert!(!on_exited(state, id, gen1, 0));
+        assert_eq!(status(state, id), PaneStatus::Running);
+
+        // the current generation still counts
+        assert!(on_output(state, id, gen2, b"new"));
+        state.pty.kill(id);
+        let end = Instant::now() + Duration::from_secs(5);
+        while state.pty.is_running(id) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(on_exited(state, id, gen2, 7));
+        assert_eq!(status(state, id), PaneStatus::Exited { code: 7 });
+    }
+
+    #[test]
+    fn failed_restart_message_survives_old_exit() {
+        let rt = runtime();
+        let (state, id) = (&rt.state, rt.pane.as_str());
+        let fx = initial_effects(&state.ws.lock().unwrap()); // guard dropped before run_effects
+        run_effects(state, fx);
+        let gen1 = state.pty.current_gen(id).expect("spawned");
+
+        // the restart cannot plan: the profile's command disappeared
+        state.loaded.write().unwrap().profiles.get_mut("cmd").unwrap().cmd = "agentboard-no-such-cmd-xyz".into();
+        restart(&rt);
+        let want = PaneStatus::Failed {
+            message: "명령을 찾을 수 없습니다: agentboard-no-such-cmd-xyz (프로필 cmd)".into(),
+        };
+        assert_eq!(status(state, id), want);
+        assert_ne!(state.pty.current_gen(id), Some(gen1), "the old generation is no longer current");
+
+        // the killed process's exit arrives after the failure was recorded
+        assert!(!on_exited(state, id, gen1, 1));
+        assert_eq!(status(state, id), want, "failure message must survive");
+        assert!(rt.ui.dropped.lock().unwrap().contains(&id.to_string()), "old output channel dropped");
+    }
+
+    #[test]
+    fn execute_returns_emitted_snapshot() {
+        let rt = runtime();
+        let state = &rt.state;
+        let snap = execute(state, WsCommand::SplitPane { pane: rt.pane.clone(), dir: crate::layout::Dir::Vertical }).unwrap();
+        let emitted = rt.ui.snaps.lock().unwrap().last().cloned().expect("emitted");
+        assert_eq!(snap.version, emitted.version);
+        assert_eq!(serde_json::to_value(&snap).unwrap(), serde_json::to_value(&emitted).unwrap());
+        assert_eq!(snap.workspace.panes.len(), 2);
+        // effects went to the launcher worker, not run inline
+        let fx = rt.rx.try_recv().expect("effects submitted");
+        assert_eq!(fx.spawn.len(), 1);
+        assert!(state.pty.current_gen(&fx.spawn[0].0).is_none(), "nothing spawned by execute itself");
+
+        // a rejected command: error, no emit, no effects
+        let n = rt.ui.snaps.lock().unwrap().len();
+        let err = execute(state, WsCommand::RestartPane { pane: "nope".into() });
+        assert!(err.is_err());
+        assert_eq!(rt.ui.snaps.lock().unwrap().len(), n);
+        assert!(rt.rx.try_recv().is_err());
     }
 
     #[test]

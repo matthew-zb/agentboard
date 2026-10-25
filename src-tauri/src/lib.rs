@@ -34,16 +34,24 @@ pub struct Snapshot {
     pub version: u64,
 }
 
+/// What the launcher pushes out to the frontend. Production: [`AppSink`] (Tauri event +
+/// per-pane output channels); tests record. Both methods are leaves (no app lock taken).
+pub trait Ui: Send + Sync {
+    /// Emit `workspace-changed` with exactly this snapshot.
+    fn workspace_changed(&self, snap: &Snapshot);
+    /// Forget the pane's output channel (pane left the model, or its process is gone).
+    fn drop_channel(&self, id: &str);
+}
+
 /// Lock order: see the module docs of `launcher`.
 pub struct AppState {
     pub ws: Mutex<Workspace>,
     pub loaded: RwLock<Loaded>,
     pub pty: PtyManager,
-    pub app: AppHandle,
     pub prompts: Mutex<HashMap<PaneId, PromptJob>>,
     /// Queue to the launcher worker thread (`launcher::submit`).
     pub effects: Mutex<mpsc::Sender<Effects>>,
-    pub sink: Arc<AppSink>,
+    pub ui: Arc<dyn Ui>,
     /// Last issued `Snapshot::version`; incremented only while `ws` is held.
     pub version: AtomicU64,
     /// Serializes "versioned snapshot + emit" (order ws -> emit_lock; leaf).
@@ -52,6 +60,31 @@ pub struct AppState {
     pub saver: persist::Saver,
     /// Startup problems outside config files (e.g. a discarded workspace.json), shown in the error list.
     pub startup_errors: Vec<String>,
+}
+
+impl AppState {
+    pub fn new(
+        ws: Workspace,
+        loaded: Loaded,
+        pty: PtyManager,
+        ui: Arc<dyn Ui>,
+        effects: mpsc::Sender<Effects>,
+        saver: persist::Saver,
+        startup_errors: Vec<String>,
+    ) -> Self {
+        AppState {
+            ws: Mutex::new(ws),
+            loaded: RwLock::new(loaded),
+            pty,
+            prompts: Mutex::new(HashMap::new()),
+            effects: Mutex::new(effects),
+            ui,
+            version: AtomicU64::new(0),
+            emit_lock: Mutex::new(()),
+            saver,
+            startup_errors,
+        }
+    }
 }
 
 /// Delivers PTY output to the attached frontend channel as raw binary and forwards
@@ -72,18 +105,27 @@ impl AppSink {
     fn new(app: AppHandle) -> Self {
         AppSink { app, channels: Mutex::new(HashMap::new()) }
     }
+}
 
-    /// Forget the pane's output channel (the pane left the model). `channels` is a leaf lock.
-    pub(crate) fn drop_channel(&self, id: &str) {
+impl Ui for AppSink {
+    fn workspace_changed(&self, snap: &Snapshot) {
+        let _ = self.app.emit(launcher::WORKSPACE_CHANGED, snap);
+    }
+
+    /// `channels` is a leaf lock.
+    fn drop_channel(&self, id: &str) {
         self.channels.lock().unwrap().remove(id);
     }
 }
 
 impl PtySink for AppSink {
-    // Runs under the pane's flush lock: flush_lock -> prompts, flush_lock -> channels.
-    fn output(&self, id: &str, bytes: &[u8]) {
+    // Runs under the pane's flush lock: flush_lock -> panes map (current_gen),
+    // flush_lock -> prompts, flush_lock -> channels. Stale generations are dropped.
+    fn output(&self, id: &str, gen: u64, bytes: &[u8]) {
         if let Some(state) = self.app.try_state::<AppState>() {
-            launcher::on_output(&state, id, bytes);
+            if !launcher::on_output(&state, id, gen, bytes) {
+                return;
+            }
         }
         let mut chs = self.channels.lock().unwrap();
         if let Some(ch) = chs.get(id) {
@@ -94,10 +136,10 @@ impl PtySink for AppSink {
     }
 
     // Runs on the pane's waiter thread with no PTY lock held.
-    fn exited(&self, id: &str, code: i32) {
+    fn exited(&self, id: &str, gen: u64, code: i32) {
         if let Some(state) = self.app.try_state::<AppState>() {
-            if !launcher::on_exited(&state, id, code) {
-                return; // stale: a restarted process already owns this id
+            if !launcher::on_exited(&state, id, gen, code) {
+                return; // stale: the id belongs to a newer spawn (or none) — keep its channel
             }
         }
         self.channels.lock().unwrap().remove(id);
@@ -106,12 +148,17 @@ impl PtySink for AppSink {
 }
 
 #[tauri::command]
-fn pty_attach(state: State<'_, AppState>, pane: String, channel: Channel<InvokeResponseBody>) -> Result<Response, String> {
+fn pty_attach(
+    state: State<'_, AppState>,
+    sink: State<'_, Arc<AppSink>>,
+    pane: String,
+    channel: Channel<InvokeResponseBody>,
+) -> Result<Response, String> {
     let mut snap = Vec::new();
-    // snapshot + subscribe under PtyManager's flush lock: no loss, no duplicates
+    // snapshot + subscribe under PtyManager's flush lock (current generation): no loss, no duplicates
     let known = state.pty.attach_with(&pane, |s| {
         snap = s;
-        state.sink.channels.lock().unwrap().insert(pane.clone(), channel);
+        sink.channels.lock().unwrap().insert(pane.clone(), channel);
     });
     if !known {
         return Err(format!("프로세스가 없는 창입니다: {pane}"));
@@ -129,17 +176,11 @@ fn pty_resize(state: State<'_, AppState>, pane: String, cols: u16, rows: u16) ->
     state.pty.resize(&pane, cols, rows)
 }
 
-/// Apply a model command; spawn/kill effects run on the launcher worker afterwards
-/// (statuses then arrive through `workspace-changed`).
+/// Apply a model command (`launcher::execute`); spawn/kill effects run on the launcher worker
+/// afterwards (statuses then arrive through `workspace-changed`).
 #[tauri::command]
 fn ws_command(state: State<'_, AppState>, cmd: WsCommand) -> Result<Snapshot, String> {
-    let fx = {
-        let mut ws = state.ws.lock().unwrap();
-        let loaded = state.loaded.read().unwrap();
-        ws.apply(cmd, &loaded)?
-    };
-    launcher::submit(&state, fx);
-    Ok(launcher::publish(&state))
+    launcher::execute(&state, cmd)
 }
 
 #[tauri::command]
@@ -281,19 +322,8 @@ pub fn run() {
             let sink = Arc::new(AppSink::new(app.handle().clone()));
             let pty = PtyManager::new(sink.clone());
             let (tx, rx) = mpsc::channel();
-            app.manage(AppState {
-                ws: Mutex::new(ws),
-                loaded: RwLock::new(loaded),
-                pty,
-                app: app.handle().clone(),
-                prompts: Mutex::new(HashMap::new()),
-                effects: Mutex::new(tx),
-                sink,
-                version: AtomicU64::new(0),
-                emit_lock: Mutex::new(()),
-                saver,
-                startup_errors,
-            });
+            app.manage(sink.clone()); // pty_attach registers output channels on it
+            app.manage(AppState::new(ws, loaded, pty, sink, tx, saver, startup_errors));
             // spawning happens on the launcher thread: window creation is not blocked
             launcher::start(app.handle(), rx, initial);
 
