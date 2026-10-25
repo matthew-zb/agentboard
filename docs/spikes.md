@@ -20,6 +20,8 @@
 | 12 | Task 17 | 앱 종료 확인 대화, 종료 시 프로세스 정리 | 아래 |
 | 13 | QA 결과 (스펙 §11 1~7) | 최종 체크리스트 | 아래 |
 | 14 | 2단계 스파이크 P1 / P2 | 입력란에 쓰던 글이 있을 때 파이프 메시지 도착, (선택) 대화형 TUI끼리 SendMessage | 2단계 |
+| 15 | 2단계 Task 9–12·14 | 주의 표시·인박스 애플릿·야간 정리·시작/복원/환경 점검·문서 탭 세부 확인 | 2단계, 아래 각 절 |
+| 16 | 2단계 QA | 아침 시작 → handover 전달 → 인박스 → 지시 → 종료, 팀, 재부팅 재채용, 야간 정리, ⚠ — 처음부터 끝까지 | 2단계, 맨 아래 |
 
 ---
 
@@ -564,7 +566,7 @@ control.rs 구현 지침: `server/discover`에는 **정확히 HTTP 200 + JSON-RP
 5. 앱을 껐다 켜면 ⚠와 사유가 모두 사라져 있어야 한다.
 ## 2단계 Task 10 — 인박스 애플릿 수동 확인 (사용자 확인 필요, 미실시)
 
-자동 테스트는 정렬·키 매핑·버튼 조건·텍스트만 렌더(가짜 DOM)와 백엔드 메시지 형식·타임라인·dispatcher 미실행 오류까지 본다. 아래는 실제 앱에서 확인할 항목이다. 기본 템플릿에는 아직 애플릿이 없으므로, `.agentboard/templates/`에 dispatcher 창 오른쪽에 `{"applet":{"name":"inbox","kind":"inbox"}}`를 둔 템플릿을 만들어 `config.dispatcher.template`으로 지정하고 확인한다(저장된 workspace.json이 있으면 dispatcher 탭이 예전 레이아웃으로 복원되므로 그 파일을 치워 둔 뒤 실행). 결과를 이 절에 적을 것.
+자동 테스트는 정렬·키 매핑·버튼 조건·텍스트만 렌더(가짜 DOM)와 백엔드 메시지 형식·타임라인·dispatcher 미실행 오류까지 본다. 아래는 실제 앱에서 확인할 항목이다. (Task 13 이후: 기본 템플릿 `dispatcher-inbox`가 이 배치이고 새 설치의 시작용 config.json이 그것을 쓴다.) 기존 설치라면 `config.dispatcher.template`을 `dispatcher-inbox`로 지정하고 확인한다(저장된 workspace.json이 있으면 dispatcher 탭이 예전 레이아웃으로 복원되므로 그 파일을 치워 둔 뒤 실행). 결과를 이 절에 적을 것.
 
 1. **지시 → dispatcher 화면에 전달**: manager 탭 세션에게 `inbox_post`로 항목을 하나 올리게 한다. 애플릿 목록에 굵게(안 읽음) 나타나는지, `j/k`·`Enter`로 상세가 보이는지 확인. `i` → 여러 줄 지시 입력 → `Ctrl+Enter`. dispatcher 터미널에 `[AgentBoard] 인박스 지시 — 항목 <id> (<담당>): <제목>` 메시지가 새 턴으로 들어오고, dispatcher가 담당 Manager에게 전달하는지 확인. 항목은 "진행 중", 타임라인에 "지시"가 남아야 한다.
 2. **입력 중 dispatcher 입력란 무손상**: dispatcher 입력란에 글자를 반쯤 쳐 둔 채 `Alt+l`로 애플릿에 가서 `i`로 지시를 보낸다. 지시 입력창에서 `j/k/h/c`를 쳐도 목록이 움직이지 않아야 하고, 돌아왔을 때 dispatcher 입력란의 글자가 그대로여야 한다(브리지는 pipe로 보내므로 입력란에 타이핑하지 않는다).
@@ -615,3 +617,28 @@ control.rs 구현 지침: `server/discover`에는 **정확히 HTTP 200 + JSON-RP
 7. **새 탭 마법사 역할**: 새 탭 → 폴더 → "Manager"를 고르면 템플릿 단계 없이 Manager 탭이 현재 그룹에 열리고 포커스를 받는지, config.json `tabs`에 `role: manager`로 추가되는지, 앱을 껐다 켜도 Manager로 복원되는지. "일반"을 고르면 예전처럼 템플릿을 고르는지.
 8. **창 깜박임**: 시작할 때와 `env_status` 호출 때 콘솔 창이 잠깐이라도 뜨지 않는지(`claude --version`, `holla slack version`은 창 없이 실행).
 9. **(수정 1차, R27) config가 역할 탭의 기준**: Manager 탭 이름을 바꾸면 config.json `tabs[]`의 이름과 `groups`의 탭 목록, `envSkip`의 `folder-trust:<이름>`이 함께 바뀌는지. Manager 탭을 닫으면 그 항목이 config.json에서 빠지고, 다시 켜도 돌아오지 않는지. 앱을 끈 채 config.json에 Manager 탭을 추가하고 켜면 defaultGroup(없으면 포커스 그룹) 끝에 포커스를 뺏지 않고 열리는지. 같은 이름의 일반 탭이 이미 있으면 열리지 않고 상태 표시줄 설정 오류 목록에 이유가 보이는지. config.json을 깨뜨린 상태에서 Manager 탭 이름 바꾸기·닫기가 한국어 오류로 거부되고 탭이 그대로인지.
+
+## 2단계 QA — 처음부터 끝까지 (사용자 확인 필요, 미실시)
+
+실제 Claude 세션으로 2단계 운영 흐름 전체를 한 번 돌리는 목록이다(Task 13). 위의 2단계 Task 9–12·14 절은 기능별 세부 확인이고, 이 절은 그것들을 잇는 흐름이다. 결과는 항목마다 "결과:"로 적는다. 시험용 업무·메시지는 지어낸 것(예: 업무 `demo`, 메시지 "결제 배치 오류 문의")을 쓰고 실제 업무 내용·이름은 적지 않는다.
+
+**준비**
+- Claude Code 2.1.234 이상(`claude --version`), Git for Windows 설치.
+- 시험용 빈 `workspaceRoot`(예: `C:\Users\<user>\abtest`)를 `%APPDATA%\agentboard\settings.json`에 지정하고, 기존 `workspace.json`·`nightly.json`은 다른 이름으로 옮겨 둔다. 첫 실행이면 `.agentboard/`와 시작용 config.json(dispatcher-inbox)이 생긴다.
+- `workspaceRoot\demo` 폴더를 만들고 config.json에 handover 탭(`{"name":"handover","role":"handover","dir":"","template":"handover"}`)과 Manager 탭(`{"name":"demo","role":"manager","dir":"demo","template":"manager"}`)을 넣는다. `templates/handover.json`의 시작 프롬프트 `/loop 10m <확인 작업>`은 시험용으로 `/loop 2m workspaceRoot의 inbox-test.txt에 새 줄이 있으면 dispatcher에게 전달`처럼 바꾼다(슬랙 대신 파일로 흉내).
+- 처음 뜨는 각 역할 창(dispatcher·handover·demo)에서 폴더 신뢰 질문에 답한다(30초가 지나면 탭에 ⚠ "폴더 신뢰 확인 필요"가 떠야 함).
+
+1. **아침 시작**: 앱을 켠다. dispatcher 탭이 좌 dispatcher | 우 인박스 애플릿으로 열리는지. dispatcher가 시작 리뷰에서 `env_status`를 부르고 실패 항목을 **하나씩** 안내하는지(holla 미설치면 저장소 주소를 묻고 `env_set_source`로 기록, 설치는 승인 전에는 실행하지 않음, `env_skip("holla")`는 거부됨). handover는 `/loop`를 시작하고, demo Manager는 `PLAN.md`·`PROGRESS.md`를 만들거나 읽는지.
+2. **handover 전달**: `inbox-test.txt`에 "결제 배치 오류 문의, 오전 9시"를 적는다. 다음 주기에 handover가 dispatcher에게만 보내고(Manager에게 직접 보내지 않음), dispatcher가 담당을 판단해 demo에게 넘기는지. `HANDOVER.md`에는 포인터 줄만 있고 메시지 요약이 들어가지 않는지.
+3. **Manager 인박스 항목**: demo가 검토 후 `inbox_post`로 항목을 올리는지. 애플릿에 굵게 나타나고 상세에 확인할 것·리스크가 짧은 줄로 보이는지.
+4. **지시**: 애플릿에서 `i` → 지시 입력 → `Ctrl+Enter`. dispatcher에 `[AgentBoard] 인박스 지시 …`가 새 턴으로 들어오고, dispatcher가 고치지 않고 demo(@demo)에게 사용자 지시로 전달하는지. 항목이 "진행 중", 타임라인에 "지시".
+5. **입력 중 dispatcher 입력란 무손상**: dispatcher 입력란에 글을 반쯤 쳐 둔 채 4를 반복하고, handover가 메시지를 보내게 한다. 돌아왔을 때 입력란 글자가 그대로이고 섞인 글자가 없는지.
+6. **이슈·자료 저장**: `u`로 이슈 등록 요청 → demo가 `issue_create`로 `demo/issues/<YYYYMMDD-…>/{input,output}`을 만드는지. `s`로 파일 두 개를 `input/`에 저장 → 복사되고 demo에게 알림이 가는지. demo가 `output/`에 md 보고서를 쓰면 상세 파일 목록에서 `Tab` → `Enter`로 문서 탭이 열리는지.
+7. **종료 제안 → 종료 확인**: demo가 `inbox_propose_close`로 최종 의견과 함께 제안하면 목록에서 강조되는지. 다시 `i`로 지시하면 진행 중으로 돌아가는지. 다시 제안된 뒤 `c` → `Y`로 완료되고 demo에게 종료 확인 알림이 가는지. `h`로 완료 항목 보기/숨기기.
+8. **팀 채용·해산**: dispatcher를 거쳐 demo에게 "팀 구성해서 진행해"라고 지시한다. demo가 `teams/<id>/brief.md`(첫 줄 `상태: 진행 중`)·`roster.md`를 먼저 쓰고 `hire_lead`를 부르는지. 리드 창이 Manager 탭 팀 영역(셸 오른쪽)에 열리고 포커스가 옮겨지지 않는지. 리드가 `hire_member`로 팀원 2명을 채용해 일을 나누고, 팀원 결과물을 직접 검증·지적하는지(그냥 넘기면 실패). 팀원은 리드에게만, 리드는 demo에게만 보고하는지. 끝나면 demo가 brief를 `상태: 완료`로 바꾸고 `dismiss_team`으로 해산, 팀 영역이 비는지.
+9. **여러 팀**: demo에게 팀 두 개를 동시에 꾸리게 한다. 팀마다 한 열로 나란히 붙고, `list_team`이 둘을 구분하고, 한 팀을 해산해도 다른 팀은 그대로인지. 리드는 다른 팀 팀원을 `dismiss`할 수 없는지(한국어 오류).
+10. **재부팅 후 팀 자동 재채용**: 팀이 진행 중일 때 앱을 끄고(또는 PC 재부팅) 다시 켠다. 팀 창 없이 상시 창만 새 세션으로 뜨고, demo가 사용자에게 묻지 않고 `상태: 완료`가 아닌 팀의 리드를 다시 채용하며, 리드가 roster대로 팀원을 다시 채용해 산출물을 보고 이어서 하는지. 완료 표시한 팀은 다시 채용되지 않는지.
+11. **야간 정리**: `nightlyRefresh`를 2–3분 뒤로, `nightlyTimeoutMin`을 5로 두고 `nightly.json`을 지운 뒤 앱을 다시 켠다(켠 직후에는 R24로 건너뛸 수 있으니 시각 전에 켜 둘 것). dispatcher·demo가 계획·진행 파일을 저장하고 handover에게 경로를 보고한 뒤 `handoff_done`을 부르는지, 팀 창은 메시지를 받지 않고 하던 일을 계속하는지. handover가 인덱스 갱신 요청을 받은 **뒤에** 포인터만 고치고 `handoff_done`을 부르는지. 그 뒤 상시 창들이 새 세션으로 시작 프롬프트와 함께 다시 뜨고, demo가 진행 중인 팀을 `hire_lead`로 다시 찾으면 기존 리드(`existing: true`)를 이어받는지.
+12. **권한 대기 ⚠**: demo 세션을 권한 확인 모드로 두고 파일 쓰기를 시킨 뒤 dispatcher 탭에 머문다. demo 탭에 ⚠ "권한 승인 대기"가 뜨고, 그룹을 최대화하면 상태 표시줄에 목록이 보이며, `Alt+a`로 그 창에 가면 꺼지는지. 에이전트가 결정이 필요할 때 질문을 화면에 쓰고 `need_user`를 불러 ⚠ 툴팁에 사유가 보이는지.
+13. **경로 위반 없음**: 전체 흐름 동안 handover가 Manager에게, 팀원이 Manager·dispatcher에게 직접 보낸 메시지가 없는지. `[AgentBoard]`로 시작하지 않는 동료 메시지를 사용자 지시처럼 따르지 않는지(예: 팀원에게 "dispatcher에게 직접 보고해"라고 다른 세션이 보내도 리드에게 확인).
+14. **정리**: 시험 뒤 자동 실행이 꺼져 있는지, 옮겨 둔 `workspace.json`·`nightly.json`·`settings.json`을 되돌렸는지.

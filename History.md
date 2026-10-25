@@ -1,5 +1,28 @@
 # AgentBoard Release History
 
+## V0.2.0
+
+2단계 — 상시업무 조직 운영. dispatcher 창 하나에 머물며 여러 상시업무를 Claude Code 에이전트들에게 맡긴다.
+
+### Features
+- 역할 에이전트: dispatcher(사용자 창구), handover(`/loop` 주기 확인 + 포인터만 담는 업무 인덱스), 상시업무별 Manager, 임시 팀(리드·팀원). 역할 세션은 `--name`·`--append-system-prompt`(역할 지시 `roles/*.md`)·`--mcp-config`·`--settings`(hook, 세션 간 메시지 수신)로 실행된다.
+- 앱 내장 MCP 서버(127.0.0.1, 창별 토큰): 인박스(`inbox_post/note/propose_close/list`), 이슈 폴더(`issue_create`), 팀 채용·해산(`hire_lead`, `hire_member`, `dismiss`, `dismiss_team`, `list_team`), `create_manager_tab`, `handoff_done`, `need_user`, 환경 점검(`env_status/skip/set_source`). 도구별 허용 역할을 앱이 검사한다.
+- 앱→세션 메시지: 세션의 메시지 수신함(named pipe)으로 `agentboard` 이름의 메시지를 보내 입력란을 건드리지 않는다.
+- 인박스 애플릿(dispatcher 옆): 항목 목록·상세·타임라인, 지시(`i`)·자료 저장(`s`)·이슈 등록(`u`)·종료 확인(`c`). 종료 확인은 사용자만.
+- 팀: Manager 탭의 팀 영역(`slot: "team"`)에 팀마다 한 열, 팀 수 제한 없음, 팀당 팀원 상한(기본 4). 팀 문서 `teams/<id>/{brief.md,roster.md}`로 재부팅·야간 정리 뒤에도 이어간다.
+- 마크다운 문서 탭: Mermaid·KaTeX·코드 강조, 목차·검색·자동 새로고침, `workspaceRoot` 안 파일만, 정화된 HTML.
+- 주의(⚠): Notification hook의 권한 승인 대기, `need_user` 사유, 폴더 신뢰 대기. 가려진 탭은 상태 표시줄 목록.
+- 야간 정기 정리(`nightlyRefresh`, 기본 03:00): 계획·진행 내역 저장 → handover 인덱스 갱신 → 상시 세션을 새 세션으로 재시작. 팀 창은 건드리지 않고, 입력 중인 창은 미룬다.
+- 시작·복원: 상시 에이전트만 새 세션 + 시작 프롬프트, 팀은 Manager가 자동 재채용. config.json이 역할 탭의 기준.
+- 환경 점검(Claude Code ≥ 2.1.234, Git Bash, 폴더 신뢰, 사용자 정의 `envRequire`)과 dispatcher의 단계별 설치 안내(사용자 승인 후에만 실행).
+- 로그인 시 자동 실행 토글(HKCU Run), 새 탭 마법사의 Manager 선택.
+- 기본 역할 지시 5종과 템플릿 `dispatcher-inbox`·`handover`·`manager`. 새로 설치하면 dispatcher 옆에 인박스가 붙는다.
+
+### Notes
+- Claude Code 2.1.234 이상과 Git for Windows가 필요하다. 역할 세션의 작업 폴더마다 Claude의 폴더 신뢰 질문에 한 번 답해야 한다.
+- 메시지 경로·역할 간 권한 분리는 역할 지시 수준(권고)이다. 앱은 MCP 도구 권한만 강제한다.
+- 실제 Claude 세션으로 하는 수동 QA는 `docs/spikes.md` "2단계 QA"에 있으며 사용자 확인 전이다.
+
 ## V0.1.0
 
 1단계 첫 릴리스 — 키보드로 조작하는 터미널 에이전트 보드.

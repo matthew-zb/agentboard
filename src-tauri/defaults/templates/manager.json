@@ -1,0 +1,18 @@
+{
+  "name": "manager",
+  "layout": {
+    "split": "horizontal",
+    "sizes": [60, 40],
+    "slot": "team",
+    "children": [
+      {
+        "pane": {
+          "name": "manager",
+          "focus": true,
+          "prompt": "시작 리뷰: handover 인덱스와 내 작업 계획(PLAN.md)·진행 내역(PROGRESS.md)을 리뷰하고, teams/에 상태가 완료가 아닌 팀이 있으면 다시 채용한 뒤 진행 준비를 하라."
+        }
+      },
+      { "pane": { "name": "shell", "agent": "powershell" } }
+    ]
+  }
+}

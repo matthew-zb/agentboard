@@ -5,10 +5,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_TEMPLATES: [(&str, &str); 3] = [
+const DEFAULT_TEMPLATES: [(&str, &str); 6] = [
     ("dispatcher.json", include_str!("../defaults/templates/dispatcher.json")),
     ("solo.json", include_str!("../defaults/templates/solo.json")),
     ("team-3.json", include_str!("../defaults/templates/team-3.json")),
+    ("dispatcher-inbox.json", include_str!("../defaults/templates/dispatcher-inbox.json")),
+    ("handover.json", include_str!("../defaults/templates/handover.json")),
+    ("manager.json", include_str!("../defaults/templates/manager.json")),
 ];
 const DEFAULT_AGENTS: [(&str, &str); 2] = [
     ("claude.json", include_str!("../defaults/agents/claude.json")),
@@ -1366,17 +1369,32 @@ fn embedded_template(name: &str) -> Template {
     parse_template(text, Path::new(file)).expect("embedded template is valid")
 }
 
-/// Create `.agentboard/` and copy embedded defaults (keybindings.json starts as `{}`: user
-/// overrides only) — never overwrites existing files.
+/// `config.json` written only when `.agentboard/` itself is new (a fresh install): the
+/// Dispatcher tab gets the inbox applet. Existing installs keep whatever they have.
+const STARTER_CONFIG: &str = r#"{
+  "dispatcher": { "agent": "claude", "template": "dispatcher-inbox" }
+}
+"#;
+
+/// Create `.agentboard/` and copy embedded defaults — templates, agent profiles, role
+/// instructions (`roles/<role>.md`), keybindings.json as `{}` (user overrides only) and, on a
+/// fresh install only, a starter config.json. Never overwrites existing files.
 pub fn ensure_dotdir(root: &Path) -> Result<(), String> {
     let dot = root.join(".agentboard");
+    let fresh = !dot.exists();
     let tdir = dot.join("templates");
     let adir = dot.join("agents");
-    std::fs::create_dir_all(&tdir).map_err(|e| format!("{}: {e}", tdir.display()))?;
-    std::fs::create_dir_all(&adir).map_err(|e| format!("{}: {e}", adir.display()))?;
+    let rdir = dot.join("roles");
+    for d in [&tdir, &adir, &rdir] {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
     let mut files: Vec<(PathBuf, &str)> =
         DEFAULT_TEMPLATES.iter().map(|(n, c)| (tdir.join(n), *c)).collect();
     files.extend(DEFAULT_AGENTS.iter().map(|(n, c)| (adir.join(n), *c)));
+    files.extend(Role::ALL.iter().map(|r| (rdir.join(format!("{}.md", r.as_str())), crate::agentcfg::default_role_prompt(*r))));
+    if fresh {
+        files.push((dot.join("config.json"), STARTER_CONFIG));
+    }
     crate::profiles::ensure_powershell_profile(&adir);
     // Overrides only: defaults always come from the embedded file, so a full copy here would
     // shadow future default changes. Existing files (incl. phase-1 full copies) stay as they are.
@@ -1678,6 +1696,73 @@ mod tests {
         std::fs::write(dot.join("templates/solo.json"), "MINE").unwrap();
         ensure_dotdir(d.path()).unwrap();
         assert_eq!(std::fs::read_to_string(dot.join("templates/solo.json")).unwrap(), "MINE");
+    }
+
+    #[test]
+    fn ensure_dotdir_copies_roles_and_new_templates_without_overwrite() {
+        let d = tempfile::tempdir().unwrap();
+        ensure_dotdir(d.path()).unwrap();
+        let dot = d.path().join(".agentboard");
+        for r in Role::ALL {
+            let p = dot.join("roles").join(format!("{}.md", r.as_str()));
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), crate::agentcfg::default_role_prompt(r), "{}", p.display());
+        }
+        for t in ["dispatcher", "solo", "team-3", "dispatcher-inbox", "handover", "manager"] {
+            assert!(dot.join(format!("templates/{t}.json")).exists(), "{t}");
+        }
+        // fresh install: a starter config.json puts the inbox applet next to the dispatcher
+        let cfg = std::fs::read_to_string(dot.join("config.json")).unwrap();
+        let (c, errs) = parse_config(&cfg, Path::new("config.json")).unwrap();
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(c.dispatcher.template, "dispatcher-inbox");
+
+        // user files are never overwritten
+        std::fs::write(dot.join("roles/manager.md"), "MINE").unwrap();
+        std::fs::write(dot.join("templates/manager.json"), "MINE").unwrap();
+        std::fs::write(dot.join("config.json"), "{}").unwrap();
+        std::fs::remove_file(dot.join("roles/lead.md")).unwrap();
+        ensure_dotdir(d.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(dot.join("roles/manager.md")).unwrap(), "MINE");
+        assert_eq!(std::fs::read_to_string(dot.join("templates/manager.json")).unwrap(), "MINE");
+        assert_eq!(std::fs::read_to_string(dot.join("config.json")).unwrap(), "{}");
+        assert!(dot.join("roles/lead.md").exists(), "a deleted default comes back");
+
+        // an existing .agentboard without config.json (phase-1 user) gets no starter config
+        std::fs::remove_file(dot.join("config.json")).unwrap();
+        ensure_dotdir(d.path()).unwrap();
+        assert!(!dot.join("config.json").exists());
+    }
+
+    #[test]
+    fn new_default_templates_validate() {
+        let known = agents(&["claude", "cmd", "powershell"]);
+        let tpl_of = |name: &str| {
+            let (file, text) = DEFAULT_TEMPLATES.iter().find(|(n, _)| *n == format!("{name}.json")).expect(name);
+            let t = parse_template(text, Path::new(file)).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let errs = validate_template(&t, Path::new(file), &known);
+            assert!(errs.is_empty(), "{name}: {errs:?}");
+            assert_eq!(t.name, name);
+            t
+        };
+        // dispatcher-inbox: dispatcher (focus, start prompt) | inbox applet on the right
+        let t = tpl_of("dispatcher-inbox");
+        let LayoutNode::Split { dir: Dir::Horizontal, .. } = &t.layout else { panic!("horizontal split") };
+        let l = t.layout.leaves();
+        assert_eq!((l[0].name.as_str(), l[0].applet.as_deref(), l[0].focus), ("dispatcher", None, true));
+        assert!(l[0].prompt.as_deref().is_some_and(|p| p.contains("env_status") && !p.contains('\n')));
+        assert_eq!((l[1].name.as_str(), l[1].applet.as_deref()), ("inbox", Some("inbox")));
+        // handover: one pane whose start prompt is the /loop example the user edits
+        let t = tpl_of("handover");
+        let l = t.layout.leaves();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].prompt.as_deref(), Some("/loop 10m <확인 작업>"));
+        // manager: the Manager pane (focus) inside the template's team area (slot "team")
+        let t = tpl_of("manager");
+        let LayoutNode::Split { slot, .. } = &t.layout else { panic!("split") };
+        assert_eq!(slot.as_deref(), Some(crate::workspace::TEAM_SLOT));
+        let l = t.layout.leaves();
+        assert_eq!((l[0].name.as_str(), l[0].focus, l[0].agent.as_deref()), ("manager", true, None));
+        assert!(l[0].prompt.as_deref().is_some_and(|p| p.contains("teams/") && !p.contains('\n')));
     }
 
     #[test]
@@ -2031,6 +2116,8 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let a = appdata_with_root(root.path());
             ensure_dotdir(root.path()).unwrap();
+            // no config.json (the fresh-install starter would pick dispatcher-inbox)
+            std::fs::remove_file(root.path().join(".agentboard/config.json")).unwrap();
             let tp = root.path().join(".agentboard/templates");
             match content {
                 None => std::fs::remove_file(tp.join("dispatcher.json")).unwrap(),

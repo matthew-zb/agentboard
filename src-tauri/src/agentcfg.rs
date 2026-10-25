@@ -126,12 +126,12 @@ pub fn settings_json(exe: &Path) -> serde_json::Value {
     json!({ "crossSessionInbound": "accept", "hooks": hooks })
 }
 
-/// Role instructions: `<workspaceRoot>/.agentboard/<roles.<role>.systemPromptFile>` when set
-/// and present, else the embedded default. A file that exists but cannot be read is an error.
+/// Role instructions: `<workspaceRoot>/.agentboard/<roles.<role>.systemPromptFile>`, where an
+/// unset key means `roles/<role>.md` (the copy `ensure_dotdir` makes for the user to edit);
+/// a missing file falls back to the embedded default. A file that exists but cannot be read is
+/// an error.
 pub fn role_prompt(role: Role, cfg: &Loaded) -> Result<String, String> {
-    let Some(rel) = cfg.config.role_config(role).system_prompt_file else {
-        return Ok(default_role_prompt(role).to_string());
-    };
+    let rel = cfg.config.role_config(role).system_prompt_file.unwrap_or_else(|| format!("roles/{}.md", role.as_str()));
     let path = cfg.settings.workspace_root.join(".agentboard").join(&rel);
     match std::fs::read_to_string(&path) {
         Ok(s) => Ok(s),
@@ -393,6 +393,47 @@ mod tests {
         for r in Role::ALL {
             assert!(!default_role_prompt(r).trim().is_empty());
         }
+    }
+
+    #[test]
+    fn role_files_load_from_dotdir_roles_by_default() {
+        // no systemPromptFile: the copied `.agentboard/roles/<role>.md` (user-editable) is used
+        let (loaded, root, _a) = loaded_with(r#"{"defaultAgent":"cmd"}"#);
+        let roles = root.path().join(".agentboard/roles");
+        for r in Role::ALL {
+            assert_eq!(role_prompt(r, &loaded).unwrap(), default_role_prompt(r), "{}", r.as_str());
+        }
+        std::fs::write(roles.join("lead.md"), "다듬은 리드 지시").unwrap();
+        assert_eq!(role_prompt(Role::Lead, &loaded).unwrap(), "다듬은 리드 지시");
+        // a deleted file falls back to the embedded default
+        std::fs::remove_file(roles.join("member.md")).unwrap();
+        assert_eq!(role_prompt(Role::Member, &loaded).unwrap(), default_role_prompt(Role::Member));
+    }
+
+    #[test]
+    fn default_role_prompts_cover_the_rules_and_fit_a_cmd_line() {
+        for r in Role::ALL {
+            let p = default_role_prompt(r);
+            // R3 / R7 / routing are in every prompt
+            for must in ["need_user", "[AgentBoard]", "agentboard", "SendMessage", "‹"] {
+                assert!(p.contains(must), "{}: missing {must}", r.as_str());
+            }
+            assert!(!p.contains("임시 기본 지시"), "{}: placeholder left", r.as_str());
+            // cmd.exe caps a command line at 8191 chars; the flattened prompt plus the other
+            // role args must stay well inside it (R18/R19)
+            let n = single_line(p).chars().count();
+            assert!(n <= 4000, "{}: {n} chars after flattening", r.as_str());
+        }
+        let has = |r: Role, words: &[&str]| {
+            for w in words {
+                assert!(default_role_prompt(r).contains(w), "{}: missing {w}", r.as_str());
+            }
+        };
+        has(Role::Dispatcher, &["env_status", "env_skip", "env_set_source", "create_manager_tab", "handoff_done", "README"]);
+        has(Role::Handover, &["/loop", "HANDOVER.md", "handoff_done"]);
+        has(Role::Manager, &["inbox_post", "inbox_propose_close", "issue_create", "brief.md", "roster.md", "hire_lead", "상태: 완료", "handoff_done"]);
+        has(Role::Lead, &["hire_member", "dismiss", "brief.md", "roster.md"]);
+        has(Role::Member, &["-lead"]);
     }
 
     #[test]

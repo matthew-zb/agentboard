@@ -1155,7 +1155,8 @@ mod tests {
         // config.json: the tab is appended, everything else kept (values and key order)
         let text = f.config_text();
         let v: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["tabs"][1], json!({"name":"ops","dir":"ops","role":"manager"}), "{text}");
+        // the shipped `manager` template (Task 13) is chosen and recorded
+        assert_eq!(v["tabs"][1], json!({"name":"ops","dir":"ops","role":"manager","template":"manager"}), "{text}");
         assert_eq!(v["nightlyRefresh"], "04:30");
         assert_eq!(v["groups"]["children"][1]["group"]["tabs"], json!(["billing"]));
         let pos = |k: &str| text.find(k).unwrap();
@@ -1365,9 +1366,17 @@ mod tests {
         assert_eq!(t.role, Some(Role::Manager));
         // user action: the new tab is the focused group's active tab
         assert_eq!(ws.groups[&ws.focus.group_id].active_tab_id, t.id);
-        // no manager template shipped yet → defaultTemplate, not written to config (R2)
+        // the shipped `manager` template: the Manager pane in the team area (slot "team")
         let v: Value = serde_json::from_str(&f.config_text()).unwrap();
-        assert_eq!(v["tabs"][0], json!({"name":"sales","dir":"sales","role":"manager"}));
+        assert_eq!(v["tabs"][0], json!({"name":"sales","dir":"sales","role":"manager","template":"manager"}));
+        assert!(matches!(&t.layout, crate::layout::LayoutNode::Split { slot: Some(s), .. } if s == crate::workspace::TEAM_SLOT));
+        drop(ws);
+        // without a manager template → defaultTemplate, not written to config (R2)
+        f.state.loaded.write().unwrap().templates.remove("manager");
+        std::fs::create_dir_all(f.root.join("ops")).unwrap();
+        create_manager_tab_ui(&f.state, "ops".into(), "ops".into()).unwrap();
+        let v: Value = serde_json::from_str(&f.config_text()).unwrap();
+        assert_eq!(v["tabs"][1], json!({"name":"ops","dir":"ops","role":"manager"}));
         // a missing folder is refused (the wizard creates it first)
         assert!(create_manager_tab_ui(&f.state, "x".into(), "nope".into()).is_err());
     }

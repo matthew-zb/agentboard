@@ -1,0 +1,17 @@
+{
+  "name": "dispatcher-inbox",
+  "layout": {
+    "split": "horizontal",
+    "sizes": [60, 40],
+    "children": [
+      {
+        "pane": {
+          "name": "dispatcher",
+          "focus": true,
+          "prompt": "시작 리뷰: 역할 지시의 시작 절차대로 env_status로 환경을 확인하고, handover 인덱스(HANDOVER.md)와 인박스(inbox_list)를 리뷰해 진행 준비를 하라."
+        }
+      },
+      { "applet": { "name": "inbox", "kind": "inbox" } }
+    ]
+  }
+}
