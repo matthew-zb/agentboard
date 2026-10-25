@@ -61,6 +61,7 @@ struct Entry {
     ring: Arc<Mutex<RingBuffer>>,
     running: Arc<AtomicBool>,
     batch: Arc<Batch>,
+    pid: Option<u32>,
 }
 
 pub struct PtyManager {
@@ -150,7 +151,7 @@ impl PtyManager {
             let mut err = None;
             let mut self_assigned = false;
             let job = match crate::winjob::JobGuard::new() {
-                Ok(j) => {
+                Ok(mut j) => {
                     if assign_self {
                         match j.assign_self() {
                             Ok(()) => self_assigned = true,
@@ -179,6 +180,12 @@ impl PtyManager {
     /// Last job object problem (creation, self-assignment or per-child assignment).
     pub fn job_error(&self) -> Option<String> {
         self.job_error.lock().unwrap().clone()
+    }
+
+    /// Test-only: OS pid of the pane's process.
+    #[doc(hidden)]
+    pub fn pid(&self, id: &str) -> Option<u32> {
+        self.entry(id).and_then(|e| e.pid)
     }
 
     /// Test-only: bytes currently queued between reader and sink.
@@ -236,6 +243,7 @@ impl PtyManager {
             ring: ring.clone(),
             running: running.clone(),
             batch: batch.clone(),
+            pid: child.process_id(),
         });
         let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
 

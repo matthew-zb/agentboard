@@ -172,3 +172,61 @@ fn pending_is_bounded_when_sink_stalls() {
     assert!(wait_until(|| sink.exit("p7").is_some()));
     assert!(sink.text("p7").len() > 1_400_000);
 }
+
+// ---- production path (PtyManager::new, self-assigned job) via re-exec ----
+
+struct Quiet;
+impl PtySink for Quiet {
+    fn output(&self, _: &str, _: &[u8]) {}
+    fn exited(&self, _: &str, _: i32) {}
+}
+
+/// Helper, only active when re-executed by `job_kills_children_when_app_exits`.
+#[test]
+fn job_child_helper() {
+    if std::env::var("AGENTBOARD_JOB_CHILD").is_err() {
+        return;
+    }
+    let m = PtyManager::new(Arc::new(Quiet));
+    m.spawn("j", spec("ping", &["-n", "60", "127.0.0.1"], cwd())).unwrap();
+    println!("CHILDPID={}", m.pid("j").unwrap());
+    // dropping the manager must NOT kill us (handle is leaked on purpose)
+    drop(m);
+    std::thread::sleep(Duration::from_millis(200));
+    println!("ALIVE_AFTER_DROP");
+    // exit without running destructors: only the OS-closed job handle can kill ping
+    std::process::exit(0);
+}
+
+fn pid_alive(pid: u32) -> bool {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+}
+
+#[test]
+fn job_kills_children_when_app_exits() {
+    if std::env::var("AGENTBOARD_JOB_CHILD").is_ok() {
+        return;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "job_child_helper", "--nocapture", "--test-threads=1"])
+        .env("AGENTBOARD_JOB_CHILD", "1")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("ALIVE_AFTER_DROP"), "helper output: {text}");
+    let pid: u32 = text
+        .split("CHILDPID=")
+        .nth(1)
+        .expect("pid line")
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(wait_until(|| !pid_alive(pid)), "ping {pid} survived app exit");
+}
