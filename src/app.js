@@ -437,9 +437,14 @@ function renderStatus(snap) {
 // (`env-changed`) and after model changes (folder-trust items follow pane state).
 let envItems = null;
 let envPending = false;
+let envAgain = false; // a request that arrived while one was in flight: run once more after
 function refreshEnv() {
-  if (envPending) return;
+  if (envPending) {
+    envAgain = true;
+    return;
+  }
   envPending = true;
+  envAgain = false;
   api
     .envStatus()
     .then((items) => {
@@ -448,7 +453,10 @@ function refreshEnv() {
       if (changed && current) renderStatus(current);
     })
     .catch(() => {})
-    .finally(() => (envPending = false));
+    .finally(() => {
+      envPending = false;
+      if (envAgain) refreshEnv();
+    });
 }
 
 /**

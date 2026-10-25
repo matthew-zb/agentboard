@@ -92,6 +92,11 @@
 //!   then `loaded(write)` alone around the atomic config.json edit and the in-memory update,
 //!   then emit `env-changed` after releasing both. The new-tab wizard's Manager choice
 //!   (`create_manager_tab` Tauri command) runs the same code path as the MCP tool.
+//!   R27 (fix round 1): `execute` of `RenameTab` / `CloseTab` on a Manager / handover tab takes
+//!   `CONFIG_WRITE` itself (dry run under `ws -> loaded(read)`, released; config.json edit under
+//!   `loaded(write)` alone; then the model; rollback on failure). So no code may call `execute`
+//!   with one of those commands while holding `CONFIG_WRITE` (nothing does: `create_manager_tab`
+//!   only executes `CreateTab` under it).
 //! * Environment check (envcheck.rs, Task 12): `AppState::env` (probe results) and its
 //!   refresh lock are leaves; the probe processes run holding only the refresh lock. Reading
 //!   items takes `ws` (clone, released), `loaded(read)`, and `trust` → PtyManager `panes`
@@ -106,7 +111,8 @@
 //! across PtyManager calls.
 
 use crate::agentcfg::PLACEHOLDER_CTRL_URL;
-use crate::config::Loaded;
+use crate::config::{self, Loaded};
+use crate::roles::Role;
 use crate::profiles::{encode_submit, AgentProfile, ReadyDetector, READY_TIMEOUT};
 use crate::pty::SpawnSpec;
 use crate::workspace::{Effects, Pane, PaneStatus, TabId, Workspace, WsCommand};
@@ -322,6 +328,67 @@ pub fn publish(state: &AppState) -> Snapshot {
 /// read), release both, queue the effects for the launcher worker, then publish. Returns the
 /// exact snapshot that was emitted. A rejected command changes nothing, emits nothing.
 pub fn execute(state: &AppState, cmd: WsCommand) -> Result<Snapshot, String> {
+    match role_tab_config_edit(state, &cmd) {
+        Some((name, dir, edit)) => execute_with_config(state, cmd, &name, &dir, &edit),
+        None => execute_model(state, cmd),
+    }
+}
+
+/// R27: renaming / closing a Manager or handover tab also edits its config.json `tabs[]`
+/// entry (config is the source of truth for role tabs). `(name, dir, edit)` of that entry, or
+/// `None` for every other command. Takes `ws` briefly (released).
+fn role_tab_config_edit(state: &AppState, cmd: &WsCommand) -> Option<(String, String, config::TabEntryEdit)> {
+    let (tab, edit) = match cmd {
+        WsCommand::RenameTab { tab, name } => (tab, config::TabEntryEdit::Rename(name.clone())),
+        WsCommand::CloseTab { tab } => (tab, config::TabEntryEdit::Remove),
+        _ => return None,
+    };
+    let ws = state.ws.lock().unwrap();
+    let t = ws.tabs.get(tab)?;
+    matches!(t.role, Some(Role::Manager | Role::Handover)).then(|| (t.name.clone(), t.dir.clone(), edit))
+}
+
+/// Same pattern as `create_manager_tab`: under `CONFIG_WRITE` — dry run on a copy of the model,
+/// then config.json (atomic, other keys kept) + the loaded config, then the model; a failed
+/// apply puts both back. A config write failure refuses the command (Korean error, nothing
+/// changed).
+fn execute_with_config(state: &AppState, cmd: WsCommand, name: &str, dir: &str, edit: &config::TabEntryEdit) -> Result<Snapshot, String> {
+    let _cfg = config::CONFIG_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let ws = state.ws.lock().unwrap();
+        let loaded = state.loaded.read().unwrap();
+        ws.clone().apply(cmd.clone(), &loaded)?;
+    }
+    let what = if matches!(edit, config::TabEntryEdit::Remove) { "을(를) 닫지" } else { "의 이름을 바꾸지" };
+    let (path, prev_text, prev_cfg) = {
+        let mut l = state.loaded.write().unwrap();
+        let path = config::config_path(&l.settings.workspace_root);
+        let res = config::edit_tab_entry(&path, name, dir, edit)
+            .map_err(|e| format!("config.json을 고칠 수 없어 탭 '{name}'{what} 않았습니다 — {e}"))?;
+        let prev_cfg = l.config.clone();
+        l.config.apply_tab_entry_edit(name, dir, edit);
+        let prev_text = match res {
+            config::ConfigEdit::Written(prev) => Some(prev),
+            config::ConfigEdit::Unchanged => None,
+        };
+        (path, prev_text, prev_cfg)
+    };
+    let res = execute_model(state, cmd);
+    if res.is_err() {
+        state.loaded.write().unwrap().config = prev_cfg;
+        if let Some(prev) = prev_text {
+            if let Err(re) = config::restore_config_file(&path, prev.as_deref()) {
+                return res.map_err(|e| format!("{e} (config.json을 되돌리지 못했습니다: {re})"));
+            }
+        }
+    }
+    if res.is_ok() {
+        state.ui.env_changed(); // folder-trust ids follow the tab
+    }
+    res
+}
+
+fn execute_model(state: &AppState, cmd: WsCommand) -> Result<Snapshot, String> {
     let fx = {
         let mut ws = state.ws.lock().unwrap();
         let loaded = state.loaded.read().unwrap();

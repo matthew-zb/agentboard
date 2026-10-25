@@ -1053,6 +1053,111 @@ pub fn set_env_source(path: &Path, id: &str, url: &str, defaults: &[EnvRequire])
     })
 }
 
+// ───────────────────────── role tab entries (R27) ─────────────────────────
+
+/// What happens to a role tab's `tabs[]` entry when the user renames or closes the tab.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TabEntryEdit {
+    Rename(String),
+    Remove,
+}
+
+/// Apply `edit` to the name in every `groups` leaf's `tabs` list (rename / drop).
+fn edit_group_names(v: &mut serde_json::Value, old: &str, edit: &TabEntryEdit) {
+    match v {
+        serde_json::Value::Object(m) => {
+            if let Some(tabs) = m.get_mut("group").and_then(|g| g.get_mut("tabs")).and_then(|t| t.as_array_mut()) {
+                match edit {
+                    TabEntryEdit::Rename(new) => tabs.iter_mut().filter(|t| t.as_str() == Some(old)).for_each(|t| *t = new.clone().into()),
+                    TabEntryEdit::Remove => tabs.retain(|t| t.as_str() != Some(old)),
+                }
+            }
+            if let Some(children) = m.get_mut("children") {
+                edit_group_names(children, old, edit);
+            }
+        }
+        serde_json::Value::Array(a) => a.iter_mut().for_each(|c| edit_group_names(c, old, edit)),
+        _ => {}
+    }
+}
+
+/// The folder-trust env id of tab `name`.
+pub fn trust_env_id(name: &str) -> String {
+    format!("{ENV_TRUST_PREFIX}{name}")
+}
+
+/// Rename / remove the `tabs[]` entry `name` + `dir` of the config.json at `path` (R27: config
+/// is the source of truth for role tabs). The tab's name also changes / goes away in the
+/// `groups` lists, and an `envSkip` entry `folder-trust:<name>` follows (so a skip survives a
+/// rename). No matching entry → `Unchanged`. Renaming onto a name another entry already has is
+/// an error. Callers hold [`CONFIG_WRITE`].
+pub fn edit_tab_entry(path: &Path, name: &str, dir: &str, edit: &TabEntryEdit) -> Result<ConfigEdit, String> {
+    edit_config_json(path, |obj| {
+        let Some(tabs) = obj.get_mut("tabs").and_then(|t| t.as_array_mut()) else { return Ok(false) };
+        let entry_dir = |v: &serde_json::Value| v.get("dir").and_then(|d| d.as_str()).unwrap_or("").to_string();
+        let Some(i) = tabs.iter().position(|v| v.get("name").and_then(|n| n.as_str()) == Some(name) && entry_dir(v) == dir) else {
+            return Ok(false);
+        };
+        match edit {
+            TabEntryEdit::Rename(new) => {
+                if tabs.iter().any(|v| v.get("name").and_then(|n| n.as_str()) == Some(new.as_str())) {
+                    return Err(format!("config.json에 이름이 '{new}'인 다른 탭이 이미 있습니다"));
+                }
+                tabs[i].as_object_mut().ok_or("config.json의 tabs 항목이 객체가 아닙니다")?.insert("name".into(), new.clone().into());
+            }
+            TabEntryEdit::Remove => {
+                tabs.remove(i);
+            }
+        }
+        if let Some(g) = obj.get_mut("groups") {
+            edit_group_names(g, name, edit);
+        }
+        if let Some(skip) = obj.get_mut("envSkip").and_then(|s| s.as_array_mut()) {
+            let old_id = trust_env_id(name);
+            match edit {
+                TabEntryEdit::Rename(new) => {
+                    let new_id = trust_env_id(new);
+                    let had = skip.iter().any(|s| s.as_str() == Some(old_id.as_str()));
+                    skip.retain(|s| s.as_str() != Some(old_id.as_str()));
+                    if had && !skip.iter().any(|s| s.as_str() == Some(new_id.as_str())) {
+                        skip.push(new_id.into());
+                    }
+                }
+                TabEntryEdit::Remove => skip.retain(|s| s.as_str() != Some(old_id.as_str())),
+            }
+        }
+        Ok(true)
+    })
+}
+
+impl Config {
+    /// The in-memory side of [`edit_tab_entry`] (same rules; no matching entry → no change).
+    pub fn apply_tab_entry_edit(&mut self, name: &str, dir: &str, edit: &TabEntryEdit) {
+        let Some(i) = self.tabs.iter().position(|t| t.name == name && t.dir == dir) else { return };
+        match edit {
+            TabEntryEdit::Rename(new) => self.tabs[i].name = new.clone(),
+            TabEntryEdit::Remove => {
+                self.tabs.remove(i);
+            }
+        }
+        if let Some(g) = &mut self.groups {
+            g.for_each_leaf_mut(|spec: &mut GroupSpec| match edit {
+                TabEntryEdit::Rename(new) => spec.tabs.iter_mut().filter(|t| *t == name).for_each(|t| *t = new.clone()),
+                TabEntryEdit::Remove => spec.tabs.retain(|t| t != name),
+            });
+        }
+        let old_id = trust_env_id(name);
+        let had = self.env_skip.contains(&old_id);
+        self.env_skip.retain(|s| *s != old_id);
+        if let (TabEntryEdit::Rename(new), true) = (edit, had) {
+            let new_id = trust_env_id(new);
+            if !self.env_skip.contains(&new_id) {
+                self.env_skip.push(new_id);
+            }
+        }
+    }
+}
+
 pub fn validate_config(c: &Config, file: &Path) -> Vec<ConfigError> {
     sanitize_config(c.clone(), file).1
 }

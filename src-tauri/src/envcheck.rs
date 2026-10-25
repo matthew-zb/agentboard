@@ -40,6 +40,8 @@ pub const CLAUDE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 /// `env_status` (MCP) reruns the probes when the cached results are older than this.
 pub const CACHE_TTL: Duration = Duration::from_secs(10);
+/// Captured stdout of a check (the rest is read and discarded).
+pub const OUTPUT_CAP: u64 = 64 * 1024;
 
 /// One environment check result (MCP `env_status`, status bar).
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -164,7 +166,9 @@ pub fn check_all(cfg: &Loaded, ws: &Workspace, probe: &dyn EnvProbe) -> Vec<EnvI
         source: None,
     });
 
-    // folder trust, one item per tab with a standing role agent
+    // folder trust, one item per tab with a standing role agent. Without Git Bash no hook runs,
+    // so a missing SessionStart may not mean an unanswered trust question.
+    let no_hooks = !ok;
     for t in ws.tabs.values() {
         let Some(pane) = ws.standing_pane(&t.id) else { continue };
         let id = format!("{ENV_TRUST_PREFIX}{}", t.name);
@@ -172,7 +176,11 @@ pub fn check_all(cfg: &Loaded, ws: &Workspace, probe: &dyn EnvProbe) -> Vec<EnvI
         out.push(EnvItem {
             ok: !timed_out,
             detail: if timed_out {
-                format!("'{}' 에이전트가 30초 안에 시작을 알리지 않았습니다 — 폴더 신뢰 질문을 기다리는 중일 수 있습니다 ({})", t.name, t.workspace.display())
+                let mut d = format!("'{}' 에이전트가 30초 안에 시작을 알리지 않았습니다 — 폴더 신뢰 질문을 기다리는 중일 수 있습니다 ({})", t.name, t.workspace.display());
+                if no_hooks {
+                    d.push_str(" — Git Bash가 없어 hook이 실행되지 않았을 수도 있습니다(git-bash 항목 참고)");
+                }
+                d
             } else {
                 t.workspace.display().to_string()
             },
@@ -264,7 +272,9 @@ pub fn run_shell(command: &str, timeout: Duration) -> RunResult {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(o) = out.as_mut() {
-            let _ = o.take(64 * 1024).read_to_end(&mut buf);
+            let _ = o.take(OUTPUT_CAP).read_to_end(&mut buf);
+            // keep draining past the cap so a chatty check never blocks on a full pipe
+            let _ = std::io::copy(o, &mut std::io::sink());
         }
         let _ = tx.send(buf);
     });
@@ -640,6 +650,15 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(3), "returned at the timeout: {:?}", t.elapsed());
         std::thread::sleep(Duration::from_secs(5));
         assert!(!marker.exists(), "the grandchild survived the timeout");
+
+        // output past the capture cap is drained, not mistaken for a hang
+        let big = dir.path().join("big.txt");
+        std::fs::write(&big, "x".repeat(300 * 1024)).unwrap();
+        let t = Instant::now();
+        let r = run_shell(&format!("type \"{}\"", big.display()), CHECK_TIMEOUT);
+        assert_eq!(r.outcome, CheckOutcome::Ok);
+        assert_eq!(r.stdout.len() as u64, OUTPUT_CAP);
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
 
         // exit codes
         assert_eq!(run_shell("exit 0", CHECK_TIMEOUT).outcome, CheckOutcome::Ok);

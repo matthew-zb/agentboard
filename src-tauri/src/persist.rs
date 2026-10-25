@@ -129,14 +129,25 @@ pub fn load(path: &Path) -> Result<Option<Workspace>, LoadError> {
 /// model is only touched through `Workspace::restore_roles` (see there for the exact rules).
 /// The result passes `normalize_and_validate`; callers still check and fall back to a fresh
 /// start if it does not.
-pub fn restore_plan(mut ws: Workspace, loaded: &Loaded) -> (Workspace, Effects) {
-    let fx = ws.restore_roles(loaded);
-    (ws, fx)
+/// The third value lists Korean messages for config role tabs that could not be added (R27,
+/// shown as startup errors).
+pub fn restore_plan(mut ws: Workspace, loaded: &Loaded) -> (Workspace, Effects, Vec<String>) {
+    let (fx, errors) = ws.restore_roles(loaded);
+    (ws, fx, errors)
 }
 
-/// In-place form of [`restore_plan`].
+/// In-place form of [`restore_plan`] (messages dropped).
 pub fn prepare_restored(ws: &mut Workspace, loaded: &Loaded) -> Effects {
-    ws.restore_roles(loaded)
+    ws.restore_roles(loaded).0
+}
+
+/// Move `path` to `<path>.bak` (replacing an older one) before a fresh start would overwrite a
+/// workspace.json that loaded but could not be restored. `Ok` also when there is no file.
+pub fn move_to_bak(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::rename(path, sibling(path, ".bak")).map_err(|e| format!("작업 상태 파일을 백업할 수 없습니다: {} — {e}", path.display()))
 }
 
 enum Msg {
@@ -582,7 +593,8 @@ mod tests {
         assert_eq!(ws.panes.values().filter(|p| p.team.is_some()).count(), 4);
         let saved = reload(&ws);
 
-        let (back, fx) = restore_plan(saved, &l);
+        let (back, fx, errs) = restore_plan(saved, &l);
+        assert!(errs.is_empty(), "{errs:?}");
         // team panes and areas gone, layout back to the template's, teamSeq reset
         assert!(back.panes.values().all(|p| p.team.is_none() && !matches!(p.role, Some(Role::Lead | Role::Member))));
         assert_eq!(back.tabs[&billing].layout, before_layout, "team area collapsed into the Manager pane");
@@ -591,7 +603,7 @@ mod tests {
             assert_no_degenerate_splits(&t.layout);
         }
         let mgr = back.standing_pane(&billing).unwrap();
-        assert_eq!(back.tabs[&billing].last_focused_pane_id, before_layout.leaves()[0]);
+        assert_eq!(back.tabs[&billing].last_focused_pane_id, mgr, "focus falls back to the Manager");
         assert_eq!(back.tabs[&billing].maximized_pane_id, None);
         // standing panes: new session + start prompt; everything else as in phase 1
         let inject: BTreeMap<String, bool> = fx.spawn.iter().cloned().collect();
@@ -628,7 +640,8 @@ mod tests {
     fn non_role_tabs_restore_as_phase1() {
         let l = loaded();
         let ws = reload(&busy(&l));
-        let (back, fx) = restore_plan(ws.clone(), &l);
+        let (back, fx, errs) = restore_plan(ws.clone(), &l);
+        assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(fx.spawn.len(), back.panes.len());
         assert!(fx.kill.is_empty());
         let ids: Vec<_> = fx.spawn.iter().map(|(p, _)| p.clone()).collect();
@@ -704,7 +717,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(path(&dir), phase1).unwrap();
         let ws = load(&path(&dir)).unwrap().unwrap();
-        let (back, fx) = restore_plan(ws, &l);
+        let (back, fx, errs) = restore_plan(ws, &l);
+        // config's handover tab is not added: the plain tab "handover" (other dir) keeps the name
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("'handover'") && errs[0].contains("같은 이름"), "{errs:?}");
+        assert_eq!(back.tabs.values().filter(|t| t.name == "handover").count(), 1);
         let inject: BTreeMap<String, bool> = fx.spawn.iter().cloned().collect();
         let role = |p: &str| (back.panes[p].role, back.panes[p].session_name.clone(), inject[p]);
         // dispatcher: always; the template's pane by name
@@ -730,13 +747,53 @@ mod tests {
         let mut with_team = back.clone();
         with_team.apply(WsCommand::AddTeamPane { tab: "t2".into(), team: "x".into(), role: Role::Lead, prompt: None }, &l).unwrap();
         let (l2, _root2) = loaded_with(r#"{"tabs":[{"name":"billing","dir":"billing","template":"mgr"}]}"#);
-        let (plain, fx) = restore_plan(reload(&with_team), &l2);
+        let (plain, fx, _) = restore_plan(reload(&with_team), &l2);
         assert_eq!(plain.tabs["t2"].role, None);
         assert!(plain.panes.values().filter(|p| p.tab == "t2").all(|p| p.role.is_none() && p.session_name.is_none() && p.team.is_none()));
         assert_eq!(plain.tabs["t2"].layout, back.tabs["t2"].layout);
         assert!(fx.spawn.iter().filter(|(p, _)| plain.panes[p].tab == "t2").all(|(_, i)| !*i));
         let mut v = plain.clone();
         assert_eq!(v.normalize_and_validate(), Ok(()));
+    }
+
+    /// R27: config role tabs missing from workspace.json are added at restore (defaultGroup,
+    /// in the background); a name already used by a plain tab is refused with a message.
+    #[test]
+    fn restore_adds_missing_config_role_tabs() {
+        let (l, _root) = loaded_with(ROLE_CONFIG);
+        let mut ws = Workspace::from_config(&l);
+        // the user closed billing and handover (before R27 their config entries stayed)
+        for name in ["billing", "handover"] {
+            let t = tab_id(&ws, name);
+            ws.apply(WsCommand::CloseTab { tab: t }, &l).unwrap();
+        }
+        // and created a plain tab named "handover" in another folder
+        ws.apply(WsCommand::CreateTab { name: "handover".into(), dir: "ho".into(), template: Some("solo".into()), group: None, role: None }, &l)
+            .unwrap();
+        let saved = reload(&ws);
+        let (back, fx, errs) = restore_plan(saved.clone(), &l);
+        // billing comes back as a Manager with its start prompt, appended to the focused group
+        // (no defaultGroup), without moving focus or the active tab
+        let billing = tab_id(&back, "billing");
+        assert_eq!(back.tabs[&billing].role, Some(Role::Manager));
+        let g = &back.groups[&back.focus.group_id];
+        assert_eq!(g.tab_ids.last(), Some(&billing));
+        assert_eq!(back.focus, saved.focus);
+        assert_eq!(g.active_tab_id, saved.groups[&saved.focus.group_id].active_tab_id);
+        let mgr = back.standing_pane(&billing).unwrap();
+        assert!(fx.spawn.contains(&(mgr.clone(), true)));
+        assert_eq!(back.panes[&mgr].session_name.as_deref(), Some("billing"));
+        // every pane of the added tab starts as at first start
+        assert!(back.tabs[&billing].layout.leaves().iter().all(|p| fx.spawn.contains(&(p.clone(), true))));
+        // handover: the plain tab keeps its name, the config tab is refused with a message
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("'handover'"), "{errs:?}");
+        let ho = tab_id(&back, "handover");
+        assert_eq!(back.tabs[&ho].role, None);
+        let mut v = back.clone();
+        assert_eq!(v.normalize_and_validate(), Ok(()));
+        // ids never collide with saved ones
+        assert!(back.counters.pane >= saved.counters.pane + back.tabs[&billing].layout.leaves().len() as u64);
     }
 
     #[test]
@@ -749,7 +806,8 @@ mod tests {
         let mgr = ws.standing_pane(&billing).unwrap();
         assert_eq!(ws.panes[&mgr].session_name.as_deref(), Some("billing"));
         let (l2, _r2) = loaded_with(&ROLE_CONFIG.replace(r#""name":"billing""#, r#""name":"billing2""#));
-        let (back, _) = restore_plan(reload(&ws), &l2);
+        let (back, _, errs) = restore_plan(reload(&ws), &l2);
+        assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(back.panes[&mgr].session_name.as_deref(), Some("billing2"));
         assert_eq!(back.panes[&mgr].role, Some(Role::Manager));
     }

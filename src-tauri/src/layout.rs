@@ -106,6 +106,17 @@ impl<T: Clone + PartialEq> LayoutNode<T> {
         }
     }
 
+    /// Visit every leaf mutably, in reading order.
+    pub fn for_each_leaf_mut(&mut self, mut f: impl FnMut(&mut T)) {
+        fn walk<T>(n: &mut LayoutNode<T>, f: &mut impl FnMut(&mut T)) {
+            match n {
+                LayoutNode::Leaf(t) => f(t),
+                LayoutNode::Split { children, .. } => children.iter_mut().for_each(|c| walk(c, f)),
+            }
+        }
+        walk(self, &mut f)
+    }
+
     pub fn leaf_count(&self) -> usize {
         match self {
             LayoutNode::Leaf(_) => 1,

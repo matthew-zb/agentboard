@@ -1189,6 +1189,10 @@ mod tests {
         // a renamed Manager keeps its session name: the old name is not free for a new Manager
         let b = f.who("billing").tab;
         crate::launcher::execute(&f.state, WsCommand::RenameTab { tab: b, name: "billing-old".into() }).unwrap();
+        // R27: the rename itself is recorded in config.json
+        let text = f.config_text();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["tabs"][0]["name"], "billing-old", "{text}");
         std::fs::create_dir_all(f.root.join("billing2")).unwrap();
         let err = f.call("dispatcher", "create_manager_tab", json!({"name":"billing","dir":"billing2"})).unwrap_err();
         assert!(err.contains("세션 이름"), "{err}");
@@ -1366,5 +1370,78 @@ mod tests {
         assert_eq!(v["tabs"][0], json!({"name":"sales","dir":"sales","role":"manager"}));
         // a missing folder is refused (the wizard creates it first)
         assert!(create_manager_tab_ui(&f.state, "x".into(), "nope".into()).is_err());
+    }
+
+    // ── R27: config-backed role tabs ──
+
+    const R27_CONFIG: &str = r#"{
+  "tabs": [
+    {"name": "billing", "role": "manager", "dir": "billing"},
+    {"name": "api", "dir": "api"}
+  ],
+  "envSkip": ["folder-trust:billing", "git-bash"],
+  "groups": {"split": "horizontal", "children": [
+    {"group": {"name": "control", "tabs": ["dispatcher"]}},
+    {"group": {"name": "work", "tabs": ["billing", "api"]}}]},
+  "nightlyRefresh": "04:30"
+}
+"#;
+
+    fn tab_of(f: &Fx, name: &str) -> String {
+        f.state.ws.lock().unwrap().tabs.values().find(|t| t.name == name).map(|t| t.id.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn rename_and_close_of_role_tabs_edit_config() {
+        let f = fx(R27_CONFIG);
+        let billing = tab_of(&f, "billing");
+        crate::launcher::execute(&f.state, WsCommand::RenameTab { tab: billing.clone(), name: "billing2".into() }).unwrap();
+        let text = f.config_text();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["tabs"][0], json!({"name":"billing2","role":"manager","dir":"billing"}));
+        assert_eq!(v["groups"]["children"][1]["group"]["tabs"], json!(["billing2", "api"]));
+        assert_eq!(v["envSkip"], json!(["git-bash", "folder-trust:billing2"]), "the trust skip follows the rename");
+        assert_eq!(v["nightlyRefresh"], "04:30");
+        assert!(text.find("\"groups\"").unwrap() < text.find("nightlyRefresh").unwrap(), "key order kept");
+        {
+            let l = f.state.loaded.read().unwrap();
+            assert!(l.config.tabs.iter().any(|t| t.name == "billing2" && t.role == Some(Role::Manager)));
+            assert!(l.config.env_skip.contains(&"folder-trust:billing2".to_string()));
+        }
+        let reloaded = load_all(&f.appdata);
+        assert!(reloaded.errors.is_empty(), "{:?}", reloaded.errors);
+        // a plain tab's rename never touches config.json
+        let api = tab_of(&f, "api");
+        crate::launcher::execute(&f.state, WsCommand::RenameTab { tab: api, name: "api2".into() }).unwrap();
+        assert_eq!(f.config_text(), text);
+        // a refused rename (duplicate name) writes nothing
+        assert!(crate::launcher::execute(&f.state, WsCommand::RenameTab { tab: billing.clone(), name: "api2".into() }).is_err());
+        assert_eq!(f.config_text(), text);
+
+        // close: the entry, its group listing and its trust skip go away
+        crate::launcher::execute(&f.state, WsCommand::CloseTab { tab: billing }).unwrap();
+        let v: Value = serde_json::from_str(&f.config_text()).unwrap();
+        assert_eq!(v["tabs"], json!([{"name":"api","dir":"api"}]));
+        assert_eq!(v["groups"]["children"][1]["group"]["tabs"], json!(["api"]));
+        assert_eq!(v["envSkip"], json!(["git-bash"]));
+        assert!(!f.state.loaded.read().unwrap().config.tabs.iter().any(|t| t.role.is_some()));
+        assert!(load_all(&f.appdata).errors.is_empty());
+        f.valid();
+    }
+
+    #[test]
+    fn role_tab_rename_refused_when_config_cannot_be_written() {
+        let f = fx(R27_CONFIG);
+        let billing = tab_of(&f, "billing");
+        // config.json became unparseable meanwhile: the rename is refused, model unchanged
+        std::fs::write(f.root.join(".agentboard/config.json"), "{ broken").unwrap();
+        let e = crate::launcher::execute(&f.state, WsCommand::RenameTab { tab: billing.clone(), name: "b2".into() }).unwrap_err();
+        assert!(e.contains("config.json") && e.contains("billing"), "{e}");
+        assert_eq!(tab_of(&f, "billing"), billing);
+        assert_eq!(f.config_text(), "{ broken");
+        let e = crate::launcher::execute(&f.state, WsCommand::CloseTab { tab: billing.clone() }).unwrap_err();
+        assert!(e.contains("닫지 않았습니다"), "{e}");
+        assert_eq!(tab_of(&f, "billing"), billing);
+        assert!(f.state.loaded.read().unwrap().config.tabs.iter().any(|t| t.name == "billing"));
     }
 }

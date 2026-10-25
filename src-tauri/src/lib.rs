@@ -620,15 +620,37 @@ async fn create_manager_tab(app: AppHandle, name: String, dir: String) -> Result
     .map_err(|e| format!("탭을 만드는 작업이 중단되었습니다 — {e}"))?
 }
 
-/// Restore a loaded workspace.json (spec §9 rules, `persist::restore_plan`). A plan that does not
-/// validate (should not happen) falls back to a fresh start from config with a startup error.
-fn restore_or_fresh(ws: Workspace, loaded: &Loaded, startup_errors: &mut Vec<String>) -> (Workspace, Effects) {
-    let (mut ws, fx) = persist::restore_plan(ws, loaded);
+/// Restore a loaded workspace.json (spec §9 rules, `persist::restore_plan`; config role tabs
+/// that could not be added become startup errors). A plan that does not validate (e.g. a
+/// hand-edited file) falls back to a fresh start from config with a startup error; the file is
+/// first moved to `workspace.json.bak` — if that fails, `saving` is turned off so the saved
+/// layout is never overwritten.
+fn restore_or_fresh(
+    ws: Workspace,
+    loaded: &Loaded,
+    ws_path: &std::path::Path,
+    saving: &mut bool,
+    startup_errors: &mut Vec<String>,
+) -> (Workspace, Effects) {
+    let (mut ws, fx, errors) = persist::restore_plan(ws, loaded);
     match ws.normalize_and_validate() {
-        Ok(()) => (ws, fx),
+        Ok(()) => {
+            startup_errors.extend(errors);
+            (ws, fx)
+        }
         Err(e) => {
             eprintln!("[agentboard] 복원 규칙 적용 실패: {e}");
-            startup_errors.push(format!("저장된 작업 상태를 복원할 수 없어 초기 배치로 시작했습니다 — {e}"));
+            match persist::move_to_bak(ws_path) {
+                Ok(()) => startup_errors.push(format!(
+                    "저장된 작업 상태를 복원할 수 없어 초기 배치로 시작했습니다(원본은 workspace.json.bak) — {e}"
+                )),
+                Err(be) => {
+                    *saving = false;
+                    startup_errors.push(format!(
+                        "저장된 작업 상태를 복원할 수 없어 초기 배치로 시작했습니다. 이번 실행의 변경 사항은 저장되지 않습니다 — {e} ({be})"
+                    ));
+                }
+            }
             let ws = Workspace::from_config(loaded);
             let fx = launcher::initial_effects(&ws);
             (ws, fx)
@@ -685,7 +707,7 @@ pub fn run() {
             let mut startup_errors = Vec::new();
             let mut saving = true;
             let (ws, initial) = match persist::load(&ws_path) {
-                Ok(Some(ws)) => restore_or_fresh(ws, &loaded, &mut startup_errors),
+                Ok(Some(ws)) => restore_or_fresh(ws, &loaded, &ws_path, &mut saving, &mut startup_errors),
                 Ok(None) => {
                     let ws = Workspace::from_config(&loaded);
                     let fx = launcher::initial_effects(&ws);

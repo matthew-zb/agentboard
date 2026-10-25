@@ -659,10 +659,19 @@ impl Workspace {
     ///    `session_name` = the current tab name (a fresh session, so a renamed tab's name is
     ///    used now); its prompt is re-read from the template pane of the same name when the
     ///    template still has one. Every other pane gets no role / session name.
-    /// 5. Effects: every pane is spawned; standing role panes with `inject = true` (new session +
-    ///    start prompt, as at first start), all others without injection (phase-1 restore).
+    ///    A tab whose focused pane was a dropped team pane gets its standing pane focused.
+    /// 5. R27: config role tabs (`manager` / `handover`) missing from workspace.json are added
+    ///    as at first start (template from config, else defaultTemplate) at the end of
+    ///    `defaultGroup` (else the focused group) — no focus or active-tab change. A config tab
+    ///    whose name is already used by another (plain) tab, whose template is missing, or a
+    ///    second handover is skipped with a Korean message in the returned list (user tabs are
+    ///    never renamed).
+    /// 6. Effects: every pane is spawned; standing role panes with `inject = true` (new session +
+    ///    start prompt, as at first start), all panes of added tabs too (as `initial_effects`),
+    ///    all others without injection (phase-1 restore; this includes extra agent panes of a
+    ///    role tab — only standing agents follow the start procedure, spec §9).
     ///    Applets (inbox, documents) get the usual no-process spawn.
-    pub fn restore_roles(&mut self, loaded: &Loaded) -> Effects {
+    pub fn restore_roles(&mut self, loaded: &Loaded) -> (Effects, Vec<String>) {
         self.reset_runtime_state();
         let cfg = &loaded.config;
         // 2. tab roles from config
@@ -678,6 +687,7 @@ impl Workspace {
         // 3. drop team panes
         let team: Vec<PaneId> =
             self.panes.values().filter(|p| p.team.is_some() || matches!(p.role, Some(Role::Lead | Role::Member))).map(|p| p.id.clone()).collect();
+        let mut refocus: BTreeSet<TabId> = BTreeSet::new();
         for id in &team {
             let tab = self.panes[id].tab.clone();
             self.panes.remove(id);
@@ -691,6 +701,7 @@ impl Workspace {
                     let leaves = t.layout.leaves();
                     if !leaves.contains(&t.last_focused_pane_id) {
                         t.last_focused_pane_id = leaves[0].clone();
+                        refocus.insert(tab.clone());
                     }
                     if t.maximized_pane_id.as_ref().is_some_and(|m| !leaves.contains(m)) {
                         t.maximized_pane_id = None;
@@ -737,9 +748,46 @@ impl Workspace {
                 }
                 p.team = None;
             }
+            if let (Some(pick), true) = (&pick, refocus.contains(&tid)) {
+                self.tabs.get_mut(&tid).unwrap().last_focused_pane_id = pick.clone();
+            }
         }
-        // 5. effects
-        Effects { spawn: self.panes.keys().map(|id| (id.clone(), standing.contains(id))).collect(), kill: Vec::new() }
+        // 5. config role tabs missing from workspace.json (R27)
+        let mut errors = Vec::new();
+        let mut added: BTreeSet<PaneId> = BTreeSet::new();
+        for spec in cfg.tabs.iter().filter(|s| s.role.is_some()) {
+            if self.tabs.values().any(|t| t.name == spec.name && t.dir == spec.dir && t.role == spec.role) {
+                continue;
+            }
+            if self.tabs.values().any(|t| t.name == spec.name) {
+                errors.push(format!(
+                    "config.json의 역할 탭 '{}'을(를) 열지 않았습니다 — 같은 이름의 다른 탭이 이미 있습니다(그 탭의 이름을 바꾸거나 닫은 뒤 다시 시작하세요)",
+                    spec.name
+                ));
+                continue;
+            }
+            if spec.role == Some(Role::Handover) && self.tabs.values().any(|t| t.role == Some(Role::Handover)) {
+                errors.push(format!("config.json의 handover 탭 '{}'을(를) 열지 않았습니다 — handover 탭이 이미 있습니다", spec.name));
+                continue;
+            }
+            let tn = spec.template.as_deref().unwrap_or(&cfg.default_template);
+            let Some(tpl) = loaded.templates.get(tn) else {
+                errors.push(format!("config.json의 역할 탭 '{}'을(를) 열지 않았습니다 — 템플릿 '{tn}'이(가) 없습니다", spec.name));
+                continue;
+            };
+            let tid = self.build_tab(&spec.name, &spec.dir, tpl, false, spec.role, loaded);
+            added.extend(self.tabs[&tid].layout.leaves());
+            let leaves = self.group_layout.leaves();
+            let gid = cfg
+                .default_group
+                .as_ref()
+                .and_then(|n| leaves.iter().find(|g| self.groups.get(*g).is_some_and(|g| &g.name == n)).cloned())
+                .unwrap_or_else(|| self.focus.group_id.clone());
+            self.groups.get_mut(&gid).unwrap().tab_ids.push(tid);
+        }
+        // 6. effects
+        let spawn = self.panes.keys().map(|id| (id.clone(), standing.contains(id) || added.contains(id))).collect();
+        (Effects { spawn, kill: Vec::new() }, errors)
     }
 
     /// Panes whose process is alive (`starting` or `running`). Applets have no process.

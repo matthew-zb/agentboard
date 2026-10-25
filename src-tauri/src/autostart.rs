@@ -106,6 +106,15 @@ pub fn is_enabled_at(key: &str, name: &str) -> Result<bool, String> {
     Ok(read_at(key, name)?.is_some())
 }
 
+/// Enabled **for `exe`**: the value exists and names this executable (compared
+/// case-insensitively, quotes optional). A value left by a moved / older / dev build counts as
+/// off, so the palette offers "켜기", which rewrites it.
+pub fn is_enabled_for_at(key: &str, name: &str, exe: &Path) -> Result<bool, String> {
+    let Some(v) = read_at(key, name)? else { return Ok(false) };
+    let stored = v.trim().trim_matches('"');
+    Ok(stored.eq_ignore_ascii_case(&exe.display().to_string()))
+}
+
 /// Delete an (empty of subkeys) key under HKCU — tests clean up their key with it.
 #[cfg(windows)]
 pub fn delete_key(key: &str) -> Result<(), String> {
@@ -128,8 +137,10 @@ pub fn disable() -> Result<(), String> {
     disable_at(RUN_KEY, VALUE_NAME)
 }
 
+/// Whether login autostart is set up for the running executable (see [`is_enabled_for_at`]).
 pub fn is_enabled() -> Result<bool, String> {
-    is_enabled_at(RUN_KEY, VALUE_NAME)
+    let exe = std::env::current_exe().map_err(|e| format!("실행 파일 경로를 알 수 없습니다 — {e}"))?;
+    is_enabled_for_at(RUN_KEY, VALUE_NAME, &exe)
 }
 
 #[cfg(test)]
@@ -155,6 +166,14 @@ mod tests {
         enable_at(&key.0, VALUE_NAME, exe).unwrap();
         assert_eq!(is_enabled_at(&key.0, VALUE_NAME), Ok(true));
         assert_eq!(read_at(&key.0, VALUE_NAME).unwrap().as_deref(), Some(r#""C:\Program Files\AgentBoard\agentboard.exe""#));
+        assert_eq!(is_enabled_for_at(&key.0, VALUE_NAME, exe), Ok(true));
+        assert_eq!(is_enabled_for_at(&key.0, VALUE_NAME, Path::new(r"c:\program files\agentboard\AGENTBOARD.exe")), Ok(true));
+        // a stale value (another exe) is reported as off; enabling rewrites it
+        let other = Path::new(r"C:\old\agentboard.exe");
+        assert_eq!(is_enabled_for_at(&key.0, VALUE_NAME, other), Ok(false));
+        enable_at(&key.0, VALUE_NAME, other).unwrap();
+        assert_eq!(is_enabled_for_at(&key.0, VALUE_NAME, other), Ok(true));
+        assert_eq!(is_enabled_for_at(&key.0, VALUE_NAME, exe), Ok(false));
         // enabling twice keeps one value
         enable_at(&key.0, VALUE_NAME, exe).unwrap();
         disable_at(&key.0, VALUE_NAME).unwrap();
