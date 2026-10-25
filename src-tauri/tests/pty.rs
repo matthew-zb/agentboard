@@ -2,6 +2,7 @@
 use app_lib::pty::{PtyManager, PtySink, SpawnSpec};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -10,9 +11,18 @@ struct CollectSink {
     out: Mutex<HashMap<String, Vec<u8>>>,
     exits: Mutex<HashMap<String, i32>>,
     out_at_exit: Mutex<HashMap<String, usize>>,
+    output_after_exit: AtomicBool,
+    /// when true, output() blocks (simulates a stalled consumer)
+    block: AtomicBool,
 }
 impl PtySink for CollectSink {
     fn output(&self, id: &str, bytes: &[u8]) {
+        while self.block.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if self.exits.lock().unwrap().contains_key(id) {
+            self.output_after_exit.store(true, Ordering::SeqCst);
+        }
         self.out.lock().unwrap().entry(id.to_string()).or_default().extend_from_slice(bytes);
     }
     fn exited(&self, id: &str, code: i32) {
@@ -54,7 +64,8 @@ fn spec(cmd: &str, args: &[&str], cwd: PathBuf) -> SpawnSpec {
 
 fn setup() -> (Arc<CollectSink>, PtyManager) {
     let sink = Arc::new(CollectSink::default());
-    let m = PtyManager::new(sink.clone());
+    // per-child job: PtyManager::new would put the test process itself in the job
+    let m = PtyManager::new_per_child_job(sink.clone());
     (sink, m)
 }
 
@@ -71,6 +82,13 @@ fn spawn_echo_streams_output_and_exit_code() {
     assert!(sink.text("p1").contains("hello-agentboard"), "got: {:?}", sink.text("p1"));
     let at_exit = *sink.out_at_exit.lock().unwrap().get("p1").unwrap();
     assert!(at_exit > 0, "final flush must precede exited");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(sink.out.lock().unwrap().get("p1").unwrap().len(), at_exit, "output after exited");
+    assert!(!sink.output_after_exit.load(Ordering::SeqCst));
+    assert_eq!(m.job_error(), None);
+    // the startup DSR request must not be forwarded to the frontend
+    assert!(!sink.out.lock().unwrap().get("p1").unwrap().windows(4).any(|w| w == b"\x1b[6n"));
+    assert!(!m.snapshot("p1").windows(4).any(|w| w == b"\x1b[6n"));
     assert!(String::from_utf8_lossy(&m.snapshot("p1")).contains("hello-agentboard"));
     assert!(!m.is_running("p1"));
 }
@@ -131,4 +149,26 @@ fn kill_terminates_and_snapshot_survives() {
     assert!(!m.snapshot("p6").is_empty());
     assert!(wait_until(|| sink.exit("p6").is_some()));
     m.kill("unknown-id");
+}
+
+#[test]
+fn pending_is_bounded_when_sink_stalls() {
+    let (sink, m) = setup();
+    let td = tempfile::tempdir().unwrap();
+    let big = td.path().join("big.txt");
+    let line = "y".repeat(78) + "\r\n";
+    std::fs::write(&big, line.repeat(20_000)).unwrap(); // ~1.6MB, more than the 1MB cap
+    sink.block.store(true, Ordering::Release);
+    m.spawn("p7", spec("cmd.exe", &["/c", "type", big.to_str().unwrap()], cwd())).unwrap();
+    // reader should fill pending up to (but never beyond) the cap and then block
+    assert!(wait_until(|| m.pending_len("p7") > 500_000), "pending never filled");
+    let mut max = 0;
+    for _ in 0..30 {
+        max = max.max(m.pending_len("p7"));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(max <= app_lib::pty::RING_CAP, "pending {max} exceeded cap");
+    sink.block.store(false, Ordering::Release);
+    assert!(wait_until(|| sink.exit("p7").is_some()));
+    assert!(sink.text("p7").len() > 1_400_000);
 }

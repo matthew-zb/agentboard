@@ -4,16 +4,41 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 pub const RING_CAP: usize = 1_048_576;
 pub const BATCH_MS: u64 = 16;
 
-/// After the child exits, wait until the reader has been quiet this long
-/// (ConPTY may deliver trailing output slightly late), but never longer than DRAIN_MAX.
-const DRAIN_QUIET: Duration = Duration::from_millis(100);
-const DRAIN_MAX: Duration = Duration::from_millis(1000);
+const DRAIN_MAX: Duration = Duration::from_millis(2000);
+
+const DSR: &[u8] = b"\x1b[6n";
+const DSR_REPLY: &[u8] = b"\x1b[1;1R";
+
+/// Strips the first cursor-position request (ESC[6n) from the stream, even when it is
+/// split across reads. Returns (bytes to forward, whether to send a reply now).
+/// A trailing partial match is held in `carry` until the next chunk.
+pub(crate) fn filter_dsr(carry: &mut Vec<u8>, answered: &mut bool, chunk: &[u8]) -> (Vec<u8>, bool) {
+    let mut data = std::mem::take(carry);
+    data.extend_from_slice(chunk);
+    if *answered {
+        return (data, false);
+    }
+    if let Some(pos) = data.windows(DSR.len()).position(|w| w == DSR) {
+        data.drain(pos..pos + DSR.len());
+        *answered = true;
+        return (data, true);
+    }
+    // hold back the longest suffix that is a proper prefix of DSR
+    let keep = (1..DSR.len())
+        .rev()
+        .find(|&k| data.len() >= k && data[data.len() - k..] == DSR[..k])
+        .unwrap_or(0);
+    let at = data.len() - keep;
+    *carry = data.split_off(at);
+    (data, false)
+}
 
 pub struct SpawnSpec {
     pub cmd: PathBuf,
@@ -35,6 +60,7 @@ struct Entry {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     ring: Arc<Mutex<RingBuffer>>,
     running: Arc<AtomicBool>,
+    batch: Arc<Batch>,
 }
 
 pub struct PtyManager {
@@ -42,33 +68,123 @@ pub struct PtyManager {
     panes: Mutex<HashMap<String, Arc<Entry>>>,
     #[cfg(windows)]
     job: Option<crate::winjob::JobGuard>,
+    /// true when the app process itself is in the job (children inherit it)
+    #[cfg(windows)]
+    self_assigned: bool,
+    job_error: Mutex<Option<String>>,
 }
 
-/// Pending (not yet flushed) bytes. `flush_lock` serializes take+output so
-/// batches reach the sink in order even when two threads flush.
+/// Bytes between the reader and the flusher. Bounded at RING_CAP: the reader blocks
+/// while it is full (natural pty backpressure). `flush_lock` serializes take+output so
+/// batches reach the sink in order, and `done` (checked under it) guarantees nothing is
+/// delivered after the final flush.
 struct Batch {
     pending: Mutex<Vec<u8>>,
+    space: Condvar,
     flush_lock: Mutex<()>,
+    done: AtomicBool,
 }
 
 impl Batch {
-    fn flush(&self, sink: &dyn PtySink, id: &str) {
+    fn new() -> Self {
+        Batch {
+            pending: Mutex::new(Vec::new()),
+            space: Condvar::new(),
+            flush_lock: Mutex::new(()),
+            done: AtomicBool::new(false),
+        }
+    }
+
+    /// Reader side: waits for room; drops the bytes if the pane is already finished.
+    fn push(&self, bytes: &[u8]) {
+        let mut p = self.pending.lock().unwrap();
+        while !p.is_empty() && p.len() + bytes.len() > RING_CAP {
+            if self.done.load(Ordering::Acquire) {
+                return;
+            }
+            p = self.space.wait_timeout(p, Duration::from_millis(50)).unwrap().0;
+        }
+        if !self.done.load(Ordering::Acquire) {
+            p.extend_from_slice(bytes);
+        }
+    }
+
+    /// Flush pending bytes; with `finish` also mark the pane done (under the lock).
+    fn flush(&self, sink: &dyn PtySink, id: &str, finish: bool) {
         let _g = self.flush_lock.lock().unwrap();
+        if self.done.load(Ordering::Acquire) {
+            return;
+        }
         let bytes = std::mem::take(&mut *self.pending.lock().unwrap());
+        self.space.notify_all();
         if !bytes.is_empty() {
             sink.output(id, &bytes);
+        }
+        if finish {
+            self.done.store(true, Ordering::Release);
+            self.pending.lock().unwrap().clear();
+            self.space.notify_all();
         }
     }
 }
 
 impl PtyManager {
+    /// Production constructor: creates a KILL_ON_JOB_CLOSE job and puts the app process
+    /// itself into it, so every child inherits it. Do NOT use in tests or short-lived
+    /// processes: dropping the manager closes the job and kills this process too. Use
+    /// [`PtyManager::new_per_child_job`] there. Failures are logged and exposed through
+    /// [`PtyManager::job_error`].
     pub fn new(sink: Arc<dyn PtySink>) -> Self {
-        PtyManager {
-            sink,
-            panes: Mutex::new(HashMap::new()),
-            #[cfg(windows)]
-            job: crate::winjob::JobGuard::new().ok(),
+        Self::build(sink, true)
+    }
+
+    /// Like `new`, but the app process is not placed in the job; each child is assigned
+    /// after it starts (tiny window in which grandchildren could escape). Safe for tests.
+    pub fn new_per_child_job(sink: Arc<dyn PtySink>) -> Self {
+        Self::build(sink, false)
+    }
+
+    fn build(sink: Arc<dyn PtySink>, assign_self: bool) -> Self {
+        #[cfg(windows)]
+        {
+            let mut err = None;
+            let mut self_assigned = false;
+            let job = match crate::winjob::JobGuard::new() {
+                Ok(j) => {
+                    if assign_self {
+                        match j.assign_self() {
+                            Ok(()) => self_assigned = true,
+                            Err(e) => err = Some(format!("self-assign failed, falling back to per-child: {e}")),
+                        }
+                    }
+                    Some(j)
+                }
+                Err(e) => {
+                    err = Some(format!("job creation failed: {e}"));
+                    None
+                }
+            };
+            if let Some(e) = &err {
+                eprintln!("[agentboard] job object: {e}");
+            }
+            PtyManager { sink, panes: Mutex::new(HashMap::new()), job, self_assigned, job_error: Mutex::new(err) }
         }
+        #[cfg(not(windows))]
+        {
+            let _ = assign_self;
+            PtyManager { sink, panes: Mutex::new(HashMap::new()), job_error: Mutex::new(None) }
+        }
+    }
+
+    /// Last job object problem (creation, self-assignment or per-child assignment).
+    pub fn job_error(&self) -> Option<String> {
+        self.job_error.lock().unwrap().clone()
+    }
+
+    /// Test-only: bytes currently queued between reader and sink.
+    #[doc(hidden)]
+    pub fn pending_len(&self, id: &str) -> usize {
+        self.entry(id).map(|e| e.batch.pending.lock().unwrap().len()).unwrap_or(0)
     }
 
     pub fn spawn(&self, id: &str, spec: SpawnSpec) -> Result<(), String> {
@@ -88,8 +204,13 @@ impl PtyManager {
         drop(pair.slave);
 
         #[cfg(windows)]
-        if let (Some(job), Some(pid)) = (&self.job, child.process_id()) {
-            let _ = job.assign(pid);
+        if !self.self_assigned {
+            if let (Some(job), Some(pid)) = (&self.job, child.process_id()) {
+                if let Err(e) = job.assign(pid) {
+                    eprintln!("[agentboard] job assign: {e}");
+                    *self.job_error.lock().unwrap() = Some(e);
+                }
+            }
         }
 
         let setup = (|| -> Result<_, String> {
@@ -107,56 +228,62 @@ impl PtyManager {
 
         let ring = Arc::new(Mutex::new(RingBuffer::new(RING_CAP)));
         let running = Arc::new(AtomicBool::new(true));
+        let batch = Arc::new(Batch::new());
         let entry = Arc::new(Entry {
             master: Mutex::new(Some(pair.master)),
             writer: Mutex::new(Some(writer)),
             killer: Mutex::new(child.clone_killer()),
             ring: ring.clone(),
             running: running.clone(),
+            batch: batch.clone(),
         });
-        let batch = Arc::new(Batch { pending: Mutex::new(Vec::new()), flush_lock: Mutex::new(()) });
-        let last_read = Arc::new(Mutex::new(Instant::now()));
-        let done = Arc::new(AtomicBool::new(false));
+        let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
 
         // Registered only after everything above succeeded.
         self.panes.lock().unwrap().insert(id.to_string(), entry.clone());
 
         // reader thread
         {
-            let (ring, batch, last_read) = (ring.clone(), batch.clone(), last_read.clone());
+            let (ring, batch) = (ring.clone(), batch.clone());
             let entry = entry.clone();
             std::thread::spawn(move || {
+                let _tx = reader_done_tx; // dropped on exit => waiter sees end-of-stream
                 // ConPTY asks for the cursor position (ESC[6n) at startup and stalls the
-                // child until answered. Answer the first request ourselves so panes start
-                // even before a frontend terminal is attached.
-                let mut answered_dsr = false;
+                // child until answered. Answer the first request ourselves and strip it
+                // from the forwarded stream so a frontend terminal does not answer again.
+                let mut carry = Vec::new();
+                let mut answered = false;
                 let mut buf = [0u8; 8192];
                 loop {
-                    match reader.read(&mut buf) {
+                    let n = match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if !answered_dsr && buf[..n].windows(4).any(|w| w == b"[6n") {
-                                answered_dsr = true;
-                                if let Some(w) = entry.writer.lock().unwrap().as_mut() {
-                                    let _ = w.write_all(b"[1;1R");
-                                    let _ = w.flush();
-                                }
-                            }
-                            ring.lock().unwrap().push(&buf[..n]);
-                            batch.pending.lock().unwrap().extend_from_slice(&buf[..n]);
-                            *last_read.lock().unwrap() = Instant::now();
+                        Ok(n) => n,
+                    };
+                    let (out, reply) = filter_dsr(&mut carry, &mut answered, &buf[..n]);
+                    if reply {
+                        if let Some(w) = entry.writer.lock().unwrap().as_mut() {
+                            let _ = w.write_all(DSR_REPLY);
+                            let _ = w.flush();
                         }
                     }
+                    if !out.is_empty() {
+                        ring.lock().unwrap().push(&out);
+                        batch.push(&out);
+                    }
+                }
+                if !carry.is_empty() {
+                    ring.lock().unwrap().push(&carry);
+                    batch.push(&carry);
                 }
             });
         }
         // flush thread
         {
-            let (batch, done, sink, id) = (batch.clone(), done.clone(), self.sink.clone(), id.to_string());
+            let (batch, sink, id) = (batch.clone(), self.sink.clone(), id.to_string());
             std::thread::spawn(move || {
-                while !done.load(Ordering::Acquire) {
+                while !batch.done.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(BATCH_MS));
-                    batch.flush(sink.as_ref(), &id);
+                    batch.flush(sink.as_ref(), &id, false);
                 }
             });
         }
@@ -168,16 +295,13 @@ impl PtyManager {
                     Ok(st) => st.exit_code() as i32,
                     Err(_) => -1,
                 };
-                let start = Instant::now();
-                while start.elapsed() < DRAIN_MAX && last_read.lock().unwrap().elapsed() < DRAIN_QUIET {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                batch.flush(sink.as_ref(), &id);
-                running.store(false, Ordering::Release);
-                done.store(true, Ordering::Release);
-                // Close the pty so the reader unblocks; the ring stays in the entry.
+                // Close the pty so the reader reaches EOF, then wait (bounded) for it.
                 *entry.writer.lock().unwrap() = None;
                 *entry.master.lock().unwrap() = None;
+                let _ = reader_done_rx.recv_timeout(DRAIN_MAX);
+                // Final flush strictly before `exited`; nothing is delivered after it.
+                batch.flush(sink.as_ref(), &id, true);
+                running.store(false, Ordering::Release);
                 sink.exited(&id, code);
             });
         }
@@ -214,5 +338,45 @@ impl PtyManager {
 
     pub fn is_running(&self, id: &str) -> bool {
         self.entry(id).map(|e| e.running.load(Ordering::Acquire)).unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dsr_whole_is_stripped_and_answered_once() {
+        let (mut c, mut a) = (Vec::new(), false);
+        let (out, reply) = filter_dsr(&mut c, &mut a, b"ab\x1b[6ncd");
+        assert_eq!(out, b"abcd");
+        assert!(reply);
+        let (out, reply) = filter_dsr(&mut c, &mut a, b"x\x1b[6ny");
+        assert_eq!(out, b"x\x1b[6ny");
+        assert!(!reply);
+    }
+
+    #[test]
+    fn dsr_split_across_chunks_is_matched() {
+        for split in 1..4 {
+            let (mut c, mut a) = (Vec::new(), false);
+            let seq = b"\x1b[6n";
+            let (o1, r1) = filter_dsr(&mut c, &mut a, &[b"hi".as_slice(), &seq[..split]].concat());
+            assert_eq!(o1, b"hi");
+            assert!(!r1);
+            let (o2, r2) = filter_dsr(&mut c, &mut a, &[&seq[split..], b"!".as_slice()].concat());
+            assert_eq!(o2, b"!");
+            assert!(r2, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn dsr_partial_prefix_that_is_not_dsr_is_released() {
+        let (mut c, mut a) = (Vec::new(), false);
+        let (o1, _) = filter_dsr(&mut c, &mut a, b"a\x1b[");
+        assert_eq!(o1, b"a");
+        let (o2, r2) = filter_dsr(&mut c, &mut a, b"31m");
+        assert_eq!(o2, b"\x1b[31m");
+        assert!(!r2);
     }
 }
