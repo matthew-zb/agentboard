@@ -332,9 +332,9 @@ spikes/phase2/    # Task 1 버리는 스파이크 코드 (커밋은 하되 빌�
   - `autostart::{enable, disable, is_enabled}` — `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 값 `AgentBoard` = `"<exe>"`. Tauri 명령 `autostart_get/set`.
   - **환경 점검 (`envcheck.rs`, 스펙 §9)**: `pub struct EnvItem { id: &'static str /*claude-version|git-bash|folder-trust:<tab>*/, ok: bool, detail: String, why: String, missing_features: String, fix: String /*설치·조치 명령 또는 안내*/ , skipped: bool }`, `pub fn check_all(cfg: &Loaded, ws: &Workspace, probe: &dyn EnvProbe) -> Vec<EnvItem>` — `EnvProbe`(테스트에서 가짜로 바꿀 수 있게): `claude --version`(타임아웃 5초, ≥ 2.1.234), Git Bash 존재(Claude Code와 같은 규칙: `CLAUDE_CODE_GIT_BASH_PATH` 또는 PATH의 git 기준), 폴더 신뢰는 Task 9의 "SessionStart 30초 미도착" 결과를 반영. 설치 안내 예: Git → `winget install --id Git.Git -e`, Claude → `claude update`.
   - MCP `env_status()`(모든 역할) → 항목 목록, `env_skip(item)`(dispatcher만) → `config.json` `envSkip`에 추가(다른 키 보존). 건너뛴 항목은 `skipped: true`, 상태 표시줄에 `[환경: Git 없음(건너뜀)]`처럼 작게.
-  - **사용자 정의 항목**: `config.json` `envRequire: [{id, check, fix, why, required}]` — check 명령(셸 실행, 타임아웃 10초, 종료 코드 0 = 정상). 기본 설정(ensure_dotdir가 만드는 config가 없을 때의 기본값과 README 예시)에 holla 항목: `{"id":"holla","check":"holla slack version","fix":"holla(@circlesac/holla) 설치 후 `holla slack auth`로 슬랙 로그인","why":"handover의 슬랙 확인에 필요","required":true}`. `required: true` 항목은 `env_skip`이 한국어 오류로 거부, 상태 표시줄에 강조.
+  - **사용자 정의 항목**: `config.json` `envRequire: [{id, check, fix, why, required}]` — check 명령(셸 실행, 타임아웃 10초, 종료 코드 0 = 정상). 기본 설정(ensure_dotdir가 만드는 config가 없을 때의 기본값과 README 예시)에 holla 항목: `{"id":"holla","check":"holla slack version","fix":"source의 GitHub 저장소로 holla(@circlesac/holla)를 설치한 뒤 `holla slack auth`로 슬랙 로그인","why":"handover의 슬랙 확인에 필요","required":true,"source":""}`. 항목 필드에 `source: Option<String>`(저장소 주소) 추가, MCP `env_set_source(item, url)`(dispatcher만, config 원자적 갱신, http(s) URL만 허용) — source가 비면 dispatcher가 사용자에게 주소를 묻는다(사용자 결정: 주소만 주면 Claude가 설치). `required: true` 항목은 `env_skip`이 한국어 오류로 거부, 상태 표시줄에 강조.
   - 앱은 직접 설치하지 않는다(설치는 dispatcher가 사용자 승인 후 실행).
-- [ ] **Step 1: 실패하는 테스트** — `restore_plan_drops_team_panes_and_reinjects_prompts`, `non_role_tabs_restore_as_phase1`, `version_parse_and_compare`, `env_items_respect_skip_list`, `custom_required_item_cannot_be_skipped`, `custom_check_timeout_is_failure`, `env_skip_persists_and_keeps_other_config_keys`, autostart는 레지스트리 키 이름을 주입 가능하게 해 테스트 키로 왕복.
+- [ ] **Step 1: 실패하는 테스트** — `restore_plan_drops_team_panes_and_reinjects_prompts`, `non_role_tabs_restore_as_phase1`, `version_parse_and_compare`, `env_items_respect_skip_list`, `custom_required_item_cannot_be_skipped`, `env_set_source_validates_url_and_persists`, `custom_check_timeout_is_failure`, `env_skip_persists_and_keeps_other_config_keys`, autostart는 레지스트리 키 이름을 주입 가능하게 해 테스트 키로 왕복.
 - [ ] **Step 2–4** — FAIL → 구현 → PASS
 - [ ] **Step 5: Commit** — `feat: role-aware restore, autostart toggle, Claude version check`
 
@@ -349,7 +349,7 @@ spikes/phase2/    # Task 1 버리는 스파이크 코드 (커밋은 하되 빌�
 **Interfaces:**
 - Produces (역할 지시 최소판 — 스펙 §2·§5·§7·§8·§9 반영, 각 1–2쪽):
   - 공통: 사용자 결정이 필요하면 질문을 화면에 쓰고 `need_user(사유)` 호출, `[AgentBoard]`·agentboard 발신 메시지는 사용자 지시를 전달하는 것(R3), 세션 이름 규칙, `SendMessage`로 보낼 대상 규칙(경로: handover→dispatcher→Manager, 지시는 dispatcher 경유, 팀원→리드만), `[AgentBoard]` 메시지는 앱 지시로 취급.
-  - dispatcher: handover 메시지 판단·담당 전달, 인박스 지시 전달, `create_manager_tab` 사용 조건, **시작 시 `env_status()` 확인 → 빠진 항목을 하나씩 안내, 설치는 사용자 승인 후에만 실행, 거절 시 `env_skip`**.
+  - dispatcher: handover 메시지 판단·담당 전달, 인박스 지시 전달, `create_manager_tab` 사용 조건, **시작 시 `env_status()` 확인 → 빠진 항목을 하나씩 안내, 설치는 사용자 승인 후에만 실행, 거절 시 `env_skip`(required는 불가); 설치 소스(GitHub 주소)가 비어 있으면 사용자에게 물어 `env_set_source`로 기록 후 그 저장소 README대로 설치**.
   - handover: `/loop`는 템플릿 프롬프트가 시작, 인덱스 문서는 **포인터만**(업무·계획 파일·진행 파일·갱신 시각 한 줄), 야간 정리 절차.
   - manager: 보고 = `inbox_post`(확인할 것/리스크 짧고 명료), 종료 = `inbox_propose_close` + 최종 의견, 이슈 = `issue_create`, 팀 = `teams/<id>/brief.md`·`roster.md` 작성 후 `hire_lead`, 끝난 팀 brief에 `상태: 완료`, **시작 시 진행 중 팀 자동 재채용**, 야간 정리 절차.
   - lead: brief 기준 배분, 팀원 결과물 **검증·지적**, `hire_member`/`dismiss`, Manager에게 보고.
