@@ -1,6 +1,7 @@
 //! Inbox store (spec §5): Manager review results ("확인할 것 / 리스크") as items with a
 //! timeline, one JSON file per item in `<workspaceRoot>/.agentboard/inbox/<id>.json`
-//! (atomic tmp + rename).
+//! (atomic tmp + rename; the rename is retried for up to ≈1 s while another process holds the
+//! file, e.g. an indexer or sync client — this wait happens under the item lock).
 //!
 //! # Item lifecycle
 //! `new` → `in_progress` → `close_proposed` → `done`. Only the user (Tauri command
@@ -9,10 +10,11 @@
 //! `close_proposed` it records `reopened` first). `done` is final.
 //!
 //! # Who may do what
-//! Agent-facing methods take the MCP [`Caller`]: `post` needs a Manager (owner tab = caller's
-//! tab); `note`, `propose_close` and `link_issue` need the owner Manager (role Manager and
-//! `item.owner_tab == caller.tab`). [`Inbox::list_for`]: Dispatcher sees every item, a Manager
-//! its own, other roles none. Agent changes mark the item unread.
+//! Agent-facing methods take the MCP [`Caller`]: `post` needs a Manager (owner = caller's tab
+//! name); `note`, `propose_close` and `link_issue` need the owner Manager (role Manager and
+//! `item.owner_name == caller.tab_name`). Ownership is keyed on the tab **name**, never the
+//! volatile tab id (R29). [`Inbox::list_for`]: Dispatcher sees every item, a Manager its own,
+//! other roles none. Agent changes mark the item unread.
 //!
 //! # Retries
 //! An MCP call that hits the 30 s deadline may still complete, and the agent may retry. So an
@@ -97,9 +99,14 @@ pub struct TimelineEntry {
 pub struct InboxItem {
     /// `YYYYMMDD-HHMMSS-xxxx` (local time + 4 random hex) = file stem.
     pub id: String,
-    pub owner_tab: TabId,
-    /// Owner tab's name when posted ("담당 업무").
+    /// Owner tab's name ("담당 업무") — the item's owner identity (R29). Tab names are unique,
+    /// stable across restarts and config-backed for role tabs (R27); a RenameTab of a role tab
+    /// moves its items ([`Inbox::rename_owner`]). No tab of that name = owner unknown.
     pub owner_name: String,
+    /// Legacy only: the owner's tab id, written by pre-R29 builds. Read once for
+    /// [`Inbox::migrate_legacy_owners`] and never written again.
+    #[serde(default, skip_serializing)]
+    pub owner_tab: Option<TabId>,
     pub title: String,
     pub check: Vec<String>,
     pub risk: Vec<String>,
@@ -137,6 +144,9 @@ pub struct InboxList {
     pub version: u64,
     /// Newest first.
     pub items: Vec<InboxItem>,
+    /// Owner names of listed items whose owner tab (with a standing agent) no longer exists —
+    /// filled by the `inbox_list` command (the inbox itself never looks at the model).
+    pub unknown_owners: Vec<String>,
 }
 
 /// Payload of `inbox-changed`.
@@ -215,10 +225,36 @@ pub fn check_owner(caller: &Caller, item: &InboxItem) -> Result<(), String> {
     if caller.role != Role::Manager {
         return Err(format!("'{}' 역할은 인박스 항목을 바꿀 수 없습니다", caller.role.as_str()));
     }
-    if item.owner_tab != caller.tab {
+    if item.owner_name != caller.tab_name {
         return Err(format!("이 항목의 담당 Manager가 아닙니다: {}", item.id));
     }
     Ok(())
+}
+
+/// Attempts of [`rename_with_retry`] (with [`RENAME_BACKOFF`] between them: ≈1 s at most).
+const RENAME_ATTEMPTS: u32 = 20;
+const RENAME_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// `rename`, retried while Windows reports the target as in use (an indexer, antivirus or
+/// sync client holding the item file briefly: sharing / lock violation, access denied) —
+/// review #10. Other errors fail at once.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < RENAME_ATTEMPTS && busy(&e) => {
+                attempt += 1;
+                std::thread::sleep(RENAME_BACKOFF);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33).
+fn busy(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(5 | 32 | 33))
 }
 
 fn file_name_of(p: &Path) -> String {
@@ -403,7 +439,8 @@ impl Inbox {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(&json)?;
             f.sync_all()?;
-            std::fs::rename(&tmp, &path)
+            drop(f);
+            rename_with_retry(&tmp, &path)
         })();
         res.map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
@@ -455,9 +492,10 @@ impl Inbox {
         Ok(())
     }
 
-    /// `inbox_post`: a Manager's new item, owned by its tab. Returns the item id (an identical
-    /// retry returns the earlier id).
-    pub fn post(&self, caller: &Caller, owner_name: &str, new: NewItem) -> Result<String, String> {
+    /// `inbox_post`: a Manager's new item, owned by its tab (name). Returns the item id (an
+    /// identical retry returns the earlier id).
+    pub fn post(&self, caller: &Caller, new: NewItem) -> Result<String, String> {
+        let owner_name = caller.tab_name.as_str();
         if caller.role != Role::Manager {
             return Err(format!("'{}' 역할은 인박스 항목을 올릴 수 없습니다", caller.role.as_str()));
         }
@@ -465,7 +503,7 @@ impl Inbox {
         let g = self.inner.lock().unwrap();
         let cutoff = now() - chrono::Duration::seconds(POST_RETRY_SECS);
         let retry = g.items.values().find(|i| {
-            i.owner_tab == caller.tab
+            i.owner_name == owner_name
                 && i.state != ItemState::Done
                 && i.title == title
                 && i.check == new.check
@@ -479,8 +517,8 @@ impl Inbox {
         }
         let item = InboxItem {
             id: String::new(),
-            owner_tab: caller.tab.clone(),
             owner_name: owner_name.to_string(),
+            owner_tab: None,
             title,
             check: new.check,
             risk: new.risk,
@@ -496,11 +534,10 @@ impl Inbox {
         self.insert(g, item)
     }
 
-    /// App-generated item (e.g. nightly refresh problems) for `owner_tab`; source and author
-    /// are [`WHO_APP`].
+    /// App-generated item (e.g. nightly refresh problems) for the tab named `owner_name`;
+    /// source and author are [`WHO_APP`].
     pub fn post_system(
         &self,
-        owner_tab: &str,
         owner_name: &str,
         title: &str,
         check: Vec<String>,
@@ -510,8 +547,8 @@ impl Inbox {
         let g = self.inner.lock().unwrap();
         let item = InboxItem {
             id: String::new(),
-            owner_tab: owner_tab.to_string(),
             owner_name: owner_name.to_string(),
+            owner_tab: None,
             title,
             check,
             risk,
@@ -525,6 +562,42 @@ impl Inbox {
             timeline: vec![entry(WHO_APP, TimelineKind::Posted, "")],
         };
         self.insert(g, item)
+    }
+
+    /// Like [`Inbox::post_system`] with one check line, but when an open (not done) app item
+    /// with the same owner and title exists, the line is appended to its timeline as a note
+    /// (item marked unread) instead of making another item — e.g. one "앱 메시지 전달 실패"
+    /// item per pane however many messages expire (final review #11). Returns the item id.
+    pub fn post_system_coalesced(
+        &self,
+        owner_name: &str,
+        title: &str,
+        line: String,
+        risk: Vec<String>,
+    ) -> Result<String, String> {
+        let title = non_empty(title, "제목")?;
+        let open = {
+            let g = self.inner.lock().unwrap();
+            g.items
+                .values()
+                .rev()
+                .find(|i| i.owner_name == owner_name && i.title == title && i.source == WHO_APP && i.state != ItemState::Done)
+                .map(|i| i.id.clone())
+        };
+        match open {
+            Some(id) => {
+                self.update(&id, |it| {
+                    if it.state == ItemState::Done {
+                        return Err(format!("완료된 항목입니다: {}", it.id));
+                    }
+                    it.timeline.push(entry(WHO_APP, TimelineKind::Note, &line));
+                    it.read = false;
+                    Ok(true)
+                })?;
+                Ok(id)
+            }
+            None => self.post_system(owner_name, &title, vec![line], risk),
+        }
     }
 
     /// `inbox_note`: the owner Manager adds a note (state unchanged).
@@ -714,6 +787,96 @@ impl Inbox {
         }
     }
 
+    /// R29: a role tab renamed from `old` to `new` keeps its items — every item owned by `old`
+    /// (done ones too) is rewritten to `new` and published once. All or nothing: a failed write
+    /// puts the already-written items back and returns the error. Returns the undo list for
+    /// [`Inbox::rename_owner_undo`] (the caller's rollback when the rename itself fails).
+    pub fn rename_owner(&self, old: &str, new: &str) -> Result<Vec<(String, String)>, String> {
+        let mut g = self.inner.lock().unwrap();
+        let ids: Vec<String> = g.items.values().filter(|i| i.owner_name == old).map(|i| i.id.clone()).collect();
+        if ids.is_empty() || old == new {
+            return Ok(Vec::new());
+        }
+        let mut done: Vec<(String, String)> = Vec::new();
+        for id in &ids {
+            let mut next = g.items[id].clone();
+            next.owner_name = new.to_string();
+            next.owner_tab = None;
+            if let Err(e) = self.write(&next) {
+                for (id, _) in &done {
+                    let _ = self.write(&g.items[id]); // memory still has the old name
+                }
+                return Err(e);
+            }
+            done.push((id.clone(), old.to_string()));
+        }
+        for id in &ids {
+            if let Some(it) = g.items.get_mut(id) {
+                it.owner_name = new.to_string();
+                it.owner_tab = None;
+            }
+        }
+        self.publish(g);
+        Ok(done)
+    }
+
+    /// Undo of [`Inbox::rename_owner`]: `(item id, previous owner name)` pairs; best effort
+    /// (a failed write is logged, memory is restored either way).
+    pub fn rename_owner_undo(&self, undo: &[(String, String)]) {
+        if undo.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for (id, prev) in undo {
+            let Some(mut it) = g.items.get(id).cloned() else { continue };
+            it.owner_name = prev.clone();
+            if let Err(e) = self.write(&it) {
+                eprintln!("[agentboard] 인박스 담당 이름을 되돌리지 못했습니다: {e}");
+            }
+            g.items.insert(id.clone(), it);
+        }
+        self.publish(g);
+    }
+
+    /// One-time migration of items written before R29 (they stored the owner's tab id):
+    /// `resolve(tab_id, stored_name)` returns the owner tab's current name, or `None` when it
+    /// cannot be mapped reliably — then the stored name is kept (owner unknown until a tab of
+    /// that name exists; only the dispatcher sees the item). Either way the file is rewritten
+    /// without the tab id. Returns Korean error lines.
+    pub fn migrate_legacy_owners(&self, mut resolve: impl FnMut(&str, &str) -> Option<String>) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut g = self.inner.lock().unwrap();
+        let legacy: Vec<(String, String, String)> = g
+            .items
+            .values()
+            .filter_map(|i| i.owner_tab.clone().map(|t| (i.id.clone(), t, i.owner_name.clone())))
+            .collect();
+        if legacy.is_empty() {
+            return errors;
+        }
+        for (id, tab, name) in legacy {
+            let mut next = g.items[&id].clone();
+            if let Some(n) = resolve(&tab, &name) {
+                next.owner_name = n;
+            }
+            next.owner_tab = None;
+            match self.write(&next) {
+                Ok(()) => {
+                    g.items.insert(id, next);
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+        self.publish(g);
+        errors
+    }
+
+    /// Publish without a change (the set of owner tabs changed, so the applet re-reads).
+    pub fn touch(&self) {
+        let g = self.inner.lock().unwrap();
+        self.publish(g);
+    }
+
     pub fn get(&self, id: &str) -> Option<InboxItem> {
         self.inner.lock().unwrap().items.get(id).cloned()
     }
@@ -722,7 +885,7 @@ impl Inbox {
     pub fn list(&self, show_done: bool) -> InboxList {
         let g = self.inner.lock().unwrap();
         let items = g.items.values().rev().filter(|i| show_done || i.state != ItemState::Done).cloned().collect();
-        InboxList { version: g.version, items }
+        InboxList { version: g.version, items, unknown_owners: Vec::new() }
     }
 
     /// `inbox_list` for an agent: Dispatcher all items, a Manager its tab's, others none.
@@ -730,7 +893,7 @@ impl Inbox {
     pub fn list_for(&self, caller: &Caller, state: Option<ItemState>) -> Vec<InboxItem> {
         let mine = |i: &InboxItem| match caller.role {
             Role::Dispatcher => true,
-            Role::Manager => i.owner_tab == caller.tab,
+            Role::Manager => i.owner_name == caller.tab_name,
             _ => false,
         };
         let g = self.inner.lock().unwrap();
@@ -757,7 +920,8 @@ mod tests {
     use std::sync::Arc;
 
     fn caller(role: Role, tab: &str, name: &str) -> Caller {
-        Caller { pane: format!("p-{name}"), role, tab: tab.into(), team: None, session_name: name.into() }
+        let tab_name = tab.strip_prefix("t-").unwrap_or(tab).to_string();
+        Caller { pane: format!("p-{name}"), role, tab: tab.into(), tab_name, team: None, session_name: name.into() }
     }
     fn mgr() -> Caller {
         caller(Role::Manager, "t-billing", "billing")
@@ -789,11 +953,11 @@ mod tests {
     fn state_machine_user_only_done() {
         let f = fx();
         let m = mgr();
-        let id = f.inbox.post(&m, "billing", new_item("결제 실패")).unwrap();
+        let id = f.inbox.post(&m, new_item("결제 실패")).unwrap();
         let it = f.inbox.get(&id).unwrap();
         assert_eq!(it.state, ItemState::New);
         assert!(!it.read);
-        assert_eq!(it.owner_tab, "t-billing");
+        assert_eq!(it.owner_name, "billing");
         assert_eq!(it.timeline[0].kind, TimelineKind::Posted);
         assert!(f.last.load(Ordering::SeqCst) >= 1, "post emits inbox-changed");
         // id format: YYYYMMDD-HHMMSS-xxxx
@@ -837,7 +1001,7 @@ mod tests {
     fn reinstruct_from_close_proposed_returns_in_progress() {
         let f = fx();
         let m = mgr();
-        let id = f.inbox.post(&m, "billing", new_item("x")).unwrap();
+        let id = f.inbox.post(&m, new_item("x")).unwrap();
         f.inbox.propose_close(&m, &id, "끝").unwrap();
         f.inbox.instruct(&id, "하나 더 확인해 줘").unwrap();
         let it = f.inbox.get(&id).unwrap();
@@ -859,7 +1023,7 @@ mod tests {
     fn concurrent_notes_are_all_kept() {
         let f = fx();
         let m = mgr();
-        let id = f.inbox.post(&m, "billing", new_item("x")).unwrap();
+        let id = f.inbox.post(&m, new_item("x")).unwrap();
         std::thread::scope(|s| {
             for t in 0..8 {
                 let (inbox, m, id) = (&f.inbox, &m, &id);
@@ -880,7 +1044,7 @@ mod tests {
         f.inbox.note(&m, &id, "같은 메모").unwrap();
         assert_eq!(f.inbox.get(&id).unwrap().timeline.len(), 82);
         // a retried identical post returns the same item
-        let id2 = f.inbox.post(&m, "billing", new_item("x")).unwrap();
+        let id2 = f.inbox.post(&m, new_item("x")).unwrap();
         assert_eq!(id2, id);
     }
 
@@ -888,7 +1052,7 @@ mod tests {
     fn add_files_never_overwrites_or_escapes() {
         let f = fx();
         let m = mgr();
-        let id = f.inbox.post(&m, "billing", new_item("x")).unwrap();
+        let id = f.inbox.post(&m, new_item("x")).unwrap();
         let src = f.dir.path().join("src");
         std::fs::create_dir_all(src.join("sub")).unwrap();
         std::fs::write(src.join("a.md"), "one").unwrap();
@@ -965,7 +1129,7 @@ mod tests {
     fn tampered_issue_link_is_refused() {
         let f = fx();
         let m = mgr();
-        let id = f.inbox.post(&m, "billing", new_item("x")).unwrap();
+        let id = f.inbox.post(&m, new_item("x")).unwrap();
         let ws = f.dir.path().join("billing");
         std::fs::create_dir(&ws).unwrap();
         let src = f.dir.path().join("a.md");
@@ -999,13 +1163,13 @@ mod tests {
         let other = caller(Role::Manager, "t-api", "api");
         let disp = caller(Role::Dispatcher, "t-disp", "dispatcher");
         let lead = caller(Role::Lead, "t-billing", "billing-batch-lead");
-        let id = f.inbox.post(&m, "billing", new_item("x")).unwrap();
+        let id = f.inbox.post(&m, new_item("x")).unwrap();
         for c in [&other, &disp, &lead] {
             assert!(f.inbox.note(c, &id, "x").is_err(), "{c:?}");
             assert!(f.inbox.propose_close(c, &id, "x").is_err(), "{c:?}");
             assert!(f.inbox.link_issue(c, &id, "20261025-x", std::path::Path::new("x")).is_err(), "{c:?}");
         }
-        assert!(f.inbox.post(&disp, "dispatcher", new_item("y")).is_err(), "only a Manager posts");
+        assert!(f.inbox.post(&disp, new_item("y")).is_err(), "only a Manager posts");
         let err = f.inbox.note(&other, &id, "x").unwrap_err();
         assert!(err.contains("담당"), "{err}");
         let it = f.inbox.get(&id).unwrap();
@@ -1013,7 +1177,7 @@ mod tests {
         f.inbox.note(&m, &id, "확인 중").unwrap();
         assert_eq!(f.inbox.get(&id).unwrap().timeline[1].who, "billing");
         // visibility: dispatcher all, manager own, others nothing
-        f.inbox.post(&other, "api", new_item("z")).unwrap();
+        f.inbox.post(&other, new_item("z")).unwrap();
         assert_eq!(f.inbox.list_for(&disp, None).len(), 2);
         assert_eq!(f.inbox.list_for(&m, None).len(), 1);
         assert_eq!(f.inbox.list_for(&other, None).len(), 1);
@@ -1022,10 +1186,121 @@ mod tests {
         assert!(f.inbox.list_for(&disp, Some(ItemState::Done)).is_empty());
     }
 
+    /// R29 / final review #3: ownership is the owner tab's name, so a fresh start that
+    /// renumbers tab ids neither hands items to another Manager nor locks out the owner.
+    #[test]
+    fn ownership_follows_the_tab_name_not_the_tab_id() {
+        let f = fx();
+        let before = Caller { tab: "t5".into(), ..caller(Role::Manager, "t-billing", "billing") };
+        let id = f.inbox.post(&before, new_item("x")).unwrap();
+        // fresh start: billing is now t2, and t5 belongs to ops
+        let billing = Caller { tab: "t2".into(), ..caller(Role::Manager, "t-billing", "billing") };
+        let ops = Caller { tab: "t5".into(), ..caller(Role::Manager, "t-ops", "ops") };
+        assert!(f.inbox.note(&ops, &id, "x").unwrap_err().contains("담당"));
+        assert!(f.inbox.propose_close(&ops, &id, "x").is_err());
+        assert!(f.inbox.list_for(&ops, None).is_empty());
+        f.inbox.note(&billing, &id, "확인 중").unwrap();
+        assert_eq!(f.inbox.list_for(&billing, None).len(), 1);
+        // a retried post from the renumbered tab is still recognised as the same item
+        assert_eq!(f.inbox.post(&billing, new_item("x")).unwrap(), id);
+        // the file carries no tab id
+        let text = std::fs::read_to_string(f.dir.path().join("inbox").join(format!("{id}.json"))).unwrap();
+        assert!(!text.contains("ownerTab") && !text.contains("t5"), "{text}");
+    }
+
+    #[test]
+    fn rename_owner_moves_every_item_of_that_name() {
+        let f = fx();
+        let m = mgr();
+        let a = f.inbox.post(&m, new_item("a")).unwrap();
+        let b = f.inbox.post(&m, new_item("b")).unwrap();
+        f.inbox.propose_close(&m, &b, "끝").unwrap();
+        f.inbox.confirm_done(&b).unwrap();
+        let other = f.inbox.post(&caller(Role::Manager, "t-api", "api"), new_item("c")).unwrap();
+        let v = f.last.load(Ordering::SeqCst);
+        let undo = f.inbox.rename_owner("billing", "billing2").unwrap();
+        assert_eq!(undo.len(), 2);
+        assert!(f.last.load(Ordering::SeqCst) > v, "a rename publishes");
+        for id in [&a, &b] {
+            assert_eq!(f.inbox.get(id).unwrap().owner_name, "billing2");
+        }
+        assert_eq!(f.inbox.get(&other).unwrap().owner_name, "api");
+        // persisted
+        let (again, _) = Inbox::load(f.dir.path().join("inbox"), Arc::new(|_| {}));
+        assert_eq!(again.get(&a).unwrap().owner_name, "billing2");
+        // the renamed Manager owns them; the old name does not
+        let renamed = caller(Role::Manager, "t-billing2", "billing");
+        f.inbox.note(&renamed, &a, "x").unwrap();
+        assert!(f.inbox.note(&m, &a, "y").is_err());
+        // rollback puts the old names back
+        f.inbox.rename_owner_undo(&undo);
+        assert_eq!(f.inbox.get(&a).unwrap().owner_name, "billing");
+        assert_eq!(f.inbox.rename_owner("nobody", "x").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn legacy_owner_tab_ids_are_migrated_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox_dir = dir.path().join("inbox");
+        std::fs::create_dir_all(&inbox_dir).unwrap();
+        let mut legacy = serde_json::to_value(sample_item()).unwrap();
+        for (id, tab, name) in [("20261025-000000-aaaa", "t5", "billing"), ("20261025-000000-bbbb", "t9", "gone")] {
+            legacy["id"] = id.into();
+            legacy["ownerTab"] = tab.into();
+            legacy["ownerName"] = name.into();
+            std::fs::write(inbox_dir.join(format!("{id}.json")), serde_json::to_string(&legacy).unwrap()).unwrap();
+        }
+        let (inbox, errs) = Inbox::load(inbox_dir.clone(), Arc::new(|_| {}));
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(inbox.get("20261025-000000-aaaa").unwrap().owner_tab.as_deref(), Some("t5"));
+        let mut seen = Vec::new();
+        let errs = inbox.migrate_legacy_owners(|tab, name| {
+            seen.push((tab.to_string(), name.to_string()));
+            (tab == "t5").then(|| "billing-new".to_string())
+        });
+        assert!(errs.is_empty(), "{errs:?}");
+        seen.sort();
+        assert_eq!(seen, [("t5".to_string(), "billing".to_string()), ("t9".to_string(), "gone".to_string())]);
+        let a = inbox.get("20261025-000000-aaaa").unwrap();
+        assert_eq!((a.owner_name.as_str(), a.owner_tab.as_deref()), ("billing-new", None));
+        // unmappable: the name is kept (owner unknown until a tab of that name exists)
+        let b = inbox.get("20261025-000000-bbbb").unwrap();
+        assert_eq!((b.owner_name.as_str(), b.owner_tab.as_deref()), ("gone", None));
+        for f in ["20261025-000000-aaaa.json", "20261025-000000-bbbb.json"] {
+            let text = std::fs::read_to_string(inbox_dir.join(f)).unwrap();
+            assert!(!text.contains("ownerTab"), "{text}");
+        }
+        // nothing left to migrate
+        let errs = inbox.migrate_legacy_owners(|_, _| panic!("already migrated"));
+        assert!(errs.is_empty());
+    }
+
+    /// Review #10: an indexer / sync client briefly holding the item file (Windows sharing
+    /// violation) must not fail the write — the rename is retried for a short, bounded time.
+    #[cfg(windows)]
+    #[test]
+    fn item_write_retries_a_briefly_locked_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let f = fx();
+        let m = mgr();
+        let id = f.inbox.post(&m, new_item("x")).unwrap();
+        let path = f.dir.path().join("inbox").join(format!("{id}.json"));
+        let lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            drop(lock);
+        });
+        f.inbox.note(&m, &id, "잠긴 동안 메모").unwrap();
+        t.join().unwrap();
+        let (again, _) = Inbox::load(f.dir.path().join("inbox"), Arc::new(|_| {}));
+        assert_eq!(again.get(&id).unwrap().timeline.len(), 2);
+        assert!(!f.dir.path().join("inbox").join(format!("{id}.json.tmp")).exists());
+    }
+
     #[test]
     fn corrupt_item_file_is_skipped_with_error() {
         let f = fx();
-        let id = f.inbox.post(&mgr(), "billing", new_item("x")).unwrap();
+        let id = f.inbox.post(&mgr(), new_item("x")).unwrap();
         let dir = f.dir.path().join("inbox");
         std::fs::write(dir.join("20261025-000000-dead.json"), "{ not json").unwrap();
         std::fs::write(dir.join("20261025-000001-beef.json"), r#"{"id":"other"}"#).unwrap();
@@ -1047,10 +1322,10 @@ mod tests {
     #[test]
     fn post_system_and_list_order() {
         let f = fx();
-        let id = f.inbox.post_system("t-billing", "billing", "야간 정리 시간 초과", vec!["확인".into()], vec![]).unwrap();
+        let id = f.inbox.post_system("billing", "야간 정리 시간 초과", vec!["확인".into()], vec![]).unwrap();
         let it = f.inbox.get(&id).unwrap();
         assert_eq!((it.source.as_str(), it.timeline[0].who.as_str()), (WHO_APP, WHO_APP));
-        let id2 = f.inbox.post(&mgr(), "billing", new_item("x")).unwrap();
+        let id2 = f.inbox.post(&mgr(), new_item("x")).unwrap();
         let l = f.inbox.list(false);
         assert_eq!(l.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>().len(), 2);
         assert!(l.items[0].id >= l.items[1].id, "newest first");
@@ -1062,7 +1337,7 @@ mod tests {
     fn sample_item() -> InboxItem {
         InboxItem {
             id: "20261025-140307-a1b2".into(),
-            owner_tab: "t-billing".into(),
+            owner_tab: None,
             owner_name: "billing".into(),
             title: "정산 배치 지연".into(),
             check: vec!["재실행 가능 시간".into(), "영향 받는\n거래처".into()],
@@ -1125,7 +1400,7 @@ mod tests {
     fn request_issue_records_timeline() {
         let f = fx();
         let m = mgr();
-        let id = f.inbox.post(&m, "billing", new_item("결제 실패")).unwrap();
+        let id = f.inbox.post(&m, new_item("결제 실패")).unwrap();
         let v = f.last.load(Ordering::SeqCst);
         f.inbox.request_issue(&id).unwrap();
         let it = f.inbox.get(&id).unwrap();
@@ -1139,7 +1414,7 @@ mod tests {
         f.inbox.link_issue(&m, &id, "20261025-결제-실패", Path::new("C:/x/issues/20261025-결제-실패")).unwrap();
         assert!(f.inbox.request_issue(&id).unwrap_err().contains("이미"));
         // a done item refuses
-        let id2 = f.inbox.post(&m, "billing", new_item("다른 건")).unwrap();
+        let id2 = f.inbox.post(&m, new_item("다른 건")).unwrap();
         f.inbox.propose_close(&m, &id2, "끝").unwrap();
         f.inbox.confirm_done(&id2).unwrap();
         assert!(f.inbox.request_issue(&id2).unwrap_err().contains("완료"));

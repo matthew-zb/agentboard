@@ -18,6 +18,8 @@ import {
   timelineLabel,
   routeText,
   shortTime,
+  ownerLabel,
+  markUnknownOwners,
 } from './inbox-logic.js';
 import { fileModeKey } from './docview-logic.js';
 
@@ -54,7 +56,7 @@ export function buildList(doc, items, { selected = null, hideDone = true, total 
     row.classList.toggle('sel', it.id === selected);
     const badge = el(doc, 'span', `inbox-badge st-${it.state}`, stateLabel(it.state));
     const title = el(doc, 'span', 'inbox-title', it.title);
-    const meta = el(doc, 'span', 'inbox-meta', `${it.ownerName} · ${shortTime(it.created)}`);
+    const meta = el(doc, 'span', 'inbox-meta', `${ownerLabel(it)} · ${shortTime(it.created)}`);
     row.append(badge, title, meta);
     rows.appendChild(row);
   }
@@ -110,7 +112,7 @@ export function buildDetail(doc, item, { focused = false, files = null, fileSel 
   head.append(el(doc, 'span', `inbox-badge st-${item.state}`, stateLabel(item.state)), el(doc, 'span', 'inbox-dtitle', item.title));
   root.appendChild(head);
   root.append(
-    field(doc, '담당', item.ownerName),
+    field(doc, '담당', ownerLabel(item)),
     field(doc, '출처', [item.source === 'app' ? '앱' : item.source, shortTime(item.created)].filter(Boolean).join(' · ')),
     field(doc, '경로', routeText(item)),
   );
@@ -193,7 +195,7 @@ function refresh() {
       // versions only grow within a run: an older answer arriving late is dropped
       if (seq !== store.seq && r.version < store.version) return;
       store.version = r.version;
-      store.items = Array.isArray(r.items) ? r.items : [];
+      store.items = markUnknownOwners(Array.isArray(r.items) ? r.items : [], r.unknownOwners);
       store.error = null;
       for (const v of store.views) v.render();
     },
@@ -471,7 +473,8 @@ export function mountInbox() {
     const item = selected();
     if (!item) return;
     if (!canDo(action, item)) {
-      deps.toast(why);
+      const lost = item.ownerMissing && (action === 'instruct' || action === 'issue');
+      deps.toast(lost ? `담당 탭 '${item.ownerName}'이(가) 없는 항목입니다 — 보낼 Manager가 없습니다` : why);
       return;
     }
     fn(item);

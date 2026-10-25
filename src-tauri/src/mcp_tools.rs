@@ -349,6 +349,16 @@ pub fn tab_workspace(state: &AppState, tab: &str) -> Result<std::path::PathBuf, 
         .ok_or_else(|| "담당 탭이 없어 이슈 폴더를 확인할 수 없습니다".to_string())
 }
 
+/// Workspace of the inbox owner tab (by name, R29).
+pub fn owner_workspace(state: &AppState, owner_name: &str) -> Result<std::path::PathBuf, String> {
+    let ws = state.ws.lock().unwrap();
+    ws.tabs
+        .values()
+        .find(|t| t.name == owner_name && t.role.is_some())
+        .map(|t| t.workspace.clone())
+        .ok_or_else(|| format!("담당 탭 '{owner_name}'이(가) 없어 이슈 폴더를 확인할 수 없습니다"))
+}
+
 fn opt_str(args: &Value, key: &str) -> Result<Option<String>, String> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -391,8 +401,7 @@ fn inbox_post(state: &AppState, caller: &Caller, args: &Value) -> Result<Value, 
         source,
         refs: capped_list(args, "refs", false)?,
     };
-    let (tab_name, _) = caller_tab(state, caller)?;
-    Ok(json!(state.inbox.post(caller, &tab_name, new)?))
+    Ok(json!(state.inbox.post(caller, new)?))
 }
 
 /// `{"issue": id, "path", "input", "output"}`. With `item`: the caller must own it, and an
@@ -936,7 +945,8 @@ mod tests {
         fn who(&self, s: &str) -> Caller {
             let ws = self.state.ws.lock().unwrap();
             let p = ws.panes.values().find(|p| p.session_name.as_deref() == Some(s)).unwrap_or_else(|| panic!("no session {s}"));
-            Caller { pane: p.id.clone(), role: p.role.unwrap(), tab: p.tab.clone(), team: p.team.clone(), session_name: s.into() }
+            let tab_name = ws.tabs[&p.tab].name.clone();
+            Caller { pane: p.id.clone(), role: p.role.unwrap(), tab: p.tab.clone(), tab_name, team: p.team.clone(), session_name: s.into() }
         }
         fn call(&self, who: &str, tool: &str, args: Value) -> Result<Value, String> {
             call(&self.state, &self.who(who), tool, args)
@@ -962,6 +972,34 @@ mod tests {
     }
 
     const TWO_MANAGERS: &str = r#"{"tabs":[{"name":"billing","role":"manager","dir":"billing"},{"name":"ops","role":"manager","dir":"ops"}]}"#;
+
+    /// R29: renaming a Manager tab moves the owner of its inbox items in the same operation
+    /// (config entry + items + model), so the renamed Manager keeps its items and nobody else
+    /// gets them; closing a role tab orphans its items (owner unknown, dispatcher only).
+    #[test]
+    fn rename_of_a_manager_tab_moves_its_inbox_items() {
+        let f = fx(TWO_MANAGERS);
+        let id = f.call("billing", "inbox_post", json!({"title":"정산","check":[],"risk":[],"source":"s"})).unwrap();
+        let id = id.as_str().unwrap().to_string();
+        let b = f.who("billing").tab;
+        crate::launcher::execute(&f.state, WsCommand::RenameTab { tab: b, name: "billing2".into() }).unwrap();
+        assert_eq!(f.state.inbox.get(&id).unwrap().owner_name, "billing2");
+        let v: Value = serde_json::from_str(&f.config_text()).unwrap();
+        assert_eq!(v["tabs"][0]["name"], "billing2");
+        // the live session keeps its name (R15) but owns the items through its tab
+        f.call("billing", "inbox_note", json!({"item": id, "text": "확인"})).unwrap();
+        assert_eq!(f.call("billing", "inbox_list", json!({})).unwrap().as_array().unwrap().len(), 1);
+        assert!(f.call("ops", "inbox_note", json!({"item": id, "text": "x"})).is_err());
+        // a refused rename changes neither config nor items
+        let o = f.who("ops").tab;
+        assert!(crate::launcher::execute(&f.state, WsCommand::RenameTab { tab: o.clone(), name: "billing2".into() }).is_err());
+        assert_eq!(f.state.inbox.get(&id).unwrap().owner_name, "billing2");
+        // closing the owner tab leaves the item to the dispatcher only
+        let b = f.who("billing").tab;
+        crate::launcher::execute(&f.state, WsCommand::CloseTab { tab: b }).unwrap();
+        assert_eq!(f.call("ops", "inbox_list", json!({})).unwrap().as_array().unwrap().len(), 0);
+        assert_eq!(f.call("dispatcher", "inbox_list", json!({})).unwrap().as_array().unwrap().len(), 1);
+    }
 
     #[test]
     fn handoff_done_only_for_standing_roles_and_harmless_outside_a_run() {

@@ -32,7 +32,7 @@
 use crate::control::{Caller, HookRouter, StateHost};
 use crate::inbox::{self, InboxItem, ItemState};
 use crate::profiles::{encode_submit, Submit};
-use crate::workspace::{PaneId, TabId};
+use crate::workspace::PaneId;
 use crate::AppState;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -211,7 +211,6 @@ pub fn write_pipe(socket: &str, token: &str, text: &str) -> Result<(), String> {
 
 struct Target {
     name: String,
-    tab: TabId,
     tab_name: String,
     submit: Submit,
 }
@@ -234,7 +233,7 @@ fn target(state: &AppState, pane: &str) -> Result<Target, String> {
         let loaded = state.loaded.read().unwrap();
         crate::launcher::profile_for(&p, &loaded).map(|pr| pr.submit.clone()).unwrap_or_default()
     };
-    Ok(Target { name: p.name, tab: p.tab, tab_name, submit })
+    Ok(Target { name: p.name, tab_name, submit })
 }
 
 /// Queue `text` for the role session of `pane` and wake the worker. `Ok` means queued, not
@@ -465,11 +464,11 @@ fn finish(state: &AppState, pane: &str, id: u64, via: Via) {
 fn expire(state: &AppState, t: &Target, p: Pending) {
     let preview: String = p.text.chars().take(300).collect();
     let more = if p.text.chars().count() > 300 { "…" } else { "" };
-    let posted = state.inbox.post_system(
-        &t.tab,
+    // one open item per pane: later failures are appended to its timeline (final review #11)
+    let posted = state.inbox.post_system_coalesced(
         &t.tab_name,
         &format!("앱 메시지 전달 실패 — {}", t.name),
-        vec![format!("전달하지 못한 메시지: {preview}{more}")],
+        format!("전달하지 못한 메시지: {preview}{more}"),
         vec!["세션이 10분 동안 메시지 통로를 보고하지 않았거나(재시작·hook 실패) 계속 작업 중이었습니다".into()],
     );
     if let Err(e) = posted {
@@ -505,15 +504,24 @@ pub fn dispatcher_pane(state: &AppState) -> Result<PaneId, String> {
     }
 }
 
-/// Session name of the owner tab's standing agent (`@<session>`); the item's owner name when
-/// the tab or its agent is gone.
-fn owner_session(state: &AppState, it: &InboxItem) -> String {
+/// Session name of the owner tab's standing agent (`@<session>`). The owner is the tab whose
+/// name is the item's `owner_name` (R29). Err (Korean) when no such tab with a standing agent
+/// exists — the item's owner is unknown (closed Manager tab, legacy item that could not be
+/// mapped), and nothing is relayed to a session that does not exist (final review #9).
+pub fn owner_session(state: &AppState, it: &InboxItem) -> Result<String, String> {
     let ws = state.ws.lock().unwrap();
+    owner_session_in(&ws, &it.owner_name).ok_or_else(|| {
+        format!("이 항목의 담당 탭 '{}'이(가) 없습니다(담당 없음) — 전달하지 않았습니다", it.owner_name)
+    })
+}
+
+/// [`owner_session`] on a locked model; `None` = owner unknown.
+pub fn owner_session_in(ws: &crate::workspace::Workspace, owner_name: &str) -> Option<String> {
+    let tab = ws.tabs.values().find(|t| t.name == owner_name && t.role.is_some())?;
     ws.panes
         .values()
-        .find(|p| p.tab == it.owner_tab && p.role.is_some_and(|r| r.is_standing()))
+        .find(|p| p.tab == tab.id && p.role.is_some_and(|r| r.is_standing()))
         .and_then(|p| p.session_name.clone())
-        .unwrap_or_else(|| it.owner_name.clone())
 }
 
 fn open_item(state: &AppState, id: &str) -> Result<InboxItem, String> {
@@ -536,8 +544,9 @@ fn fits(msg: &str) -> Result<(), String> {
 pub fn relay_instruct(state: &AppState, id: &str, text: &str) -> Result<(), String> {
     let text = inbox::clean_instruction(text)?;
     let it = open_item(state, id)?;
+    let owner = owner_session(state, &it)?;
     let disp = dispatcher_pane(state)?;
-    let msg = inbox::instruct_message(&it, &owner_session(state, &it), &text);
+    let msg = inbox::instruct_message(&it, &owner, &text);
     fits(&msg)?;
     state.inbox.instruct(id, &text)?;
     send(state, &disp, &msg)
@@ -547,8 +556,9 @@ pub fn relay_instruct(state: &AppState, id: &str, text: &str) -> Result<(), Stri
 /// Manager create the issue.
 pub fn relay_issue_request(state: &AppState, id: &str) -> Result<(), String> {
     let it = open_item(state, id)?;
+    let owner = owner_session(state, &it)?;
     let disp = dispatcher_pane(state)?;
-    let msg = inbox::issue_request_message(&it, &owner_session(state, &it));
+    let msg = inbox::issue_request_message(&it, &owner);
     fits(&msg)?;
     state.inbox.request_issue(id)?;
     send(state, &disp, &msg)
@@ -571,8 +581,9 @@ pub fn confirm_done(state: &AppState, id: &str) -> Result<Option<String>, String
     state.inbox.confirm_done(id)?;
     let notice = (|| {
         let it = state.inbox.get(id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))?;
+        let owner = owner_session(state, &it)?;
         let disp = dispatcher_pane(state)?;
-        send(state, &disp, &inbox::done_message(&it, &owner_session(state, &it)))
+        send(state, &disp, &inbox::done_message(&it, &owner))
     })();
     Ok(notice.err().map(|e| format!("완료로 바꿨지만 담당 Manager에게 알리지 못했습니다 — {e}")))
 }

@@ -251,7 +251,8 @@ mod tests {
         fn caller_of(&self, pane: &str) -> Caller {
             let ws = self.state.ws.lock().unwrap();
             let p = ws.pane_by_id(pane).unwrap();
-            Caller { pane: p.id.clone(), role: p.role.unwrap(), tab: p.tab.clone(), team: None, session_name: p.session_name.clone().unwrap() }
+            let tab_name = ws.tabs[&p.tab].name.clone();
+            Caller { pane: p.id.clone(), role: p.role.unwrap(), tab: p.tab.clone(), tab_name, team: None, session_name: p.session_name.clone().unwrap() }
         }
         fn caller(&self) -> Caller {
             self.caller_of(&self.pane)

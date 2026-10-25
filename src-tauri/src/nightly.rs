@@ -716,11 +716,11 @@ pub fn perform(state: &AppState, file: Option<&Path>, actions: Vec<Action>) {
             Action::Discard { pane } => {
                 crate::bridge::discard(state, &pane, |t| t.starts_with(MESSAGE_MARK));
             }
-            Action::Incomplete { tab, tab_name, name, reason, .. } => {
-                post_item(state, &tab, &tab_name, &format!("야간 정리 미완료: {name}"), reason);
+            Action::Incomplete { tab_name, name, reason, .. } => {
+                post_item(state, &tab_name, &format!("야간 정리 미완료: {name}"), reason);
             }
-            Action::Held { tab, tab_name, name, reason, .. } => {
-                post_item(state, &tab, &tab_name, &format!("야간 정리 보류: {name}"), reason);
+            Action::Held { tab_name, name, reason, .. } => {
+                post_item(state, &tab_name, &format!("야간 정리 보류: {name}"), reason);
             }
             Action::Restart { pane, gen } => {
                 // re-checked now (minor 3): an exit or a user restart since the observation
@@ -737,8 +737,8 @@ pub fn perform(state: &AppState, file: Option<&Path>, actions: Vec<Action>) {
     }
 }
 
-fn post_item(state: &AppState, tab: &str, tab_name: &str, title: &str, reason: String) {
-    if let Err(e) = state.inbox.post_system(tab, tab_name, title, vec![reason], Vec::new()) {
+fn post_item(state: &AppState, tab_name: &str, title: &str, reason: String) {
+    if let Err(e) = state.inbox.post_system(tab_name, title, vec![reason], Vec::new()) {
         eprintln!("[agentboard] 인박스 시스템 항목을 만들 수 없습니다: {e}");
     }
 }
@@ -1387,7 +1387,7 @@ mod tests {
         );
         let items = state.inbox.list(false).items;
         assert_eq!(items[0].title, format!("야간 정리 보류: {}", m.name));
-        assert_eq!(items[0].owner_tab, m.tab);
+        assert_eq!(items[0].owner_name, m.tab_name);
         // R24 spawn times: only for the recorded generation
         state.nightly.note_spawn(&m.pane, 5, at("2026-10-25 08:00"));
         assert_eq!(state.nightly.spawned_at(&m.pane, Some(5)), Some(at("2026-10-25 08:00")));
@@ -1404,7 +1404,10 @@ mod tests {
         let file = appdata.path().join(FILE_NAME);
         let pane_of = |r: Role| ts.iter().find(|t| t.role == r).unwrap().clone();
         let (d, h, m) = (pane_of(Role::Dispatcher), pane_of(Role::Handover), pane_of(Role::Manager));
-        let caller = |t: &Target| Caller { pane: t.pane.clone(), role: t.role, tab: t.tab.clone(), team: None, session_name: t.name.clone() };
+        let caller = |t: &Target| {
+            let tab_name = state.ws.lock().unwrap().tabs[&t.tab].name.clone();
+            Caller { pane: t.pane.clone(), role: t.role, tab: t.tab.clone(), tab_name, team: None, session_name: t.name.clone() }
+        };
         let base = Instant::now();
 
         // outside a run: harmless
@@ -1445,7 +1448,7 @@ mod tests {
         let items = state.inbox.list(false).items;
         assert_eq!(items.len(), 1, "{items:?}");
         assert_eq!(items[0].title, format!("야간 정리 미완료: {}", h.name));
-        assert_eq!(items[0].owner_tab, h.tab);
+        assert_eq!(items[0].owner_name, h.tab_name);
         assert!(items[0].check[0].contains("handoff_done"));
         assert_eq!(items[0].source, crate::inbox::WHO_APP);
 

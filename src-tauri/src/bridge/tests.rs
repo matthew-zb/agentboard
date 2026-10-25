@@ -46,6 +46,7 @@ impl Fx {
             pane: p.id.clone(),
             role: p.role.unwrap(),
             tab: p.tab.clone(),
+            tab_name: ws.tabs[&p.tab].name.clone(),
             team: None,
             session_name: p.session_name.clone().unwrap(),
         }
@@ -246,14 +247,25 @@ fn queued_message_expires_with_error_and_inbox_item() {
     let err = rx.recv_timeout(Duration::from_secs(1)).expect("outcome").expect_err("must fail");
     assert!(err.contains("10분"), "{err}");
     assert_eq!(fx.state.bridge.queued(&fx.pane), 0);
-    let tab = fx.caller().tab;
     let items = fx.state.inbox.list(false).items;
     assert_eq!(items.len(), 1, "one system item");
-    assert_eq!(items[0].owner_tab, tab);
     assert_eq!(items[0].owner_name, "billing");
     assert_eq!(items[0].source, crate::inbox::WHO_APP);
     assert!(items[0].title.contains("전달"), "{}", items[0].title);
     assert!(items[0].check.iter().any(|c| c.contains("만료될 메시지")));
+    // later failures of the same pane are appended to that item, not new items (review #11)
+    let id = items[0].id.clone();
+    for text in ["둘째 만료", "셋째 만료"] {
+        let rx = send_tracked(&fx.state, &fx.pane, text).unwrap();
+        pump(&fx.state, Instant::now() + QUEUE_TIMEOUT + Duration::from_secs(1));
+        assert!(rx.recv_timeout(Duration::from_secs(1)).expect("outcome").is_err());
+    }
+    let items = fx.state.inbox.list(false).items;
+    assert_eq!(items.len(), 1, "still one item: {items:?}");
+    assert_eq!(items[0].id, id);
+    let notes: Vec<&str> = items[0].timeline.iter().skip(1).map(|e| e.text.as_str()).collect();
+    assert!(notes.len() == 2 && notes[0].contains("둘째 만료") && notes[1].contains("셋째 만료"), "{notes:?}");
+    assert!(!items[0].read);
 }
 
 #[test]
@@ -456,7 +468,7 @@ impl Fx {
             source: "slack #ops".into(),
             refs: vec![],
         };
-        self.state.inbox.post(&self.caller(), "billing", item).unwrap()
+        self.state.inbox.post(&self.caller(), item).unwrap()
     }
 }
 
@@ -556,4 +568,31 @@ fn discard_drops_only_matching_undelivered_messages() {
     assert!(gone.recv_timeout(Duration::from_secs(1)).expect("outcome").is_err(), "tracked sender told");
     assert!(keep.try_recv().is_err(), "the other message still waits");
     assert_eq!(discard(&fx.state, "nope", |_| true), 0);
+}
+
+/// R29 / final review #3, #9: the relay finds the owner by tab name; an item whose owner tab
+/// is gone (or not yet migrated after a rename) is refused, nothing recorded or queued.
+#[test]
+fn inbox_relay_routes_by_owner_name_and_refuses_unknown_owners() {
+    use crate::workspace::PaneStatus;
+    let fx = fixture();
+    let disp = fx.dispatcher();
+    fx.set_status(&disp, PaneStatus::Running);
+    let id = fx.post("정산 배치 지연");
+    let tab = fx.caller().tab;
+    fx.state.ws.lock().unwrap().tabs.get_mut(&tab).unwrap().name = "billing2".into();
+    let before = fx.state.inbox.get(&id).unwrap();
+    let e = relay_instruct(&fx.state, &id, "지시").unwrap_err();
+    assert!(e.contains("담당 없음") && e.contains("billing"), "{e}");
+    assert!(relay_issue_request(&fx.state, &id).unwrap_err().contains("담당 없음"));
+    assert_eq!(fx.state.inbox.get(&id).unwrap(), before, "nothing recorded");
+    assert!(fx.queued_texts(&disp).is_empty(), "nothing queued");
+    // the rename migration (R29) re-attaches it; the live session name is still `billing` (R15)
+    fx.state.inbox.rename_owner("billing", "billing2").unwrap();
+    relay_instruct(&fx.state, &id, "지시").unwrap();
+    let texts = fx.queued_texts(&disp);
+    assert!(texts[0].contains("(billing2)") && texts[0].ends_with("담당 Manager(@billing)에게 전달하라."), "{}", texts[0]);
+    // a system item for a tab that does not exist
+    let gone = fx.state.inbox.post_system("gone", "x", vec![], vec![]).unwrap();
+    assert!(relay_instruct(&fx.state, &gone, "지시").unwrap_err().contains("담당 없음"));
 }

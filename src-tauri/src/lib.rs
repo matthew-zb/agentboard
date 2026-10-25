@@ -406,7 +406,21 @@ fn app_exit(app: AppHandle, state: State<'_, AppState>) {
 /// Inbox applet (Task 10): items newest first (done ones only with `show_done`) + version.
 #[tauri::command]
 fn inbox_list(state: State<'_, AppState>, show_done: bool) -> inbox::InboxList {
-    state.inbox.list(show_done)
+    inbox_list_with_owners(&state, show_done)
+}
+
+/// `inbox_list` plus the owners that have no tab any more (R29, review #9). `ws` is read and
+/// released before the inbox is called.
+fn inbox_list_with_owners(state: &AppState, show_done: bool) -> inbox::InboxList {
+    let known: std::collections::BTreeSet<String> = {
+        let ws = state.ws.lock().unwrap();
+        ws.tabs.values().filter(|t| bridge::owner_session_in(&ws, &t.name).is_some()).map(|t| t.name.clone()).collect()
+    };
+    let mut l = state.inbox.list(show_done);
+    let unknown: std::collections::BTreeSet<String> =
+        l.items.iter().filter(|i| !known.contains(&i.owner_name)).map(|i| i.owner_name.clone()).collect();
+    l.unknown_owners = unknown.into_iter().collect();
+    l
 }
 
 #[tauri::command]
@@ -462,9 +476,9 @@ async fn inbox_add_files(
     let res = tauri::async_runtime::spawn_blocking(move || {
         let app = app2;
         let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
-        let owner = state.inbox.get(&id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))?.owner_tab;
+        let owner = state.inbox.get(&id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))?.owner_name;
         // ws taken and released here; the inbox is called without it
-        let workspace = mcp_tools::tab_workspace(&state, &owner)?;
+        let workspace = mcp_tools::owner_workspace(&state, &owner)?;
         state.inbox.add_files(&id, &paths, target, &workspace)
     })
     .await
@@ -564,7 +578,7 @@ fn doc_open_url(url: String) -> Result<(), String> {
 fn inbox_issue_files(state: State<'_, AppState>, id: String) -> Result<docs::IssueFiles, String> {
     let item = state.inbox.get(&id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))?;
     let Some(issue) = item.issue else { return Ok(docs::IssueFiles::default()) };
-    let workspace = mcp_tools::tab_workspace(&state, &item.owner_tab)?;
+    let workspace = mcp_tools::owner_workspace(&state, &item.owner_name)?;
     docs::issue_files(&issues::resolve(&workspace, &issue)?)
 }
 
@@ -631,11 +645,13 @@ fn restore_or_fresh(
     ws_path: &std::path::Path,
     saving: &mut bool,
     startup_errors: &mut Vec<String>,
+    restored: &mut bool,
 ) -> (Workspace, Effects) {
     let (mut ws, fx, errors) = persist::restore_plan(ws, loaded);
     match ws.normalize_and_validate() {
         Ok(()) => {
             startup_errors.extend(errors);
+            *restored = true;
             (ws, fx)
         }
         Err(e) => {
@@ -706,8 +722,10 @@ pub fn run() {
             let ws_path = appdata.join("workspace.json");
             let mut startup_errors = Vec::new();
             let mut saving = true;
+            // tab ids are trustworthy for the legacy inbox migration only in a restored layout
+            let mut restored = false;
             let (ws, initial) = match persist::load(&ws_path) {
-                Ok(Some(ws)) => restore_or_fresh(ws, &loaded, &ws_path, &mut saving, &mut startup_errors),
+                Ok(Some(ws)) => restore_or_fresh(ws, &loaded, &ws_path, &mut saving, &mut startup_errors, &mut restored),
                 Ok(None) => {
                     let ws = Workspace::from_config(&loaded);
                     let fx = launcher::initial_effects(&ws);
@@ -750,6 +768,15 @@ pub fn run() {
                 }
             };
             app.manage(AppState::new(ws, loaded, pty, sink, tx, saver, startup_errors, agentcfg::default_run_dir()));
+            {
+                // R29: items written before name-keyed ownership carry a tab id; map it once
+                let state = app.state::<AppState>();
+                let ws = state.ws.lock().unwrap().clone();
+                let errs = state.inbox.migrate_legacy_owners(|tab, name| legacy_owner(&ws.tabs, restored, tab, name));
+                for e in errs {
+                    eprintln!("[agentboard] 인박스 항목 이전 실패: {e}");
+                }
+            }
             if let Some(listener) = listener {
                 let handle = app.handle().clone();
                 if let Err(e) = tauri::async_runtime::block_on(control::serve_on(handle, listener)) {
@@ -798,6 +825,22 @@ pub fn run() {
         });
 }
 
+/// Owner name of a pre-R29 inbox item that stored tab id `tab` and name `name`: the stored name
+/// when a role tab still has it; otherwise the current name of tab `tab` — but only when the
+/// layout was restored from workspace.json (a fresh start renumbers tab ids, so an id could
+/// name another Manager). `None` = keep the stored name (owner unknown, dispatcher only).
+fn legacy_owner(tabs: &TabMap, restored: bool, tab: &str, name: &str) -> Option<String> {
+    if tabs.values().any(|t| t.name == name && t.role.is_some()) {
+        return Some(name.to_string());
+    }
+    if !restored {
+        return None;
+    }
+    tabs.get(tab).filter(|t| t.role.is_some()).map(|t| t.name.clone())
+}
+
+type TabMap = std::collections::BTreeMap<crate::workspace::TabId, crate::workspace::Tab>;
+
 /// `%APPDATA%/agentboard` (settings.json, workspace.json) — not Tauri's identifier-based dir.
 pub fn appdata_dir() -> std::path::PathBuf {
     dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("agentboard")
@@ -810,6 +853,39 @@ mod tests {
 
     #[test]
     fn it_builds() {}
+
+    /// R29 legacy migration: the stored name wins; a tab id is trusted only in a restored
+    /// layout (a fresh start renumbers ids); otherwise the owner stays unknown.
+    #[test]
+    fn legacy_inbox_owner_mapping() {
+        let mut tabs = TabMap::new();
+        let mut tab = |id: &str, name: &str, role: Option<crate::roles::Role>| {
+            let t = crate::workspace::Tab {
+                id: id.into(),
+                name: name.into(),
+                dir: name.into(),
+                template: "solo".into(),
+                is_dispatcher: false,
+                workspace: std::path::PathBuf::from(name),
+                layout: crate::layout::LayoutNode::Leaf("p".into()),
+                last_focused_pane_id: "p".into(),
+                maximized_pane_id: None,
+                sync_input: false,
+                role,
+                team_seq: Default::default(),
+            };
+            tabs.insert(id.into(), t);
+        };
+        use crate::roles::Role::Manager;
+        tab("t2", "billing", Some(Manager));
+        tab("t5", "ops", Some(Manager));
+        tab("t7", "notes", None);
+        assert_eq!(legacy_owner(&tabs, false, "t5", "billing").as_deref(), Some("billing"), "name still exists");
+        assert_eq!(legacy_owner(&tabs, false, "t5", "renamed"), None, "fresh start: ids are not trusted");
+        assert_eq!(legacy_owner(&tabs, true, "t5", "renamed").as_deref(), Some("ops"), "restored: id → current name");
+        assert_eq!(legacy_owner(&tabs, true, "t7", "renamed"), None, "not a role tab");
+        assert_eq!(legacy_owner(&tabs, true, "t9", "renamed"), None, "gone");
+    }
 
     struct NullSink;
     impl PtySink for NullSink {

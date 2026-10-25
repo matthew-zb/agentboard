@@ -69,10 +69,11 @@ export function canDo(action, item) {
     case 'close':
       return item.state === 'close_proposed';
     case 'instruct':
+      return open && !item.ownerMissing;
     case 'save':
       return open;
     case 'issue':
-      return open && !item.issue;
+      return open && !item.issue && !item.ownerMissing;
     default:
       return false;
   }
@@ -151,10 +152,25 @@ export function timelineLabel(kind) {
   return TIMELINE[t] || String(t);
 }
 
+/**
+ * Items whose owner tab no longer exists (R29: ownership is the tab name; `unknownOwners`
+ * from inbox_list) get `ownerMissing: true` — copies, the input is not changed.
+ */
+export function markUnknownOwners(items, unknownOwners) {
+  if (!Array.isArray(unknownOwners) || !unknownOwners.length) return items;
+  const gone = new Set(unknownOwners);
+  return items.map((it) => (gone.has(it.ownerName) ? { ...it, ownerMissing: true } : it));
+}
+
+/** 담당: the owner tab's name, or `담당 없음(이름)` when that tab is gone. */
+export function ownerLabel(item) {
+  return item.ownerMissing ? `담당 없음(${item.ownerName})` : item.ownerName;
+}
+
 /** 경로: how the item reached its owner. */
 export function routeText(item) {
-  if (item.source === 'app') return `앱 → ${item.ownerName}`;
-  return `handover → dispatcher → ${item.ownerName}`;
+  if (item.source === 'app') return `앱 → ${ownerLabel(item)}`;
+  return `handover → dispatcher → ${ownerLabel(item)}`;
 }
 
 /** `2026-10-25T14:03:07+09:00` → `10-25 14:03` (local time as stored). */

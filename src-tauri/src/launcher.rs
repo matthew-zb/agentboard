@@ -92,11 +92,12 @@
 //!   then `loaded(write)` alone around the atomic config.json edit and the in-memory update,
 //!   then emit `env-changed` after releasing both. The new-tab wizard's Manager choice
 //!   (`create_manager_tab` Tauri command) runs the same code path as the MCP tool.
-//!   R27 (fix round 1): `execute` of `RenameTab` / `CloseTab` on a Manager / handover tab takes
-//!   `CONFIG_WRITE` itself (dry run under `ws -> loaded(read)`, released; config.json edit under
-//!   `loaded(write)` alone; then the model; rollback on failure). So no code may call `execute`
-//!   with one of those commands while holding `CONFIG_WRITE` (nothing does: `create_manager_tab`
-//!   only executes `CreateTab` under it).
+//!   R27 (fix round 1): `execute` of `RenameTab` / `CloseTab` takes `CONFIG_WRITE` itself, then
+//!   reads the tab (`ws`, released); for a Manager / handover tab: dry run under
+//!   `ws -> loaded(read)`, released; config.json edit under `loaded(write)` alone; (rename, R29)
+//!   the inbox owner names under the inbox lock alone; then the model; rollback on failure. So
+//!   no code may call `execute` with one of those commands while holding `CONFIG_WRITE`
+//!   (nothing does: `create_manager_tab` only executes `CreateTab` under it).
 //! * Environment check (envcheck.rs, Task 12): `AppState::env` (probe results) and its
 //!   refresh lock are leaves; the probe processes run holding only the refresh lock. Reading
 //!   items takes `ws` (clone, released), `loaded(read)`, and `trust` → PtyManager `panes`
@@ -328,9 +329,17 @@ pub fn publish(state: &AppState) -> Snapshot {
 /// read), release both, queue the effects for the launcher worker, then publish. Returns the
 /// exact snapshot that was emitted. A rejected command changes nothing, emits nothing.
 pub fn execute(state: &AppState, cmd: WsCommand) -> Result<Snapshot, String> {
-    match role_tab_config_edit(state, &cmd) {
-        Some((name, dir, edit)) => execute_with_config(state, cmd, &name, &dir, &edit),
-        None => execute_model(state, cmd),
+    match cmd {
+        WsCommand::RenameTab { .. } | WsCommand::CloseTab { .. } => {
+            // CONFIG_WRITE first, then the tab's name/dir are read: two concurrent renames of
+            // the same role tab cannot both act on the name read before the other's edit
+            let _cfg = config::CONFIG_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+            match role_tab_config_edit(state, &cmd) {
+                Some((name, dir, edit)) => execute_with_config(state, cmd, &name, &dir, &edit),
+                None => execute_model(state, cmd),
+            }
+        }
+        _ => execute_model(state, cmd),
     }
 }
 
@@ -348,12 +357,13 @@ fn role_tab_config_edit(state: &AppState, cmd: &WsCommand) -> Option<(String, St
     matches!(t.role, Some(Role::Manager | Role::Handover)).then(|| (t.name.clone(), t.dir.clone(), edit))
 }
 
-/// Same pattern as `create_manager_tab`: under `CONFIG_WRITE` — dry run on a copy of the model,
-/// then config.json (atomic, other keys kept) + the loaded config, then the model; a failed
-/// apply puts both back. A config write failure refuses the command (Korean error, nothing
-/// changed).
+/// Same pattern as `create_manager_tab`, called with `CONFIG_WRITE` held (by `execute`): dry
+/// run on a copy of the model, then config.json (atomic, other keys kept) + the loaded config,
+/// then (rename, R29) the owner name of the tab's inbox items, then the model; a failed step
+/// puts the earlier ones back. A config or inbox write failure refuses the command (Korean
+/// error, nothing changed). Lock order: CONFIG_WRITE → (`ws`, `loaded`) one at a time →
+/// inbox (leaf), never nested.
 fn execute_with_config(state: &AppState, cmd: WsCommand, name: &str, dir: &str, edit: &config::TabEntryEdit) -> Result<Snapshot, String> {
-    let _cfg = config::CONFIG_WRITE.lock().unwrap_or_else(|e| e.into_inner());
     {
         let ws = state.ws.lock().unwrap();
         let loaded = state.loaded.read().unwrap();
@@ -373,17 +383,31 @@ fn execute_with_config(state: &AppState, cmd: WsCommand, name: &str, dir: &str, 
         };
         (path, prev_text, prev_cfg)
     };
-    let res = execute_model(state, cmd);
-    if res.is_err() {
-        state.loaded.write().unwrap().config = prev_cfg;
-        if let Some(prev) = prev_text {
+    let rollback_config = |res: Result<Snapshot, String>| -> Result<Snapshot, String> {
+        state.loaded.write().unwrap().config = prev_cfg.clone();
+        if let Some(prev) = &prev_text {
             if let Err(re) = config::restore_config_file(&path, prev.as_deref()) {
                 return res.map_err(|e| format!("{e} (config.json을 되돌리지 못했습니다: {re})"));
             }
         }
+        res
+    };
+    // R29: the tab's inbox items follow the new name (all or nothing)
+    let undo = match edit {
+        config::TabEntryEdit::Rename(new) => match state.inbox.rename_owner(name, new) {
+            Ok(u) => u,
+            Err(e) => return rollback_config(Err(format!("인박스 항목의 담당을 바꿀 수 없어 탭 '{name}'의 이름을 바꾸지 않았습니다 — {e}"))),
+        },
+        config::TabEntryEdit::Remove => Vec::new(),
+    };
+    let res = execute_model(state, cmd);
+    if res.is_err() {
+        state.inbox.rename_owner_undo(&undo);
+        return rollback_config(res);
     }
-    if res.is_ok() {
-        state.ui.env_changed(); // folder-trust ids follow the tab
+    state.ui.env_changed(); // folder-trust ids follow the tab
+    if matches!(edit, config::TabEntryEdit::Remove) {
+        state.inbox.touch(); // its items lost their owner: the applet re-reads
     }
     res
 }

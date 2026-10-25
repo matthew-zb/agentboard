@@ -15,6 +15,8 @@ import {
   timelineLabel,
   routeText,
   shortTime,
+  ownerLabel,
+  markUnknownOwners,
 } from '../../src/inbox-logic.js';
 import { buildList, buildDetail, flatFiles } from '../../src/inbox.js';
 
@@ -326,4 +328,21 @@ test('detail lists issue input/output files; .md rows are marked, selection only
   // no issue → no list even when files are passed
   const d3 = buildDetail(fakeDoc(), item('10:00', 'new', false), { files });
   assert.ok(!all(d3).some((e) => e.className === 'inbox-file'));
+});
+
+test('unknown owners (R29): marked from inbox_list, labelled, and not instructable', () => {
+  const a = item('10:00', 'new', false);
+  const b = item('11:00', 'new', false, { ownerName: 'gone' });
+  const out = markUnknownOwners([a, b], ['gone']);
+  assert.equal(out[0].ownerMissing, undefined);
+  assert.equal(out[1].ownerMissing, true);
+  assert.equal(markUnknownOwners([a], undefined)[0], a, 'old backend: unchanged');
+  assert.equal(ownerLabel(out[0]), 'billing');
+  assert.equal(ownerLabel(out[1]), '담당 없음(gone)');
+  assert.equal(routeText(out[1]), 'handover → dispatcher → 담당 없음(gone)');
+  assert.equal(canDo('instruct', out[1]), false);
+  assert.equal(canDo('issue', out[1]), false);
+  assert.equal(canDo('save', out[1]), true, 'files can still be saved into a linked issue');
+  const list = buildList(fakeDoc(), out, { selected: null, hideDone: true, total: 2 });
+  assert.ok(list.textContent.includes('담당 없음(gone)'));
 });

@@ -53,6 +53,9 @@ pub struct Caller {
     pub pane: PaneId,
     pub role: Role,
     pub tab: TabId,
+    /// The tab's current name (inbox ownership, R29; can differ from `session_name` after a
+    /// rename until the next restart, R15).
+    pub tab_name: String,
     pub team: Option<String>,
     pub session_name: String,
 }
@@ -63,13 +66,15 @@ pub fn caller_for(state: &AppState, token: &str) -> Option<Caller> {
     let pane = state.tokens.resolve(token)?; // leaf lock, released here
     let ws = state.ws.lock().unwrap();
     let p = ws.pane_by_id(&pane)?;
-    if p.kind.is_applet() || !ws.tabs.contains_key(&p.tab) {
+    let tab = ws.tabs.get(&p.tab)?;
+    if p.kind.is_applet() {
         return None;
     }
     Some(Caller {
         pane: p.id.clone(),
         role: p.role?,
         tab: p.tab.clone(),
+        tab_name: tab.name.clone(),
         team: p.team.clone(),
         session_name: p.session_name.clone()?,
     })
