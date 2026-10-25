@@ -1377,11 +1377,10 @@ const STARTER_CONFIG: &str = r#"{
 "#;
 
 /// Create `.agentboard/` and copy embedded defaults — templates, agent profiles, role
-/// instructions (`roles/<role>.md`), keybindings.json as `{}` (user overrides only) and, on a
-/// fresh install only, a starter config.json. Never overwrites existing files.
+/// instructions (`roles/<role>.md`), keybindings.json as `{}` (user overrides only) and, when
+/// config.json is missing, a starter config.json. Never overwrites existing files.
 pub fn ensure_dotdir(root: &Path) -> Result<(), String> {
     let dot = root.join(".agentboard");
-    let fresh = !dot.exists();
     let tdir = dot.join("templates");
     let adir = dot.join("agents");
     let rdir = dot.join("roles");
@@ -1392,9 +1391,9 @@ pub fn ensure_dotdir(root: &Path) -> Result<(), String> {
         DEFAULT_TEMPLATES.iter().map(|(n, c)| (tdir.join(n), *c)).collect();
     files.extend(DEFAULT_AGENTS.iter().map(|(n, c)| (adir.join(n), *c)));
     files.extend(Role::ALL.iter().map(|r| (rdir.join(format!("{}.md", r.as_str())), crate::agentcfg::default_role_prompt(*r))));
-    if fresh {
-        files.push((dot.join("config.json"), STARTER_CONFIG));
-    }
+    // task 13 #5: gated on the file, not the folder — a first run that stopped before writing
+    // it still gets the starter; an existing config.json is never touched (below)
+    files.push((dot.join("config.json"), STARTER_CONFIG));
     crate::profiles::ensure_powershell_profile(&adir);
     // Overrides only: defaults always come from the embedded file, so a full copy here would
     // shadow future default changes. Existing files (incl. phase-1 full copies) stay as they are.
@@ -1737,10 +1736,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dot.join("config.json")).unwrap(), "{}");
         assert!(dot.join("roles/lead.md").exists(), "a deleted default comes back");
 
-        // an existing .agentboard without config.json (phase-1 user) gets no starter config
+        // task 13 #5: a missing config.json is written even when .agentboard exists (a first
+        // run that failed half-way, a phase-1 install) — never over an existing one
         std::fs::remove_file(dot.join("config.json")).unwrap();
         ensure_dotdir(d.path()).unwrap();
-        assert!(!dot.join("config.json").exists());
+        assert_eq!(std::fs::read_to_string(dot.join("config.json")).unwrap(), STARTER_CONFIG);
     }
 
     #[test]
@@ -2126,8 +2126,8 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let a = appdata_with_root(root.path());
             ensure_dotdir(root.path()).unwrap();
-            // no config.json (the fresh-install starter would pick dispatcher-inbox)
-            std::fs::remove_file(root.path().join(".agentboard/config.json")).unwrap();
+            // a config.json without a dispatcher block (the starter would pick dispatcher-inbox)
+            std::fs::write(root.path().join(".agentboard/config.json"), "{}").unwrap();
             let tp = root.path().join(".agentboard/templates");
             match content {
                 None => std::fs::remove_file(tp.join("dispatcher.json")).unwrap(),
