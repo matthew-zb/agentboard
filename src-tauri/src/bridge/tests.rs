@@ -133,20 +133,32 @@ impl FakePipe {
         let n = name.clone();
         // created before returning: a client can connect as soon as `start` returns
         let first = rt.block_on(async { ServerOptions::new().first_pipe_instance(true).create(&n) }).unwrap();
+        // Connections are read one at a time, in accept order (final review #5): the bridge
+        // writes back-to-back messages on consecutive connections, and per-connection reader
+        // tasks could finish out of order under load. The next instance is created before the
+        // read, so the client's next connect is never refused.
         rt.spawn(async move {
             let mut server = first;
             loop {
-                if server.connect().await.is_err() {
+                let connected = match server.connect().await {
+                    Ok(()) => true,
+                    // ERROR_NO_DATA: the client connected, wrote and closed before connect()
+                    // was polled — its bytes are still readable
+                    Err(e) => e.raw_os_error() == Some(232),
+                };
+                let mut conn = server;
+                server = match ServerOptions::new().create(&n) {
+                    Ok(s) => s,
+                    Err(_) => return, // the pipe name is gone (runtime shutting down)
+                };
+                if !connected {
+                    continue; // a failed connect loses nothing: wait on the next instance
+                }
+                let mut buf = Vec::new();
+                let _ = conn.read_to_end(&mut buf).await;
+                if tx.send(buf).is_err() {
                     return;
                 }
-                let mut conn = server;
-                server = ServerOptions::new().create(&n).unwrap();
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    let _ = conn.read_to_end(&mut buf).await;
-                    let _ = tx.send(buf);
-                });
             }
         });
         FakePipe { name, rx, _rt: rt }
