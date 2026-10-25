@@ -38,7 +38,7 @@ DevTools 정책(R9): 가속키 비활성화는 디버그·릴리스 공통. 컨�
 결과: (미기록)
 
 ## S1 — Alt 키 처리
-`src/app.js`에 임시 프로브가 있다: 문서 keydown capture에서 `Alt+H`를 `preventDefault`(`// TEMP(Task 9)`).
+`src/app.js`에 임시 프로브가 있다: 문서 keydown capture에서 `Alt+H`를 `preventDefault`(`// TEMP(Task 11)`).
 - [ ] 사용자 확인 필요 — `Alt`만 눌렀다 뗐을 때 xterm 포커스가 유지된다(이후 바로 타이핑됨).
 - [ ] 사용자 확인 필요 — `Alt`만 눌렀다 뗐을 때 경고음이 나지 않는다.
 - [ ] 사용자 확인 필요 — `Alt+H`(프로브 적용 상태)에서 경고음이 나지 않는다.
@@ -47,3 +47,13 @@ DevTools 정책(R9): 가속키 비활성화는 디버그·릴리스 공통. 컨�
 기대 결과: 포커스 유지, 경고음 없음.
 실패 시 대안(스펙 §10 S1, 순서대로): (1) keyup의 Alt에 `preventDefault` 적용, (2) 그래도 안 되면 Rust 서브클래싱으로 `WM_SYSKEYDOWN/WM_SYSCHAR` 처리.
 적용한 대안: (미기록)
+
+## Task 9 — Launcher와 Tauri 명령 계층
+자동 확인: `cargo test`(launcher 단위 테스트), `npx tauri dev` 실행 시 콘솔의 시작 요약 줄
+`[agentboard] startup: tabs=… panes=… running=… failed=… config_errors=…`과 패닉 없음.
+- [ ] 사용자 확인 필요 — `$env:AGENTBOARD_DEVTOOLS='1'; npx tauri dev`로 실행하고 DevTools 콘솔에서
+  `await window.__TAURI__.core.invoke('ws_snapshot')`를 호출한다. `workspace.tabs`에 dispatcher 탭과
+  config.json의 탭이 보이고, `workspace.panes[*].status.state`가 `running`이면 통과.
+- [ ] 사용자 확인 필요 — 화면에 포커스된 탭의 창 하나가 나타나 입력이 된다(Task 11 전까지의 임시 화면).
+
+결과: (미기록)

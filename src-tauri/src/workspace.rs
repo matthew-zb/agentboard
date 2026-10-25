@@ -262,6 +262,13 @@ impl Workspace {
         }
     }
 
+    /// Marks that the first prompt was injected without a ready signal. Unknown ids ignored.
+    pub fn set_prompt_warning(&mut self, pane: &str, on: bool) {
+        if let Some(p) = self.panes.get_mut(pane) {
+            p.prompt_warning = on;
+        }
+    }
+
     /// Panes whose process is alive (`starting` or `running`).
     pub fn running_count(&self) -> usize {
         self.panes.values().filter(|p| matches!(p.status, PaneStatus::Starting | PaneStatus::Running)).count()

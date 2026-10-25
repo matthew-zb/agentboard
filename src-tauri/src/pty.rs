@@ -40,6 +40,7 @@ pub(crate) fn filter_dsr(carry: &mut Vec<u8>, answered: &mut bool, chunk: &[u8])
     (data, false)
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpawnSpec {
     pub cmd: PathBuf,
     pub args: Vec<String>,

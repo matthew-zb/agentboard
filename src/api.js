@@ -29,8 +29,55 @@ export function resize(paneId, cols, rows) {
   return tauri().core.invoke('pty_resize', { pane: paneId, cols, rows });
 }
 
-export async function send(_cmd) {
-  throw new Error('not implemented until Task 9');
+const invoke = (name, args) => tauri().core.invoke(name, args);
+
+/** Apply a WsCommand (`{type: 'splitPane', ...}`); resolves to the Snapshot `{workspace, errors}`. */
+export function send(cmd) {
+  return invoke('ws_command', { cmd });
+}
+
+/** Current Snapshot `{workspace, errors}`. */
+export function snapshot() {
+  return invoke('ws_snapshot');
+}
+
+/** Called with a Snapshot after every model or pane status change; resolves to an unlisten fn. */
+export function onWorkspaceChanged(fn) {
+  return on('workspace-changed', fn);
+}
+
+/** Config error lines (`파일:줄:열 — 원인`), job object problems included. */
+export function configErrors() {
+  return invoke('config_errors');
+}
+
+/** Action → key string map from keybindings.json (defaults merged). */
+export function keybindings() {
+  return invoke('get_keybindings');
+}
+
+/** Keys the pane's agent profile wants delivered to the PTY instead of the app. */
+export function passthrough(paneId) {
+  return invoke('get_passthrough', { pane: paneId });
+}
+
+/** Directory names under workspaceRoot (no dot-dirs), sorted. */
+export function listDirs() {
+  return invoke('list_workspace_dirs');
+}
+
+/** Create `workspaceRoot/<name>`; rejects with a Korean message. */
+export function createDir(name) {
+  return invoke('create_workspace_dir', { name });
+}
+
+export function listTemplates() {
+  return invoke('list_templates');
+}
+
+/** `[[tabId, dir], ...]` for tabs whose working folder does not exist. */
+export function missingDirs() {
+  return invoke('missing_dirs');
 }
 
 /** Listen to a backend event; resolves to an unlisten function. */
