@@ -36,8 +36,10 @@ use std::time::Duration;
 pub const BODY_LIMIT: usize = 1024 * 1024;
 /// Deadline of one `tools/call`.
 pub const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Deadline of one hook handler (the hook CLI itself gives up after 2 s).
-pub const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Deadline of one hook handler. Equal to the hook CLI's own 2 s budget: hook handlers must
+/// finish in < 2 s (no pipe or PTY IO — the bridge queues and its worker delivers) so the
+/// replies, and with them a session's hook events, keep their order.
+pub const HOOK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Protocol versions accepted in `initialize`, newest first. A client's version from this list
 /// is echoed (spike P3); anything else is answered with the newest.
 pub const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];

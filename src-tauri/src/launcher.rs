@@ -58,6 +58,14 @@
 //!   `Ui::inbox_changed` emits). Never take `ws`/`loaded` while holding it: MCP tools and
 //!   commands read tab data from `ws` first (released), then call the inbox. `add_files`
 //!   copies with no lock held.
+//! * Bridge (bridge.rs, Task 7): `Bridge::inner` (registrations + queues), `Bridge::wake`
+//!   (worker condvar) and `AppState::last_input` are leaves. `flush_lock -> bridge inner`
+//!   (sink `output` → `bridge::on_output`, after `prompts` is released). `Bridge::pump_lock`
+//!   is taken only by `bridge::pump` (worker thread / tests) and is outermost: under it `ws`,
+//!   `loaded(read)`, the `panes` map (`current_gen`), `last_input`, `inner` and the inbox are
+//!   taken one at a time, each released before the next; the pipe write and the PTY fallback
+//!   `PtyManager::write` run holding only `pump_lock` (R13: write is allowed off the worker).
+//!   Hook handlers take only `panes` (released) then `inner`/`wake`; they never write pipes.
 //! * Never call `PtyManager::spawn/kill/remove/write/resize/attach_with` while holding `ws`,
 //!   `loaded` or `prompts`: spawn/kill/write can block, and the PTY threads call back into
 //!   the sink (`output` -> prompts, `exited` -> ws).
@@ -461,10 +469,13 @@ pub fn on_output(state: &AppState, id: &str, gen: u64, bytes: &[u8]) -> bool {
     if state.pty.current_gen(id) != Some(gen) {
         return false;
     }
-    let mut jobs = state.prompts.lock().unwrap();
-    if let Some(job) = jobs.get_mut(id).filter(|j| j.owns(gen)) {
-        job.feed(bytes, Instant::now());
+    {
+        let mut jobs = state.prompts.lock().unwrap();
+        if let Some(job) = jobs.get_mut(id).filter(|j| j.owns(gen)) {
+            job.feed(bytes, Instant::now());
+        }
     }
+    crate::bridge::on_output(state, id); // busy (leaf lock, after prompts is released)
     true
 }
 

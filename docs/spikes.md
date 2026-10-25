@@ -542,3 +542,13 @@ control.rs 구현 지침: `server/discover`에는 **정확히 HTTP 200 + JSON-RP
 - 본문 키 `event`, `stdin`, `socket`, `msgToken`, `cwd`. `socket` = `\\.\pipe\LOCAL\cc-msg-<32 hex>`, `msgToken` = 32자, `cwd` = `C:\workspace`
 - `stdin`은 파싱된 hook JSON 그대로. SessionStart에는 `session_title` = `--name` 값이 있었다
 → 스파이크의 미검증 항목 "공백 있는 경로를 따옴표로 감싼 shell form"이 이제 **확인됨**. hook 모드는 Tauri 창을 띄우지 않고 바로 끝났다(남은 프로세스 없음).
+
+## 2단계 Task 7 검증 — 실제 세션에 브리지 메시지 전달
+
+`cargo test --test bridge_real -- --ignored --nocapture`(`src-tauri/tests/bridge_real.rs`). Claude Code 2.1.310, `claude -p --input-format stream-json --output-format stream-json --verbose --model haiku --name abverify-t7-<n> --settings <앱의 역할 settings 파일>`(`agentcfg::settings_json`: hook → 이 빌드의 `agentboard.exe --hook`, `crossSessionInbound: accept`), `AGENTBOARD_URL/TOKEN`은 실제 제어 서버(`control::serve`)와 발급 토큰, 부모 세션의 `CLAUDE*` 변수는 지움. 브리지 작업 스레드(`bridge::start_worker`) 실행 중.
+
+- hook 순서: `SessionStart` → `UserPromptSubmit` → (첫 답) → `Stop`. SessionStart 처리기가 파이프(`\.\pipe\LOCAL\cc-msg-…`)를 현재 generation으로 등록했다.
+- `bridge::send_tracked(.., "bridge-7731 한글 확인")` → 결과 `Ok(Pipe)`(1초 안). 세션은 `UserPromptSubmit` → 새 턴 → `Stop`으로 받았고, 답에 "from AgentBoard"와 본문(`bridge-7731`, `한글`)이 나왔다. 즉 **auth 줄 + `from-name="agentboard"` 래퍼 + `[AgentBoard] ` 머리말 형식이 실제로 전달되고, 비ASCII(한글) 본문도 깨지지 않는다**(스파이크 미검증 항목 해소).
+- 받은 쪽은 peer 메시지로 취급하므로 첫 턴의 "GOT: 로 답하라" 같은 형식 지시를 따르지 않을 수 있다(스파이크의 "사용자 지시로 취급되지 않는다"와 같음). 역할 지시 파일(Task 13)에 `agentboard` 메시지의 성격을 적어 둘 것.
+- 연결 직후 닫아도(쓰기 후 바로 handle drop) 메시지는 유실되지 않았다.
+- 시험 뒤 claude 프로세스 트리는 `taskkill /T`로 종료했다. 비용: haiku 두 턴.

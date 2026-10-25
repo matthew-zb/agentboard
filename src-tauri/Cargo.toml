@@ -28,7 +28,7 @@ windows = "0.62"
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

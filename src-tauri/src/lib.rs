@@ -1,4 +1,5 @@
 pub mod agentcfg;
+pub mod bridge;
 pub mod config;
 pub mod control;
 pub mod hookcli;
@@ -84,6 +85,10 @@ pub struct AppState {
     /// Inbox store (`<workspaceRoot>/.agentboard/inbox`); its lock is a leaf (+ its own emit
     /// lock), see `inbox` module docs.
     pub inbox: inbox::Inbox,
+    /// App → session messages (Task 7): session registrations + per-pane queues; leaf locks.
+    pub bridge: bridge::Bridge,
+    /// Last real keystroke per pane (`pty_write`, R4). Leaf lock. Task 11 reads it too.
+    pub last_input: Mutex<HashMap<PaneId, std::time::Instant>>,
 }
 
 impl AppState {
@@ -102,6 +107,8 @@ impl AppState {
         let emit_ui = ui.clone();
         let (inbox, inbox_errors) = inbox::Inbox::load(inbox_dir, Arc::new(move |v| emit_ui.inbox_changed(v)));
         startup_errors.extend(inbox_errors);
+        let hooks = control::HookRouter::new();
+        bridge::register_hooks(&hooks);
         AppState {
             ws: Mutex::new(ws),
             loaded: RwLock::new(loaded),
@@ -116,9 +123,11 @@ impl AppState {
             tokens: agentcfg::Tokens::new(),
             ctrl_url: Mutex::new(None),
             run_dir,
-            hooks: control::HookRouter::new(),
+            hooks,
             handoffs: Mutex::new(HashMap::new()),
             inbox,
+            bridge: bridge::Bridge::new(),
+            last_input: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -259,6 +268,8 @@ fn pty_attach(
 
 #[tauri::command]
 fn pty_write(state: State<'_, AppState>, pane: String, data: String) -> Result<(), String> {
+    // real keystrokes only (R4): the bridge's PTY fallback and Task 11's quiet check use it
+    bridge::note_input(&state, &pane);
     state.pty.write(&pane, data.as_bytes())
 }
 
@@ -485,6 +496,8 @@ pub fn run() {
                     eprintln!("[agentboard] 제어 서버 시작 실패: {e}");
                 }
             }
+            // app → session messages: delivered off the hook/command threads
+            bridge::start_worker(app.handle().clone());
             // spawning happens on the launcher thread: window creation is not blocked
             launcher::start(app.handle(), rx, initial);
 
