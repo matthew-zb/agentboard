@@ -127,6 +127,40 @@ pub struct Pane {
     /// Claude Code session name (`--name`, see `roles::session_name`); set for role panes only.
     #[serde(default)]
     pub session_name: Option<String>,
+    /// Why the pane wants the user (`need_user`, a permission prompt, the folder-trust
+    /// warning); `None` for a plain bell. Only meaningful while `attention` is on: every path
+    /// that clears `attention` clears it too. Runtime state like `attention` (reset on load).
+    #[serde(default)]
+    pub attention_reason: Option<String>,
+}
+
+impl Pane {
+    /// Attention off, reason gone (focus, restart, load, `SetAttention{on:false}`).
+    pub fn clear_attention(&mut self) {
+        self.attention = false;
+        self.attention_reason = None;
+    }
+}
+
+/// Longest attention reason kept (characters); longer ones are cut.
+pub const ATTENTION_REASON_MAX: usize = 200;
+
+/// An attention reason as stored: control and bidi-override characters dropped (line breaks
+/// and tabs become spaces), whitespace runs collapsed, trimmed, cut to
+/// [`ATTENTION_REASON_MAX`] characters. `None` when nothing is left.
+pub fn clean_reason(s: &str) -> Option<String> {
+    let bidi = |c: char| matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    let mut out = String::new();
+    for c in s.chars() {
+        let c = if c.is_whitespace() { ' ' } else { c };
+        if c.is_control() || bidi(c) || (c == ' ' && (out.is_empty() || out.ends_with(' '))) {
+            continue;
+        }
+        out.push(c);
+    }
+    let out: String = out.trim_end().chars().take(ATTENTION_REASON_MAX).collect();
+    let out = out.trim_end().to_string();
+    (!out.is_empty()).then_some(out)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -252,7 +286,14 @@ pub enum WsCommand {
     SetFocus { group: GroupId, tab: Option<TabId>, pane: Option<PaneId> },
     SetMaximized { tab: TabId, pane: Option<PaneId> },
     SetSyncInput { tab: TabId, on: bool },
-    SetAttention { pane: PaneId, on: bool },
+    /// `on: false` also clears the reason; `on: true` with a reason replaces it (cleaned by
+    /// [`clean_reason`]), without one keeps it (a bell does not erase a pending question).
+    SetAttention {
+        pane: PaneId,
+        on: bool,
+        #[serde(default)]
+        reason: Option<String>,
+    },
     // groups (Task 8)
     /// `index` is the final position after the tab is removed from its old spot; out of range appends.
     MoveTab { tab: TabId, group: GroupId, index: usize },
@@ -557,7 +598,7 @@ impl Workspace {
     pub fn reset_runtime_state(&mut self) -> Effects {
         for p in self.panes.values_mut() {
             p.status = PaneStatus::Starting;
-            p.attention = false;
+            p.clear_attention();
             p.prompt_warning = false;
         }
         Effects { spawn: self.panes.keys().map(|id| (id.clone(), false)).collect(), kill: Vec::new() }
@@ -665,6 +706,7 @@ impl Workspace {
                         status: PaneStatus::Starting,
                         attention: false,
                         prompt_warning: false,
+                        attention_reason: None,
                         kind: PaneKind::Terminal,
                         role: None,
                         team: None,
@@ -708,7 +750,7 @@ impl Workspace {
                 self.pane(&pane)?;
                 self.set_status(&pane, PaneStatus::Starting);
                 let p = self.panes.get_mut(&pane).unwrap();
-                p.attention = false;
+                p.clear_attention();
                 p.prompt_warning = false;
                 fx.kill.push(pane.clone());
                 fx.spawn.push((pane, false));
@@ -842,9 +884,17 @@ impl Workspace {
                 self.tab(&tab)?;
                 self.tabs.get_mut(&tab).unwrap().sync_input = on;
             }
-            SetAttention { pane, on } => {
+            SetAttention { pane, on, reason } => {
                 self.pane(&pane)?;
-                self.panes.get_mut(&pane).unwrap().attention = on;
+                let p = self.panes.get_mut(&pane).unwrap();
+                if on {
+                    p.attention = true;
+                    if let Some(r) = reason.as_deref().and_then(clean_reason) {
+                        p.attention_reason = Some(r);
+                    }
+                } else {
+                    p.clear_attention();
+                }
             }
             MoveTab { tab, group, index } => {
                 self.tab(&tab)?;
@@ -990,6 +1040,7 @@ impl Workspace {
                 status: PaneStatus::Starting,
                 attention: false,
                 prompt_warning: false,
+                attention_reason: None,
                 kind: PaneKind::Terminal,
                 role: Some(role),
                 team: Some(team.to_string()),
@@ -1248,6 +1299,7 @@ impl Workspace {
                         status: PaneStatus::Starting,
                         attention: false,
                         prompt_warning: false,
+                        attention_reason: None,
                         kind,
                         role: pane_role,
                         team: None,
@@ -1338,7 +1390,7 @@ impl Workspace {
         self.groups.get_mut(gid).unwrap().active_tab_id = tid.clone();
         let focused = self.tabs[tid].last_focused_pane_id.clone();
         if let Some(p) = self.panes.get_mut(&focused) {
-            p.attention = false;
+            p.clear_attention();
         }
         // R22: never leave focus on a pane hidden by a maximize
         if self.group_maximized.as_ref().is_some_and(|g| g != gid) {
@@ -1994,6 +2046,55 @@ mod tests {
     }
 
     #[test]
+    fn attention_reason_lifecycle() {
+        let l = loaded_fixture();
+        let mut ws = Workspace::from_config(&l);
+        let g = ws.focus.group_id.clone();
+        let api = tab(&ws, "api").id.clone();
+        let coder = pane(&ws, "api", "coder");
+        let set = |ws: &mut Workspace, on: bool, reason: Option<&str>| {
+            ws.apply(WsCommand::SetAttention { pane: coder.clone(), on, reason: reason.map(str::to_string) }, &l).unwrap();
+        };
+        set(&mut ws, true, Some("  배포\n승인\u{7}  필요\u{202E} "));
+        assert!(ws.panes[&coder].attention);
+        assert_eq!(ws.panes[&coder].attention_reason.as_deref(), Some("배포 승인 필요"));
+        set(&mut ws, true, None); // a bell keeps the pending reason
+        assert_eq!(ws.panes[&coder].attention_reason.as_deref(), Some("배포 승인 필요"));
+        set(&mut ws, false, None);
+        assert!(!ws.panes[&coder].attention && ws.panes[&coder].attention_reason.is_none());
+        // focus clears both
+        set(&mut ws, true, Some("질문"));
+        ws.apply(WsCommand::SetFocus { group: g.clone(), tab: Some(api.clone()), pane: Some(coder.clone()) }, &l).unwrap();
+        assert!(!ws.panes[&coder].attention && ws.panes[&coder].attention_reason.is_none());
+        // restart and a restored workspace clear it too
+        set(&mut ws, true, Some("질문"));
+        ws.apply(WsCommand::RestartPane { pane: coder.clone() }, &l).unwrap();
+        assert!(ws.panes[&coder].attention_reason.is_none());
+        set(&mut ws, true, Some("질문"));
+        ws.reset_runtime_state();
+        assert!(ws.panes[&coder].attention_reason.is_none());
+        // wire shape: camelCase, and an old command / pane without the field still parses
+        let c: WsCommand = serde_json::from_str(r#"{"type":"setAttention","pane":"p1","on":true}"#).unwrap();
+        assert_eq!(c, WsCommand::SetAttention { pane: "p1".into(), on: true, reason: None });
+        let v = serde_json::to_value(&ws.panes[&coder]).unwrap();
+        assert!(v.as_object().unwrap().contains_key("attentionReason"));
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("attentionReason");
+        let p: Pane = serde_json::from_value(old).unwrap();
+        assert_eq!(p.attention_reason, None);
+    }
+
+    #[test]
+    fn clean_reason_strips_controls_and_caps_length() {
+        assert_eq!(clean_reason(""), None);
+        assert_eq!(clean_reason(" \u{1b}[31m \t\r\n "), Some("[31m".into()));
+        assert_eq!(clean_reason("\u{0}\u{7}\u{200F}"), None);
+        let long = "가".repeat(ATTENTION_REASON_MAX + 50);
+        assert_eq!(clean_reason(&long).unwrap().chars().count(), ATTENTION_REASON_MAX);
+        assert_eq!(clean_reason("a  b\n\nc"), Some("a b c".into()));
+    }
+
+    #[test]
     fn set_focus_records_last_location_and_clears_attention() {
         let l = loaded_fixture();
         let mut ws = Workspace::from_config(&l);
@@ -2001,7 +2102,7 @@ mod tests {
         let d = tab(&ws, "dispatcher").id.clone();
         let api = tab(&ws, "api").id.clone();
         let coder = pane(&ws, "api", "coder");
-        ws.apply(WsCommand::SetAttention { pane: coder.clone(), on: true }, &l).unwrap();
+        ws.apply(WsCommand::SetAttention { pane: coder.clone(), on: true, reason: None }, &l).unwrap();
         assert!(ws.panes[&coder].attention);
         ws.apply(WsCommand::SetFocus { group: g.clone(), tab: Some(api.clone()), pane: Some(coder.clone()) }, &l).unwrap();
         assert!(!ws.panes[&coder].attention);
@@ -2015,7 +2116,7 @@ mod tests {
         assert_eq!(ws.last_location, Some(Location { group_id: g.clone(), tab_id: d.clone() }));
         // switching tabs clears attention of that tab's last focused pane
         let dp = ws.tabs[&d].last_focused_pane_id.clone();
-        ws.apply(WsCommand::SetAttention { pane: dp.clone(), on: true }, &l).unwrap();
+        ws.apply(WsCommand::SetAttention { pane: dp.clone(), on: true, reason: None }, &l).unwrap();
         ws.apply(WsCommand::SetFocus { group: g.clone(), tab: Some(d.clone()), pane: None }, &l).unwrap();
         assert!(!ws.panes[&dp].attention);
         assert_eq!(ws.last_location, Some(Location { group_id: g.clone(), tab_id: api.clone() }));
@@ -2129,7 +2230,7 @@ mod tests {
         let l = loaded_fixture();
         let mut ws = Workspace::from_config(&l);
         let p = pane(&ws, "api", "coder");
-        ws.apply(WsCommand::SetAttention { pane: p.clone(), on: true }, &l).unwrap();
+        ws.apply(WsCommand::SetAttention { pane: p.clone(), on: true, reason: None }, &l).unwrap();
         ws.set_prompt_warning(&p, true);
         ws.apply(WsCommand::RestartPane { pane: p.clone() }, &l).unwrap();
         assert!(!ws.panes[&p].attention);

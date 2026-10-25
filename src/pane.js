@@ -30,7 +30,7 @@ export function statusSymbol(pane) {
 /** Tooltip for ⚠, or null when the pane needs no attention. */
 export function warnTitle(pane) {
   const parts = [];
-  if (pane.attention) parts.push('주의: 이 창에서 알림(벨)이 왔습니다');
+  if (pane.attention) parts.push(pane.attentionReason ? `주의: ${pane.attentionReason}` : '주의: 이 창에서 알림(벨)이 왔습니다');
   if (pane.promptWarning) parts.push('프롬프트 경고: 준비 신호를 감지하지 못해 시간 초과 후 프롬프트를 넣었습니다');
   return parts.length ? parts.join('\n') : null;
 }
@@ -236,7 +236,7 @@ function createAppletEntry(id, model) {
   };
   el.tabIndex = -1; // focusable, so pane focus has somewhere to go
   el.addEventListener('mousedown', () => {
-    if (e.ctx && !e.ctx.focused) hooks.onFocus(e.ctx.group, e.ctx.tab, id);
+    if (e.ctx && (!e.ctx.focused || e.ctx.attention)) hooks.onFocus(e.ctx.group, e.ctx.tab, id);
   });
   return e;
 }
@@ -344,7 +344,7 @@ function createEntry(id) {
   });
 
   el.addEventListener('mousedown', () => {
-    if (e.ctx && !e.ctx.focused) hooks.onFocus(e.ctx.group, e.ctx.tab, id);
+    if (e.ctx && (!e.ctx.focused || e.ctx.attention)) hooks.onFocus(e.ctx.group, e.ctx.tab, id);
   });
 
   e.ro = new ResizeObserver(() => scheduleFit(e));
@@ -435,8 +435,9 @@ export function restartPane(paneId) {
 }
 
 /**
- * Apply a Pane model from a snapshot. ctx: `{group, tab, focused}` (focused = the workspace
- * focus chain ends at this pane). Updates header/classes and attaches when appropriate.
+ * Apply a Pane model from a snapshot. ctx: `{group, tab, focused, attention}` (focused = the
+ * workspace focus chain ends at this pane; a click on a focused pane that shows ⚠ re-sends
+ * SetFocus, which clears it). Updates header/classes and attaches when appropriate.
  */
 export function syncPane(pane, ctx) {
   const e = getPane(pane.id, pane);

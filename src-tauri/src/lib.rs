@@ -1,4 +1,5 @@
 pub mod agentcfg;
+pub mod attention;
 pub mod bridge;
 pub mod config;
 pub mod control;
@@ -89,6 +90,8 @@ pub struct AppState {
     pub bridge: bridge::Bridge,
     /// Last real keystroke per pane (`pty_write`, R4). Leaf lock. Task 11 reads it too.
     pub last_input: Mutex<HashMap<PaneId, std::time::Instant>>,
+    /// Folder-trust timers of role panes per spawn generation (Task 9, `attention`). Leaf lock.
+    pub trust: Mutex<HashMap<PaneId, attention::Trust>>,
 }
 
 impl AppState {
@@ -109,6 +112,7 @@ impl AppState {
         startup_errors.extend(inbox_errors);
         let hooks = control::HookRouter::new();
         bridge::register_hooks(&hooks);
+        attention::register_hooks(&hooks); // after the bridge: wraps its SessionStart
         AppState {
             ws: Mutex::new(ws),
             loaded: RwLock::new(loaded),
@@ -128,6 +132,7 @@ impl AppState {
             inbox,
             bridge: bridge::Bridge::new(),
             last_input: Mutex::new(HashMap::new()),
+            trust: Mutex::new(HashMap::new()),
         }
     }
 }

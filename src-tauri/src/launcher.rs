@@ -66,6 +66,10 @@
 //!   taken one at a time, each released before the next; the pipe write and the PTY fallback
 //!   `PtyManager::write` run holding only `pump_lock` (R13: write is allowed off the worker).
 //!   Hook handlers take only `panes` (released) then `inner`/`wake`; they never write pipes.
+//! * Attention (attention.rs, Task 9): `AppState::trust` (folder-trust timers) is a leaf.
+//!   `spawn_pane` arms it after `spawn` returns (no app lock held); `poll_trust` (prompt timer
+//!   thread) and the SessionStart / Notification handlers take it, release it, then read
+//!   `current_gen` / `ws` one at a time and change the model only via `execute`.
 //! * `loaded(write)` (Task 8): taken only by the MCP tool `create_manager_tab`, alone — no other
 //!   lock held, none taken inside — around the atomic config.json append and the in-memory
 //!   `config.tabs` push (and their rollback). It is never taken under `ws`; `execute` runs
@@ -358,6 +362,7 @@ pub fn start(app: &AppHandle, rx: mpsc::Receiver<Effects>, initial: Effects) {
             std::thread::sleep(PROMPT_POLL);
             let state = h.state::<AppState>();
             poll_prompts(&state, Instant::now());
+            crate::attention::poll_trust(&state, Instant::now()); // R5 folder-trust timers
         })
         .expect("prompt timer thread");
 }
@@ -374,6 +379,7 @@ pub fn run_effects(state: &AppState, fx: Effects) {
             state.ui.drop_channel(id);
             // a removed pane's identity ends here (only role panes have these)
             state.tokens.revoke(id);
+            crate::attention::forget(state, id);
             crate::agentcfg::remove_run_files(&state.run_dir, id);
         } else {
             state.pty.kill(id);
@@ -452,6 +458,10 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
                 if job.gen().is_none() {
                     job.bind(gen);
                 }
+            }
+            // R5: a role session must report SessionStart for this generation in time (leaf lock)
+            if pane.role.is_some() {
+                crate::attention::arm_trust(state, id, gen, Instant::now());
             }
             // A very fast exit may already have happened: claim Running only while this
             // generation is current and alive (otherwise `on_exited` sets / has set Exited).
@@ -607,6 +617,7 @@ mod tests {
             status: PaneStatus::Starting,
             attention: false,
             prompt_warning: false,
+            attention_reason: None,
             kind: PaneKind::Terminal,
             role: None,
             team: None,

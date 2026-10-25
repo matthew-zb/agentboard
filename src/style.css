@@ -77,6 +77,10 @@ body.dragging-v, body.dragging-v * { cursor: row-resize !important; user-select:
 #status { flex: 0 0 22px; display: flex; align-items: center; gap: 12px; padding: 0 10px; background: var(--chrome); border-top: 1px solid var(--line); font-size: 12px; white-space: nowrap; overflow: hidden; }
 .status-path { color: var(--text); }
 .status-flags { display: flex; gap: 8px; }
+.status-attn { color: var(--warn); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.status-attn.hidden { display: none; }
+.status-attn .attn-tab { cursor: pointer; }
+.status-attn .attn-tab:hover { text-decoration: underline; }
 .flag.sync { color: var(--accent); font-weight: 600; }
 .flag.errors { color: var(--warn); cursor: pointer; }
 

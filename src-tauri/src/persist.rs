@@ -252,7 +252,7 @@ mod tests {
             l,
         )
         .unwrap();
-        ws.apply(WsCommand::SetAttention { pane: p.clone(), on: true }, l).unwrap();
+        ws.apply(WsCommand::SetAttention { pane: p.clone(), on: true, reason: None }, l).unwrap();
         ws.set_status(&p, PaneStatus::Exited { code: 2 });
         ws.set_prompt_warning(&p, true);
         ws
@@ -518,7 +518,7 @@ mod tests {
         assert!(fx.kill.is_empty());
         let ids: Vec<_> = fx.spawn.iter().map(|(p, _)| p.clone()).collect();
         assert_eq!(ids, ws.panes.keys().cloned().collect::<Vec<_>>());
-        assert!(ws.panes.values().all(|p| p.status == PaneStatus::Starting && !p.attention && !p.prompt_warning));
+        assert!(ws.panes.values().all(|p| p.status == PaneStatus::Starting && !p.attention && !p.prompt_warning && p.attention_reason.is_none()));
     }
 
     #[test]

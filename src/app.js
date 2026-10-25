@@ -53,6 +53,7 @@ import {
 } from './overlays.js';
 import { configureCopyMode, toggleCopyMode, copyActive, pruneCopySessions } from './copy-ui.js';
 import { pickCommands, paletteItems, missingDirsFlow, closeFlow } from './overlay-logic.js';
+import { hiddenAttentionTabs, statusEntryText } from './attention-logic.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -335,7 +336,7 @@ export function render(snap) {
   const focusedId = focusedPaneId(ws);
   const groupOf = tabGroups(ws);
   for (const pane of Object.values(ws.panes)) {
-    syncPane(pane, { group: groupOf[pane.tab] ?? null, tab: pane.tab, focused: pane.id === focusedId });
+    syncPane(pane, { group: groupOf[pane.tab] ?? null, tab: pane.tab, focused: pane.id === focusedId, attention: !!pane.attention });
   }
 
   const groupsEl = $('groups');
@@ -375,6 +376,7 @@ function selectTab(ws, group, tab) {
 function renderStatus(snap) {
   const s = statusParts(snap);
   $('status').querySelector('.status-path').textContent = s.path;
+  renderAttentionList($('status').querySelector('.status-attn'), snap);
   const flags = $('status').querySelector('.status-flags');
   flags.replaceChildren();
   if (s.sync) flags.appendChild(flag('[SYNC]', 'sync', '입력 동기화: 이 탭의 모든 실행 중 창에 입력이 전달됩니다'));
@@ -387,6 +389,33 @@ function renderStatus(snap) {
     });
     flags.appendChild(f);
   }
+}
+
+/**
+ * `⚠ billing(사유…), api`: ⚠ tabs whose tab bar is off screen (spec §5-1). Text only via
+ * textContent (reasons come from agents); a click focuses that tab's attention pane, which
+ * clears its ⚠. Alt+a (pane.nextAttention) reaches the same panes.
+ */
+function renderAttentionList(el, snap) {
+  if (!el) return;
+  const entries = hiddenAttentionTabs(snap);
+  el.replaceChildren();
+  el.classList.toggle('hidden', entries.length === 0);
+  if (!entries.length) return;
+  el.appendChild(document.createTextNode('⚠ '));
+  entries.forEach((en, i) => {
+    if (i > 0) el.appendChild(document.createTextNode(', '));
+    const a = document.createElement('span');
+    a.className = 'attn-tab';
+    a.textContent = statusEntryText(en);
+    a.title = en.reason ? `${en.name}: ${en.reason}` : `${en.name}: 주의가 필요한 창이 있습니다`;
+    a.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      if (overlayOpen()) return;
+      enqueue(() => execute([{ type: 'setFocus', group: en.group, tab: en.tab, pane: en.pane }]));
+    });
+    el.appendChild(a);
+  });
 }
 
 function flag(text, cls, title) {

@@ -202,6 +202,13 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
 
 권한 승인 대기 등을 AgentBoard가 ⚠로 표시하려면 Claude Code가 터미널 벨(BEL)을 울려야 합니다. Claude Code에서 `/config` → 알림 채널(notification channel)을 **terminal bell**로 설정하세요(설정 값 `preferredNotifChannel: "terminal_bell"`). 이후 비활성 탭의 창이 벨을 울리면 창 헤더와 탭 바에 ⚠가 뜨고, 포커스는 옮겨지지 않습니다. `Alt+a`로 해당 창으로 이동하고, 다시 누르면 원래 위치로 돌아옵니다.
 
+### 역할 에이전트의 주의(⚠) 표시
+
+- **권한 승인 대기**: 앱이 띄운 역할 세션(dispatcher·manager·팀 등)은 Claude Code Notification hook의 `permission_prompt`로 ⚠가 켜집니다(벨 설정 불필요). 지금 보고 있는(포커스된) 창이면 켜지 않으며, `idle_prompt`(쉬는 중 알림)는 쓰지 않습니다. auto 권한 모드에서는 권한 요청 자체가 거의 없습니다.
+- **`need_user`**: 에이전트가 사용자 결정이 필요하면 질문을 화면에 쓰고 MCP 도구 `need_user(reason)`을 부릅니다. ⚠ 툴팁에 사유가 보입니다(최대 200자).
+- **폴더 신뢰 확인 필요**: 역할 창이 시작 후 30초 안에 SessionStart를 보내지 않으면(대개 Claude의 "이 폴더를 신뢰하시겠습니까?" 질문에서 멈춤) 이 사유로 ⚠가 켜집니다. 그 창으로 가서 직접 답하세요 — 앱은 Claude의 신뢰 설정을 바꾸지 않습니다.
+- ⚠는 그 창에 포커스하면(클릭·`Alt+a`·탭 전환) 사유와 함께 꺼집니다. 그룹 최대화 등으로 ⚠ 탭의 탭 바가 화면에 없으면 상태 표시줄에 `⚠ billing(사유…), api`처럼 보이고, 항목을 클릭하거나 `Alt+a`로 이동합니다. ⚠는 앱을 다시 시작하면 지워집니다.
+
 ## 로드맵
 
 1단계(현재)는 사람이 직접 조작하는 터미널 보드입니다. 2단계에서는 앱 내장 MCP 서버를 통해 Dispatcher 에이전트가 탭·창을 만들고, 다른 에이전트에 메시지를 주입하고 출력을 검토하며(프로필의 `level`·`idle`·`resume` 활용, Claude 대화 이어가기, Codex·Gemini 프로필 추가), 3단계에서는 역할 기반 팀 자동 편성과 작업 상태 대시보드 같은 오케스트레이션을 다룹니다.

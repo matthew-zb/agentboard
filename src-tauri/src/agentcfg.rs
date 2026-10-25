@@ -308,6 +308,7 @@ mod tests {
             status: PaneStatus::Starting,
             attention: false,
             prompt_warning: false,
+            attention_reason: None,
             kind: PaneKind::Terminal,
             role: Some(role),
             team: None,

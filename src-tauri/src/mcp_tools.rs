@@ -37,6 +37,7 @@ pub const PERMISSIONS: &[(&str, &[Role])] = &[
     ("list_team", &[M, L]),
     ("handoff_done", &[M, D, H]),
     ("create_manager_tab", &[D]),
+    ("need_user", &[D, H, M, L, Mb]),
 ];
 
 /// Whether `role` may call `tool` (per [`PERMISSIONS`]; unknown tools: no).
@@ -200,6 +201,18 @@ fn implemented() -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
         },
+        ToolDef {
+            name: "need_user",
+            description: "사용자의 판단·결정이 필요할 때 호출합니다. 먼저 질문을 화면에 쓰고 이 도구를 부르면, 앱이 이 창의 탭에 ⚠ 표시와 사유를 띄웁니다(사용자가 이 창으로 오면 해제). 포커스는 옮기지 않습니다.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "reason": { "type": "string", "description": "한 줄 사유(최대 200자, 예: 배포 대상 서버 선택 필요)" }
+                },
+                "required": ["reason"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -250,6 +263,7 @@ pub fn call(state: &AppState, caller: &Caller, name: &str, args: Value) -> Resul
         "dismiss" => dismiss(state, caller, &args),
         "dismiss_team" => dismiss_team(state, caller, &args),
         "create_manager_tab" => create_manager_tab(state, caller, &args),
+        "need_user" => crate::attention::need_user(state, caller, &args),
         _ => Err(format!("알 수 없는 도구입니다: {name}")),
     }
 }
@@ -738,13 +752,13 @@ mod tests {
             names(Role::Manager),
             [
                 "inbox_post", "inbox_note", "inbox_propose_close", "inbox_list", "issue_create", "hire_lead", "dismiss",
-                "dismiss_team", "list_team", "handoff_done"
+                "dismiss_team", "list_team", "handoff_done", "need_user"
             ]
         );
-        assert_eq!(names(Role::Dispatcher), ["inbox_list", "handoff_done", "create_manager_tab"]);
-        assert_eq!(names(Role::Lead), ["inbox_list", "hire_member", "dismiss", "dismiss_team", "list_team"]);
-        assert_eq!(names(Role::Handover), ["inbox_list", "handoff_done"]);
-        assert_eq!(names(Role::Member), ["inbox_list"]);
+        assert_eq!(names(Role::Dispatcher), ["inbox_list", "handoff_done", "create_manager_tab", "need_user"]);
+        assert_eq!(names(Role::Lead), ["inbox_list", "hire_member", "dismiss", "dismiss_team", "list_team", "need_user"]);
+        assert_eq!(names(Role::Handover), ["inbox_list", "handoff_done", "need_user"]);
+        assert_eq!(names(Role::Member), ["inbox_list", "need_user"]);
     }
 
     // ── team tools · create_manager_tab (Task 8) ──
