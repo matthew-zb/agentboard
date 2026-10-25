@@ -1,8 +1,10 @@
 pub mod agentcfg;
 pub mod config;
+pub mod control;
 pub mod hookcli;
 pub mod launcher;
 pub mod layout;
+pub mod mcp_tools;
 pub mod persist;
 pub mod profiles;
 pub mod roles;
@@ -71,6 +73,10 @@ pub struct AppState {
     pub ctrl_url: Mutex<Option<String>>,
     /// Where role panes' run files go (`%APPDATA%/agentboard/run`).
     pub run_dir: std::path::PathBuf,
+    /// Hook event handlers of the control server (Tasks 7·10 register). Leaf lock.
+    pub hooks: control::HookRouter,
+    /// Last `handoff_done` per pane (nightly refresh, Task 11). Leaf lock.
+    pub handoffs: Mutex<HashMap<PaneId, std::time::SystemTime>>,
 }
 
 impl AppState {
@@ -98,6 +104,8 @@ impl AppState {
             tokens: agentcfg::Tokens::new(),
             ctrl_url: Mutex::new(None),
             run_dir,
+            hooks: control::HookRouter::new(),
+            handoffs: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -392,7 +400,25 @@ pub fn run() {
             let pty = PtyManager::new(sink.clone());
             let (tx, rx) = mpsc::channel();
             app.manage(sink.clone()); // pty_attach registers output channels on it
+            // control server: bound before AppState exists (a failure becomes a startup error),
+            // serving + ctrl_url before the initial spawns so role panes get the real URL
+            let listener = match tauri::async_runtime::block_on(control::bind()) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    eprintln!("[agentboard] 제어 서버 시작 실패: {e}");
+                    startup_errors.push(format!(
+                        "제어 서버를 시작할 수 없습니다: {e} — 역할 에이전트의 MCP 도구와 hook 보고가 동작하지 않습니다"
+                    ));
+                    None
+                }
+            };
             app.manage(AppState::new(ws, loaded, pty, sink, tx, saver, startup_errors, agentcfg::default_run_dir()));
+            if let Some(listener) = listener {
+                let handle = app.handle().clone();
+                if let Err(e) = tauri::async_runtime::block_on(control::serve_on(handle, listener)) {
+                    eprintln!("[agentboard] 제어 서버 시작 실패: {e}");
+                }
+            }
             // spawning happens on the launcher thread: window creation is not blocked
             launcher::start(app.handle(), rx, initial);
 

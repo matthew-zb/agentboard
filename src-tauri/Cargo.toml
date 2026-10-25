@@ -17,6 +17,8 @@ regex = "1"
 which = "8"
 dirs = "6"
 getrandom = "0.3"
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
+tokio = { version = "1", features = ["net", "rt", "macros", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 win32job = "2"
@@ -25,6 +27,7 @@ windows = "0.62"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

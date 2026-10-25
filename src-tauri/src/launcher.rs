@@ -47,6 +47,11 @@
 //!   `spawn_pane` takes them one at a time (issue the role pane's token, read the URL) before
 //!   `loaded(read)`; `plan_spawn` then writes the pane's run files under `loaded(read)` only
 //!   (small local files, no other lock, never under `ws`).
+//! * Control server (control.rs): `AppState::hooks` (HookRouter map) and
+//!   `AppState::handoffs` are leaves. The caller of a request is computed by taking `tokens`
+//!   (released) and then `ws` (released); nothing is held across an `.await`. Tool bodies and
+//!   hook handlers run on blocking threads and follow the rules here (model changes only via
+//!   `execute`, R13).
 //! * Never call `PtyManager::spawn/kill/remove/write/resize/attach_with` while holding `ws`,
 //!   `loaded` or `prompts`: spawn/kill/write can block, and the PTY threads call back into
 //!   the sink (`output` -> prompts, `exited` -> ws).
