@@ -276,6 +276,9 @@ impl Inbox {
                         .map_err(|e| e.to_string())
                         .and_then(|s| serde_json::from_str::<InboxItem>(&s).map_err(|e| e.to_string()));
                     match parsed {
+                        Ok(item) if item.issue.as_deref().map_or(false, |i| !issues::is_valid_id(i)) => {
+                            errors.push(format!("인박스 항목 파일의 이슈 id가 잘못되어 건너뜁니다: {name}"))
+                        }
                         Ok(item) if item.id == stem => {
                             items.insert(item.id.clone(), item);
                         }
@@ -529,29 +532,44 @@ impl Inbox {
 
     /// The user copies files into the linked issue's `input/` or `output/`: regular files only
     /// (directories and missing paths refused before anything is copied), copies never
-    /// overwrite (`name (2).ext`), the destination is checked to be the issue's own sub-folder.
-    /// Returns the new files. Copies run with no lock held.
-    pub fn add_files(&self, id: &str, paths: &[PathBuf], target: Target) -> Result<Vec<PathBuf>, String> {
+    /// overwrite (`name (2).ext`). The issue folder is re-derived from `owner_workspace` (the
+    /// owner tab's current workspace, looked up by the caller from `ws`) and validated with
+    /// [`issues::resolve`]; the stored `issuePath` is never trusted — it must match, and the
+    /// destination must resolve inside the issue folder (junctions refused). Returns the new
+    /// files. Copies run with no lock held.
+    pub fn add_files(
+        &self,
+        id: &str,
+        paths: &[PathBuf],
+        target: Target,
+        owner_workspace: &Path,
+    ) -> Result<Vec<PathBuf>, String> {
         if paths.is_empty() {
             return Err("복사할 파일이 없습니다".into());
         }
         let item = self.get(id).ok_or_else(|| not_found(id))?;
-        let (Some(issue), Some(issue_path)) = (&item.issue, &item.issue_path) else {
+        let Some(issue) = &item.issue else {
             return Err("이슈 폴더가 연결되지 않은 항목입니다 — 먼저 이슈를 만들어 주세요".into());
         };
-        let looks_right = issue_path.file_name().map_or(false, |n| n.to_string_lossy() == issue.as_str())
-            && issue_path.parent().and_then(|p| p.file_name()).map_or(false, |n| n == "issues")
-            && issue_path.is_dir();
-        if !looks_right {
-            return Err(format!("연결된 이슈 폴더를 찾을 수 없습니다: {issue}"));
+        let issue_path = issues::resolve(owner_workspace, issue)?;
+        let same = match &item.issue_path {
+            None => true,
+            Some(stored) => match (std::fs::canonicalize(stored), std::fs::canonicalize(&issue_path)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            },
+        };
+        if !same {
+            return Err(format!("저장된 이슈 경로가 담당 탭의 이슈 폴더와 다릅니다 — 복사하지 않습니다: {issue}"));
         }
+        let issue_path = &issue_path;
         let dest = issue_path.join(target.dir_name());
         if std::fs::symlink_metadata(&dest).map_or(false, |m| m.file_type().is_symlink()) {
             return Err(format!("이슈 폴더의 {} 폴더가 링크입니다 — 복사하지 않습니다", target.dir_name()));
         }
         std::fs::create_dir_all(&dest).map_err(|e| format!("{} 폴더를 만들 수 없습니다 — {e}", target.dir_name()))?;
         let inside = match (std::fs::canonicalize(&dest), std::fs::canonicalize(issue_path)) {
-            (Ok(d), Ok(i)) => d.starts_with(&i) && d != i,
+            (Ok(d), Ok(i)) => d.parent() == Some(i.as_path()),
             _ => false,
         };
         if !inside {
@@ -771,12 +789,12 @@ mod tests {
         std::fs::create_dir_all(src.join("sub")).unwrap();
         std::fs::write(src.join("a.md"), "one").unwrap();
         std::fs::write(src.join("noext"), "n").unwrap();
-        // no issue yet → refused
-        let err = f.inbox.add_files(&id, &[src.join("a.md")], Target::Input).unwrap_err();
-        assert!(err.contains("이슈"), "{err}");
-
         let ws = f.dir.path().join("billing");
         std::fs::create_dir(&ws).unwrap();
+        // no issue yet → refused
+        let err = f.inbox.add_files(&id, &[src.join("a.md")], Target::Input, &ws).unwrap_err();
+        assert!(err.contains("이슈"), "{err}");
+
         let (iid, idir) = crate::issues::create(&ws, "결제", chrono::NaiveDate::from_ymd_opt(2026, 10, 25).unwrap()).unwrap();
         f.inbox.link_issue(&m, &id, &iid, &idir).unwrap();
         let it = f.inbox.get(&id).unwrap();
@@ -786,10 +804,10 @@ mod tests {
         f.inbox.link_issue(&m, &id, &iid, &idir).unwrap();
         assert!(f.inbox.link_issue(&m, &id, "20261025-other", &ws.join("issues/20261025-other")).is_err());
 
-        let out = f.inbox.add_files(&id, &[src.join("a.md"), src.join("noext")], Target::Input).unwrap();
+        let out = f.inbox.add_files(&id, &[src.join("a.md"), src.join("noext")], Target::Input, &ws).unwrap();
         assert_eq!(out, vec![idir.join("input").join("a.md"), idir.join("input").join("noext")]);
         std::fs::write(src.join("a.md"), "two").unwrap();
-        let out = f.inbox.add_files(&id, &[src.join("a.md"), src.join("a.md"), src.join("noext")], Target::Input).unwrap();
+        let out = f.inbox.add_files(&id, &[src.join("a.md"), src.join("a.md"), src.join("noext")], Target::Input, &ws).unwrap();
         assert_eq!(
             out,
             vec![idir.join("input/a (2).md"), idir.join("input/a (3).md"), idir.join("input/noext (2)")]
@@ -797,28 +815,77 @@ mod tests {
         assert_eq!(std::fs::read_to_string(idir.join("input/a.md")).unwrap(), "one", "never overwritten");
         assert_eq!(std::fs::read_to_string(idir.join("input/a (2).md")).unwrap(), "two");
         assert!(src.join("a.md").exists(), "copied, not moved");
-        let out = f.inbox.add_files(&id, &[src.join("a.md")], Target::Output).unwrap();
+        let out = f.inbox.add_files(&id, &[src.join("a.md")], Target::Output, &ws).unwrap();
         assert_eq!(out, vec![idir.join("output/a.md")]);
         let it = f.inbox.get(&id).unwrap();
         assert_eq!(it.timeline.iter().filter(|e| e.kind == TimelineKind::FilesAdded).count(), 3);
 
         // directories and missing sources are refused (Korean), nothing copied
         let before = std::fs::read_dir(idir.join("input")).unwrap().count();
-        let err = f.inbox.add_files(&id, &[src.join("a.md"), src.join("sub")], Target::Input).unwrap_err();
+        let err = f.inbox.add_files(&id, &[src.join("a.md"), src.join("sub")], Target::Input, &ws).unwrap_err();
         assert!(err.contains("폴더"), "{err}");
-        let err = f.inbox.add_files(&id, &[src.join("missing.txt")], Target::Input).unwrap_err();
+        let err = f.inbox.add_files(&id, &[src.join("missing.txt")], Target::Input, &ws).unwrap_err();
         assert!(err.contains("missing.txt"), "{err}");
         assert!(!err.contains(&*src.to_string_lossy()), "file name only: {err}");
-        assert!(f.inbox.add_files(&id, &[], Target::Input).is_err());
+        assert!(f.inbox.add_files(&id, &[], Target::Input, &ws).is_err());
         assert_eq!(std::fs::read_dir(idir.join("input")).unwrap().count(), before);
         // a stored link that does not look like an issue folder is not used
         {
             let mut g = f.inbox.inner.lock().unwrap();
             g.items.get_mut(&id).unwrap().issue_path = Some(f.dir.path().to_path_buf());
         }
-        assert!(f.inbox.add_files(&id, &[src.join("a.md")], Target::Input).is_err());
+        assert!(f.inbox.add_files(&id, &[src.join("a.md")], Target::Input, &ws).is_err());
+        // a different (e.g. stale) workspace never matches the stored link either
+        assert!(f.inbox.add_files(&id, &[src.join("a.md")], Target::Input, f.dir.path()).is_err());
         // nothing was ever written outside the issue folder
         assert!(!f.dir.path().join("input").exists() && !ws.join("input").exists());
+
+        // a junction planted at the issue's input/ (pointing outside) is refused
+        {
+            let mut g = f.inbox.inner.lock().unwrap();
+            g.items.get_mut(&id).unwrap().issue_path = Some(idir.clone());
+        }
+        let outside = f.dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::remove_dir_all(idir.join("output")).unwrap();
+        if crate::issues::tests::link_dir(&idir.join("output"), &outside) {
+            let err = f.inbox.add_files(&id, &[src.join("a.md")], Target::Output, &ws).unwrap_err();
+            assert!(err.contains("output"), "{err}");
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing copied outside");
+        } else {
+            eprintln!("junction/symlink creation refused by the OS — junction part skipped");
+        }
+    }
+
+    #[test]
+    fn tampered_issue_link_is_refused() {
+        let f = fx();
+        let m = mgr();
+        let id = f.inbox.post(&m, "billing", new_item("x")).unwrap();
+        let ws = f.dir.path().join("billing");
+        std::fs::create_dir(&ws).unwrap();
+        let src = f.dir.path().join("a.md");
+        std::fs::write(&src, "x").unwrap();
+        let (iid, idir) = crate::issues::create(&ws, "결제", chrono::NaiveDate::from_ymd_opt(2026, 10, 25).unwrap()).unwrap();
+        f.inbox.link_issue(&m, &id, &iid, &idir).unwrap();
+        // a hand-edited item: issuePath points at a look-alike folder outside the workspace
+        let fake = f.dir.path().join("elsewhere").join("issues").join(&iid);
+        std::fs::create_dir_all(fake.join("input")).unwrap();
+        let path = f.dir.path().join("inbox").join(format!("{id}.json"));
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["issuePath"] = serde_json::json!(fake);
+        std::fs::write(&path, v.to_string()).unwrap();
+        let (again, errs) = Inbox::load(f.dir.path().join("inbox"), Arc::new(|_| {}));
+        assert!(errs.is_empty(), "{errs:?}");
+        let err = again.add_files(&id, &[src.clone()], Target::Input, &ws).unwrap_err();
+        assert!(err.contains("다릅니다"), "{err}");
+        assert_eq!(std::fs::read_dir(fake.join("input")).unwrap().count(), 0);
+        // a hand-edited issue id that escapes is rejected at load
+        v["issue"] = serde_json::json!("../../x");
+        std::fs::write(&path, v.to_string()).unwrap();
+        let (again, errs) = Inbox::load(f.dir.path().join("inbox"), Arc::new(|_| {}));
+        assert!(again.get(&id).is_none());
+        assert!(errs.iter().any(|e| e.contains("이슈 id")), "{errs:?}");
     }
 
     #[test]

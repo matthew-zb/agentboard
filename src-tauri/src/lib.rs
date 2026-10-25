@@ -389,7 +389,10 @@ async fn inbox_add_files(
     let paths: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
     let res = tauri::async_runtime::spawn_blocking(move || {
         let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
-        state.inbox.add_files(&id, &paths, target)
+        let owner = state.inbox.get(&id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))?.owner_tab;
+        // ws taken and released here; the inbox is called without it
+        let workspace = mcp_tools::tab_workspace(&state, &owner)?;
+        state.inbox.add_files(&id, &paths, target, &workspace)
     })
     .await
     .map_err(|e| format!("파일 복사 작업이 중단되었습니다 — {e}"))??;

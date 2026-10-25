@@ -45,6 +45,37 @@ pub fn is_valid_id(id: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_alphanumeric() || is_hangul(c) || c == '-')
 }
 
+/// Canonical `<tab_workspace>/issues`, which must exist and lie inside the canonical
+/// workspace (a junction/symlink at `issues` pointing elsewhere is refused). Returns
+/// `(canonical workspace, canonical issues)`.
+fn checked_issues_root(tab_workspace: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let ws_real = std::fs::canonicalize(tab_workspace)
+        .map_err(|_| "담당 탭의 작업 폴더를 찾을 수 없습니다".to_string())?;
+    let issues_real = std::fs::canonicalize(tab_workspace.join("issues"))
+        .map_err(|_| "담당 탭의 issues 폴더를 찾을 수 없습니다".to_string())?;
+    if !issues_real.starts_with(&ws_real) || issues_real == ws_real {
+        return Err("issues 폴더가 작업 폴더 밖을 가리킵니다 — 사용하지 않습니다".into());
+    }
+    Ok((ws_real, issues_real))
+}
+
+/// The folder of issue `issue` in `tab_workspace`, validated at use time: `issue` must be a
+/// valid id, `issues/` must be inside the workspace and `issues/<issue>` must resolve to a
+/// direct child of it (a junction/symlink planted there is refused). Returns the plain
+/// (non-canonical) path `<tab_workspace>/issues/<issue>`.
+pub fn resolve(tab_workspace: &Path, issue: &str) -> Result<PathBuf, String> {
+    if !is_valid_id(issue) {
+        return Err(format!("잘못된 이슈 id입니다: {issue}"));
+    }
+    let (_, issues_real) = checked_issues_root(tab_workspace)?;
+    let dir = tab_workspace.join("issues").join(issue);
+    let dir_real = std::fs::canonicalize(&dir).map_err(|_| format!("이슈 폴더를 찾을 수 없습니다: {issue}"))?;
+    if dir_real.parent() != Some(issues_real.as_path()) || !dir_real.is_dir() {
+        return Err(format!("이슈 폴더가 issues 폴더 밖을 가리킵니다 — 사용하지 않습니다: {issue}"));
+    }
+    Ok(dir)
+}
+
 /// Create `<tab_workspace>/issues/<YYYYMMDD-slug>[-N]/{input,output}`; returns the id and the
 /// issue folder. The tab workspace must exist.
 pub fn create(tab_workspace: &Path, title: &str, today: NaiveDate) -> Result<(String, PathBuf), String> {
@@ -53,11 +84,7 @@ pub fn create(tab_workspace: &Path, title: &str, today: NaiveDate) -> Result<(St
     }
     let issues = tab_workspace.join("issues");
     std::fs::create_dir_all(&issues).map_err(|e| format!("issues 폴더를 만들 수 없습니다 — {e}"))?;
-    let ws_real = std::fs::canonicalize(tab_workspace).map_err(|e| format!("작업 폴더를 확인할 수 없습니다 — {e}"))?;
-    let issues_real = std::fs::canonicalize(&issues).map_err(|e| format!("issues 폴더를 확인할 수 없습니다 — {e}"))?;
-    if !issues_real.starts_with(&ws_real) {
-        return Err("issues 폴더가 작업 폴더 밖을 가리킵니다 — 이슈 폴더를 만들지 않습니다".into());
-    }
+    checked_issues_root(tab_workspace)?;
     let base = format!("{}-{}", today.format("%Y%m%d"), slug(title));
     for n in 1..=1000u32 {
         let id = if n == 1 { base.clone() } else { format!("{base}-{n}") };
@@ -78,7 +105,7 @@ pub fn create(tab_workspace: &Path, title: &str, today: NaiveDate) -> Result<(St
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn day() -> NaiveDate {
@@ -116,5 +143,49 @@ mod tests {
         let err = create(&tmp.path().join("nope"), "x", day()).unwrap_err();
         assert!(err.contains("작업 폴더"), "{err}");
         assert!(!tmp.path().join("nope").exists());
+
+        // resolve: valid ids inside the workspace only
+        assert_eq!(resolve(&ws, &id).unwrap(), dir);
+        assert!(resolve(&ws, "..").is_err());
+        assert!(resolve(&ws, "20261025-none").is_err());
+        assert!(resolve(&tmp.path().join("nope"), &id).is_err());
+    }
+
+    /// Junction (no privilege needed) or else a directory symlink; `false` if neither works.
+    pub(crate) fn link_dir(link: &Path, target: &Path) -> bool {
+        let ok = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map_or(false, |o| o.status.success());
+        #[cfg(windows)]
+        let ok = ok || std::os::windows::fs::symlink_dir(target, link).is_ok();
+        ok && link.exists()
+    }
+
+    #[test]
+    fn junctions_out_of_the_workspace_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("billing");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join("x")).unwrap();
+        std::fs::create_dir(&ws).unwrap();
+        // issues/<id> is a junction to a folder outside the workspace
+        std::fs::create_dir(ws.join("issues")).unwrap();
+        if !link_dir(&ws.join("issues").join("20261025-x"), &outside.join("x")) {
+            eprintln!("junction/symlink creation refused by the OS — skipping");
+            return;
+        }
+        let err = resolve(&ws, "20261025-x").unwrap_err();
+        assert!(err.contains("밖"), "{err}");
+        // issues itself is a junction to outside
+        let ws2 = tmp.path().join("api");
+        std::fs::create_dir(&ws2).unwrap();
+        assert!(link_dir(&ws2.join("issues"), &outside));
+        assert!(resolve(&ws2, "x").unwrap_err().contains("밖"));
+        let err = create(&ws2, "y", day()).unwrap_err();
+        assert!(err.contains("밖"), "{err}");
+        assert!(!outside.join("20261025-y").exists(), "nothing created outside");
     }
 }

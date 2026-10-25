@@ -163,11 +163,15 @@ pub fn call(state: &AppState, caller: &Caller, name: &str, args: Value) -> Resul
     match name {
         "inbox_post" => inbox_post(state, caller, &args),
         "inbox_note" => {
-            state.inbox.note(caller, &req_str(&args, "item")?, &req_str(&args, "text")?)?;
+            let text = req_str(&args, "text")?;
+            cap_bytes("text", &text)?;
+            state.inbox.note(caller, &req_str(&args, "item")?, &text)?;
             Ok(json!("메모를 기록했습니다."))
         }
         "inbox_propose_close" => {
-            state.inbox.propose_close(caller, &req_str(&args, "item")?, &req_str(&args, "final_opinion")?)?;
+            let opinion = req_str(&args, "final_opinion")?;
+            cap_bytes("final_opinion", &opinion)?;
+            state.inbox.propose_close(caller, &req_str(&args, "item")?, &opinion)?;
             Ok(json!("종료를 제안했습니다. 사용자가 확인하면 완료됩니다."))
         }
         "inbox_list" => {
@@ -182,6 +186,51 @@ pub fn call(state: &AppState, caller: &Caller, name: &str, args: Value) -> Resul
         "handoff_done" => handoff_done(state, caller),
         _ => Err(format!("알 수 없는 도구입니다: {name}")),
     }
+}
+
+/// Content caps of MCP inputs (characters, except `TEXT_MAX_BYTES`).
+pub const TITLE_MAX: usize = 200;
+pub const ENTRY_MAX: usize = 500;
+pub const ENTRIES_MAX: usize = 20;
+pub const TEXT_MAX_BYTES: usize = 8 * 1024;
+
+fn cap_chars(key: &str, s: &str, max: usize) -> Result<(), String> {
+    if s.chars().count() > max {
+        return Err(format!("{key}이(가) 너무 깁니다(최대 {max}자)"));
+    }
+    Ok(())
+}
+
+fn cap_bytes(key: &str, s: &str) -> Result<(), String> {
+    if s.len() > TEXT_MAX_BYTES {
+        return Err(format!("{key}이(가) 너무 깁니다(최대 8KB)"));
+    }
+    Ok(())
+}
+
+/// Required array of strings: at most [`ENTRIES_MAX`] entries of at most [`ENTRY_MAX`] chars.
+fn capped_list(args: &Value, key: &str, required: bool) -> Result<Vec<String>, String> {
+    if required && matches!(args.get(key), None | Some(Value::Null)) {
+        return Err(format!("{key}이(가) 필요합니다"));
+    }
+    let v = str_list(args, key)?;
+    if v.len() > ENTRIES_MAX {
+        return Err(format!("{key} 항목이 너무 많습니다(최대 {ENTRIES_MAX}개)"));
+    }
+    for e in &v {
+        cap_chars(key, e, ENTRY_MAX)?;
+    }
+    Ok(v)
+}
+
+/// Owner tab's current workspace from `ws` (released before returning). A tab that no longer
+/// exists is refused: stored issue paths are never trusted on their own.
+pub fn tab_workspace(state: &AppState, tab: &str) -> Result<std::path::PathBuf, String> {
+    let ws = state.ws.lock().unwrap();
+    ws.tabs
+        .get(tab)
+        .map(|t| t.workspace.clone())
+        .ok_or_else(|| "담당 탭이 없어 이슈 폴더를 확인할 수 없습니다".to_string())
 }
 
 fn opt_str(args: &Value, key: &str) -> Result<Option<String>, String> {
@@ -215,12 +264,16 @@ fn caller_tab(state: &AppState, caller: &Caller) -> Result<(String, std::path::P
 
 /// Returns the new item's id as plain text.
 fn inbox_post(state: &AppState, caller: &Caller, args: &Value) -> Result<Value, String> {
+    let title = req_str(args, "title")?;
+    cap_chars("title", &title, TITLE_MAX)?;
+    let source = req_str(args, "source")?;
+    cap_chars("source", &source, ENTRY_MAX)?;
     let new = NewItem {
-        title: req_str(args, "title")?,
-        check: str_list(args, "check")?,
-        risk: str_list(args, "risk")?,
-        source: opt_str(args, "source")?.unwrap_or_default(),
-        refs: str_list(args, "refs")?,
+        title,
+        check: capped_list(args, "check", true)?,
+        risk: capped_list(args, "risk", true)?,
+        source,
+        refs: capped_list(args, "refs", false)?,
     };
     let (tab_name, _) = caller_tab(state, caller)?;
     Ok(json!(state.inbox.post(caller, &tab_name, new)?))
@@ -233,6 +286,7 @@ fn issue_create(state: &AppState, caller: &Caller, args: &Value) -> Result<Value
     if title.trim().is_empty() {
         return Err("title이(가) 비어 있습니다".into());
     }
+    cap_chars("title", &title, TITLE_MAX)?;
     let reply = |id: &str, path: &std::path::Path| {
         json!({ "issue": id, "path": path, "input": path.join("input"), "output": path.join("output") })
     };
@@ -240,8 +294,13 @@ fn issue_create(state: &AppState, caller: &Caller, args: &Value) -> Result<Value
     if let Some(item_id) = &item {
         let it = state.inbox.get(item_id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {item_id}"))?;
         inbox::check_owner(caller, &it)?;
-        if let (Some(id), Some(path)) = (&it.issue, &it.issue_path) {
-            return Ok(reply(id, path));
+        if it.state == ItemState::Done {
+            return Err(format!("완료된 항목입니다: {item_id}"));
+        }
+        if let Some(id) = &it.issue {
+            // re-derived and validated from the tab's current workspace, never the stored path
+            let path = issues::resolve(&tab_workspace(state, &caller.tab)?, id)?;
+            return Ok(reply(id, &path));
         }
     }
     let (_, workspace) = caller_tab(state, caller)?;

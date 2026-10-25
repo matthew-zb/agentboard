@@ -477,6 +477,34 @@ fn inbox_tools_over_mcp() {
     // the user's file copy lands in the issue folder
     let src = workspace.join("note.md");
     std::fs::write(&src, "x").unwrap();
-    let out = fx.state.inbox.add_files(&id, &[src], app_lib::inbox::Target::Output).unwrap();
+    let out = fx.state.inbox.add_files(&id, &[src], app_lib::inbox::Target::Output, &workspace).unwrap();
     assert_eq!(out, vec![path.join("output").join("note.md")]);
+
+    // content caps (Korean errors); schema-required fields are enforced
+    let long = "가".repeat(201);
+    let bad = [
+        json!({"title":long,"check":[],"risk":[],"source":""}),
+        json!({"title":"x","check":["a".repeat(501)],"risk":[],"source":""}),
+        json!({"title":"x","check":vec!["a"; 21],"risk":[],"source":""}),
+        json!({"title":"x","risk":[],"source":""}),
+        json!({"title":"x","check":[],"risk":[]}),
+    ];
+    for args in bad {
+        let res = call(&fx, &m, "inbox_post", args.clone());
+        assert_eq!(res["isError"], true, "{args}");
+        assert!(has_hangul(&text(&res)));
+    }
+    let big = "a".repeat(8 * 1024 + 1);
+    assert_eq!(call(&fx, &m, "inbox_note", json!({"item":id,"text":big}))["isError"], true);
+    assert_eq!(call(&fx, &m, "inbox_propose_close", json!({"item":id,"final_opinion":big}))["isError"], true);
+    assert_eq!(call(&fx, &m, "issue_create", json!({"title":"가".repeat(201)}))["isError"], true);
+
+    // issue_create on a done item: refused before any folder is made
+    let id2 = text(&call(&fx, &m, "inbox_post", json!({"title":"끝난 일","check":[],"risk":[],"source":"s"})));
+    call(&fx, &m, "inbox_propose_close", json!({"item":id2,"final_opinion":"끝"}));
+    fx.state.inbox.confirm_done(&id2).unwrap();
+    let before = std::fs::read_dir(workspace.join("issues")).unwrap().count();
+    let res = call(&fx, &m, "issue_create", json!({"item":id2,"title":"고아"}));
+    assert_eq!(res["isError"], true, "{res}");
+    assert_eq!(std::fs::read_dir(workspace.join("issues")).unwrap().count(), before);
 }
