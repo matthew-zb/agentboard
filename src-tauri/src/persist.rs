@@ -8,7 +8,6 @@
 use crate::workspace::{Effects, Workspace};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const DEBOUNCE: Duration = Duration::from_millis(500);
@@ -17,6 +16,9 @@ const MAX_DELAY: Duration = Duration::from_secs(5);
 const FLUSH_WAIT: Duration = Duration::from_secs(5);
 /// Shown in the error list when workspace.json had to be discarded.
 pub const CORRUPT_MESSAGE: &str = "작업 상태 파일이 손상되어 초기 배치로 시작했습니다";
+/// Shown when workspace.json exists but could not be read or backed up; saving is disabled.
+pub const UNREADABLE_MESSAGE: &str =
+    "저장된 작업 상태 파일을 읽을 수 없어 초기 배치로 시작했습니다. 이번 실행의 변경 사항은 저장되지 않습니다";
 
 fn sibling(path: &Path, ext: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
@@ -44,13 +46,66 @@ pub fn save_atomic(path: &Path, ws: &Workspace) -> Result<(), String> {
     })
 }
 
+/// Why `load` produced no workspace although a file exists.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoadError {
+    /// Unparsable or inconsistent; the original was moved to `.bak` (the path is free to rewrite).
+    Corrupt(String),
+    /// Could not be read, or could not be moved to `.bak`: the original is still at the path and
+    /// must NOT be overwritten (start the Saver disabled).
+    Unreadable(String),
+}
+
+impl LoadError {
+    /// Korean line for the user-visible error list.
+    pub fn user_message(&self) -> &'static str {
+        match self {
+            LoadError::Corrupt(_) => CORRUPT_MESSAGE,
+            LoadError::Unreadable(_) => UNREADABLE_MESSAGE,
+        }
+    }
+    pub fn detail(&self) -> &str {
+        match self {
+            LoadError::Corrupt(m) | LoadError::Unreadable(m) => m,
+        }
+    }
+    /// Whether the saver may write to the path afterwards.
+    pub fn may_overwrite(&self) -> bool {
+        matches!(self, LoadError::Corrupt(_))
+    }
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.detail())
+    }
+}
+
+/// Read with a few retries for transient errors (sharing violations from antivirus/sync tools).
+fn read_with_retry(path: &Path, attempts: u32, backoff: Duration) -> std::io::Result<Vec<u8>> {
+    let mut last = None;
+    for i in 0..attempts {
+        match std::fs::read(path) {
+            Ok(b) => return Ok(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
+            Err(e) => last = Some(e),
+        }
+        if i + 1 < attempts {
+            std::thread::sleep(backoff);
+        }
+    }
+    Err(last.expect("attempts >= 1"))
+}
+
 /// `Ok(None)` when the file does not exist. A file that cannot be parsed, or whose contents are
-/// inconsistent (`Workspace::normalize_and_validate`), is moved to `<path>.bak` and reported as `Err`.
-pub fn load(path: &Path) -> Result<Option<Workspace>, String> {
-    let bytes = match std::fs::read(path) {
+/// inconsistent (`Workspace::normalize_and_validate`), is moved to `<path>.bak` and reported as
+/// `LoadError::Corrupt`. If it cannot be read (3 tries) or the move fails, the result is
+/// `LoadError::Unreadable` and the original stays untouched.
+pub fn load(path: &Path) -> Result<Option<Workspace>, LoadError> {
+    let bytes = match read_with_retry(path, 3, Duration::from_millis(100)) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("작업 상태 파일을 읽을 수 없습니다: {} — {e}", path.display())),
+        Err(e) => return Err(LoadError::Unreadable(format!("작업 상태 파일을 읽을 수 없습니다: {} — {e}", path.display()))),
     };
     let parsed = serde_json::from_slice::<Workspace>(&bytes)
         .map_err(|e| format!("{}:{}:{} — {e}", path.display(), e.line(), e.column()))
@@ -59,11 +114,10 @@ pub fn load(path: &Path) -> Result<Option<Workspace>, String> {
         Ok(ws) => Ok(Some(ws)),
         Err(cause) => {
             let bak = sibling(path, ".bak");
-            let moved = match std::fs::rename(path, &bak) {
-                Ok(()) => format!("{} 로 옮겼습니다", bak.display()),
-                Err(e) => format!("백업 실패: {e}"),
-            };
-            Err(format!("{cause} ({moved})"))
+            match std::fs::rename(path, &bak) {
+                Ok(()) => Err(LoadError::Corrupt(format!("{cause} ({} 로 옮겼습니다)", bak.display()))),
+                Err(e) => Err(LoadError::Unreadable(format!("{cause} (백업 실패, 원본 유지: {e})"))),
+            }
         }
     }
 }
@@ -82,7 +136,8 @@ enum Msg {
 /// Background saver: `notify()` after every model change; saves 500ms after the last one
 /// (at most 5s after the first of a continuous burst). Dropping it saves a pending change.
 pub struct Saver {
-    tx: Mutex<Sender<Msg>>,
+    /// `None` = disabled (an existing workspace.json must be left untouched).
+    tx: Option<Sender<Msg>>,
 }
 
 impl Saver {
@@ -132,17 +187,25 @@ impl Saver {
                 }
             })
             .expect("saver thread");
-        Saver { tx: Mutex::new(tx) }
+        Saver { tx: Some(tx) }
+    }
+
+    /// A saver that never writes (used when an existing workspace.json could not be preserved).
+    pub fn disabled() -> Saver {
+        Saver { tx: None }
     }
 
     pub fn notify(&self) {
-        let _ = self.tx.lock().unwrap().send(Msg::Dirty);
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Msg::Dirty);
+        }
     }
 
     /// Save now (blocks until written, at most a few seconds). Used at app exit.
     pub fn flush(&self) {
+        let Some(tx) = &self.tx else { return };
         let (ack_tx, ack_rx) = mpsc::channel();
-        if self.tx.lock().unwrap().send(Msg::Flush(ack_tx)).is_ok() {
+        if tx.send(Msg::Flush(ack_tx)).is_ok() {
             let _ = ack_rx.recv_timeout(FLUSH_WAIT);
         }
     }
@@ -209,6 +272,57 @@ mod tests {
         assert_eq!(back, ws);
         assert_eq!(back.group_layout.leaves().len(), 2);
         assert_eq!(back.counters, ws.counters);
+    }
+
+    #[test]
+    fn unreadable_file_is_not_corrupt_and_stays_untouched() {
+        // a directory at the path: present, but not readable as a file
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(path(&dir)).unwrap();
+        std::fs::write(path(&dir).join("keep.txt"), "x").unwrap();
+        let e = load(&path(&dir)).unwrap_err();
+        assert!(matches!(e, LoadError::Unreadable(_)), "{e:?}");
+        assert!(!e.may_overwrite());
+        assert_eq!(e.user_message(), UNREADABLE_MESSAGE);
+        assert_ne!(UNREADABLE_MESSAGE, CORRUPT_MESSAGE);
+        // startup uses a disabled saver: a save attempt must not touch the original
+        let saver = Saver::disabled();
+        saver.notify();
+        saver.flush();
+        assert!(path(&dir).is_dir() && path(&dir).join("keep.txt").exists());
+        assert!(!dir.path().join("workspace.json.tmp").exists());
+    }
+
+    #[test]
+    fn bak_rename_failure_keeps_original() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(path(&dir), "{ not json").unwrap();
+        let bak = dir.path().join("workspace.json.bak");
+        std::fs::create_dir(&bak).unwrap();
+        std::fs::write(bak.join("x"), "x").unwrap(); // non-empty dir: rename onto it fails
+        let e = load(&path(&dir)).unwrap_err();
+        assert!(matches!(e, LoadError::Unreadable(_)), "{e:?}");
+        assert!(!e.may_overwrite());
+        assert_eq!(std::fs::read_to_string(path(&dir)).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn corrupt_file_reports_corrupt_and_may_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(path(&dir), "{ not json").unwrap();
+        let e = load(&path(&dir)).unwrap_err();
+        assert!(matches!(e, LoadError::Corrupt(_)));
+        assert!(e.may_overwrite());
+        assert_eq!(e.user_message(), CORRUPT_MESSAGE);
+    }
+
+    #[test]
+    fn read_retry_gives_up_on_persistent_error_but_not_on_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = read_with_retry(&path(&dir), 3, Duration::from_millis(1)).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        std::fs::create_dir(path(&dir)).unwrap();
+        assert!(read_with_retry(&path(&dir), 3, Duration::from_millis(1)).is_err());
     }
 
     #[test]

@@ -15,7 +15,8 @@
 //! * `ws -> emit_lock` (R16): `publish` stamps a version under `ws`, takes `emit_lock`,
 //!   releases `ws`, emits, then releases `emit_lock` — emits go out in version order and
 //!   never while `ws` is held.
-//! * `Saver` (persist.rs): `notify` is a channel send (leaf). Its thread takes `ws` only to
+//! * `Saver` (persist.rs): `notify` is a channel send (leaf); `publish` calls it while still
+//!   holding `emit_lock` (emit_lock -> saver channel; nothing is acquired inside). Its thread takes `ws` only to
 //!   clone, releases it, then writes the file — never `ws` during IO, never `emit_lock`.
 //! * `prompts`, `channels`, `effects` and `emit_lock` are leaves: nothing is acquired while
 //!   holding them.

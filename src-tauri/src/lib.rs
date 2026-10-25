@@ -219,6 +219,7 @@ pub fn run() {
             let loaded = config::load_all(&appdata);
             let ws_path = appdata.join("workspace.json");
             let mut startup_errors = Vec::new();
+            let mut saving = true;
             let (ws, initial) = match persist::load(&ws_path) {
                 Ok(Some(mut ws)) => {
                     let fx = persist::prepare_restored(&mut ws);
@@ -231,7 +232,9 @@ pub fn run() {
                 }
                 Err(e) => {
                     eprintln!("[agentboard] workspace.json 복원 실패: {e}");
-                    startup_errors.push(persist::CORRUPT_MESSAGE.to_string());
+                    startup_errors.push(e.user_message().to_string());
+                    // an original that could not be preserved must never be overwritten
+                    saving = e.may_overwrite();
                     let ws = Workspace::from_config(&loaded);
                     let fx = launcher::initial_effects(&ws);
                     (ws, fx)
@@ -239,9 +242,13 @@ pub fn run() {
             };
             let handle = app.handle().clone();
             // clone under `ws`, released before the saver writes (no lock held during IO)
-            let saver = persist::Saver::new(ws_path, move || {
-                handle.try_state::<AppState>().map(|s| s.ws.lock().unwrap().clone())
-            });
+            let saver = if saving {
+                persist::Saver::new(ws_path, move || {
+                    handle.try_state::<AppState>().map(|s| s.ws.lock().unwrap().clone())
+                })
+            } else {
+                persist::Saver::disabled()
+            };
 
             let sink = Arc::new(AppSink::new(app.handle().clone()));
             let pty = PtyManager::new(sink.clone());
