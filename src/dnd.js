@@ -46,6 +46,24 @@ export function bodyDrop(groupTabIds, group, dragTab, zone) {
   return tabBarDrop(groupTabIds, group, dragTab, null, false);
 }
 
+/** Our drags carry this type (not text/plain, so a drop on a text input cannot paste the id). */
+export const DRAG_MIME = 'application/x-agentboard-tab';
+
+/** True when the dataTransfer types say this is one of our tab drags. */
+export const isTabDrag = (types) => !!types && Array.prototype.includes.call(types, DRAG_MIME);
+
+/** A drag event (dragstart/dragover) is expected at least this often while a drag is alive. */
+export const STRAY_QUIET_MS = 400;
+
+/**
+ * Stray-drag fallback decision: a plain mouse event means the native drag ended without a
+ * dragend only when it is a real release/move (no buttons held) AND no drag event was seen
+ * recently. Stray events during a live drag (dragover keeps firing) never cancel it.
+ */
+export function strayEnded({ now, lastDragEvent, buttons }) {
+  return buttons === 0 && now - lastDragEvent >= STRAY_QUIET_MS;
+}
+
 // ── DOM wiring ─────────────────────────────────────────────────────────────
 
 const MARKS = ['drop-before', 'drop-after', 'drop-end'];
@@ -57,7 +75,7 @@ const MARKS = ['drop-before', 'drop-after', 'drop-end'];
  * Tabs must be `draggable` (renderTabBar sets it).
  */
 export function installDnd(root, { getWs, send, refocus }) {
-  let drag = null; // {tab, token}
+  let drag = null; // {tab, token, last}
   let token = 0;
 
   const groupTabIds = (g) => {
@@ -75,9 +93,13 @@ export function installDnd(root, { getWs, send, refocus }) {
     drag = null;
     for (const el of document.querySelectorAll('.drop-overlay')) el.remove();
     clearMarks();
-    window.removeEventListener('mousemove', cleanup, true);
-    window.removeEventListener('mouseup', cleanup, true);
+    window.removeEventListener('mousemove', onStray, true);
+    window.removeEventListener('mouseup', onStray, true);
     if (was) refocus();
+  }
+
+  function onStray(e) {
+    if (drag && strayEnded({ now: Date.now(), lastDragEvent: drag.last, buttons: e.buttons })) cleanup();
   }
 
   function addOverlays(myToken) {
@@ -111,22 +133,23 @@ export function installDnd(root, { getWs, send, refocus }) {
   root.addEventListener('dragstart', (e) => {
     const tabEl = closest(e, '.tab[data-tab]');
     if (!tabEl) return;
-    drag = { tab: tabEl.dataset.tab, token: ++token };
+    drag = { tab: tabEl.dataset.tab, token: ++token, last: Date.now() };
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = 'move';
-      try { e.dataTransfer.setData('text/plain', drag.tab); } catch (_) { /* ignore */ }
+      try { e.dataTransfer.setData(DRAG_MIME, drag.tab); } catch (_) { /* ignore */ }
     }
-    // Mouse events do not fire during a native drag: seeing one means the drag ended without a
-    // dragend (e.g. the dragged tab was re-rendered away mid-drag), so clean up.
-    window.addEventListener('mousemove', cleanup, true);
-    window.addEventListener('mouseup', cleanup, true);
+    // Fallback for a drag that ended without dragend (e.g. the dragged tab was re-rendered
+    // away): see strayEnded. Window blur is deliberately ignored while a drag is live.
+    window.addEventListener('mousemove', onStray, true);
+    window.addEventListener('mouseup', onStray, true);
     // Mutating the DOM inside dragstart can cancel the drag: add the overlays a frame later.
     const my = drag.token;
     requestAnimationFrame(() => addOverlays(my));
   });
 
   root.addEventListener('dragover', (e) => {
-    if (!drag) return;
+    if (!drag || !isTabDrag(e.dataTransfer && e.dataTransfer.types)) return;
+    drag.last = Date.now();
     const ov = closest(e, '.drop-overlay');
     const bar = closest(e, '.tabbar[data-group]');
     if (ov) {
@@ -152,7 +175,7 @@ export function installDnd(root, { getWs, send, refocus }) {
   });
 
   root.addEventListener('drop', (e) => {
-    if (!drag) return;
+    if (!drag || !isTabDrag(e.dataTransfer && e.dataTransfer.types)) return;
     e.preventDefault();
     const tab = drag.tab;
     const ov = closest(e, '.drop-overlay');
@@ -181,7 +204,4 @@ export function installDnd(root, { getWs, send, refocus }) {
   document.addEventListener('keydown', (e) => {
     if (drag && e.key === 'Escape') cleanup();
   }, true);
-  window.addEventListener('blur', () => {
-    if (drag) cleanup();
-  });
 }

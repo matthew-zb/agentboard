@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { tabDropIndex, tabBarDrop, bodyDrop, zoneToSplit } from '../../src/dnd.js';
+import { tabDropIndex, tabBarDrop, bodyDrop, zoneToSplit, strayEnded, isTabDrag, DRAG_MIME, STRAY_QUIET_MS } from '../../src/dnd.js';
 
 const ids = ['a', 'b', 'c', 'd'];
 
@@ -57,4 +57,19 @@ test('bodyDrop: center appends, edges split', () => {
 test('zoneToSplit', () => {
   assert.equal(zoneToSplit('center'), null);
   assert.deepEqual(zoneToSplit('top'), { dir: 'vertical', before: true });
+});
+
+test('strayEnded: stray events during a live drag do not cancel it', () => {
+  assert.equal(strayEnded({ now: 1000, lastDragEvent: 900, buttons: 0 }), false); // recent dragover
+  assert.equal(strayEnded({ now: 1000, lastDragEvent: 0, buttons: 1 }), false); // button held
+});
+
+test('strayEnded: a real release after a lost dragend does', () => {
+  assert.equal(strayEnded({ now: 1000 + STRAY_QUIET_MS, lastDragEvent: 1000, buttons: 0 }), true);
+});
+
+test('isTabDrag recognises only our MIME type', () => {
+  assert.equal(isTabDrag([DRAG_MIME]), true);
+  assert.equal(isTabDrag(['text/plain']), false);
+  assert.equal(isTabDrag(null), false);
 });
