@@ -8,6 +8,8 @@
 //! model change (R13); it runs on a blocking thread, never inside the async runtime.
 
 use crate::control::Caller;
+use crate::inbox::{self, ItemState, NewItem};
+use crate::issues;
 use crate::roles::Role;
 use crate::AppState;
 use serde_json::{json, Value};
@@ -58,6 +60,72 @@ impl ToolDef {
 fn implemented() -> Vec<ToolDef> {
     vec![
         ToolDef {
+            name: "inbox_post",
+            description: "검토 결과를 사용자 인박스에 새 항목으로 올립니다(담당 = 호출한 Manager의 탭). 반환: 항목 id.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "항목 제목" },
+                    "check": { "type": "array", "items": { "type": "string" }, "description": "사용자가 확인할 것" },
+                    "risk": { "type": "array", "items": { "type": "string" }, "description": "리스크 포인트" },
+                    "source": { "type": "string", "description": "출처(슬랙 채널·메일 제목, 시각)" },
+                    "refs": { "type": "array", "items": { "type": "string" }, "description": "참고 경로·링크(선택)" }
+                },
+                "required": ["title", "check", "risk", "source"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "inbox_note",
+            description: "자기 담당 인박스 항목의 타임라인에 진행 메모를 남깁니다.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "item": { "type": "string", "description": "항목 id" },
+                    "text": { "type": "string", "description": "메모 내용" }
+                },
+                "required": ["item", "text"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "inbox_propose_close",
+            description: "자기 담당 항목을 최종 의견과 함께 '종료 제안됨'으로 바꿉니다. 완료 확인은 사용자만 합니다.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "item": { "type": "string", "description": "항목 id" },
+                    "final_opinion": { "type": "string", "description": "최종 의견" }
+                },
+                "required": ["item", "final_opinion"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "inbox_list",
+            description: "인박스 항목을 조회합니다(Manager는 자기 담당, dispatcher는 전체). state를 주지 않으면 완료되지 않은 항목만 돌려줍니다.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "state": { "type": "string", "enum": ["new", "in_progress", "close_proposed", "done"], "description": "이 상태의 항목만" }
+                },
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "issue_create",
+            description: "자기 작업 폴더에 이슈 폴더(issues/<YYYYMMDD-제목>/{input,output})를 만들고, 항목을 주면 연결합니다. 반환: 이슈 id와 경로.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "item": { "type": "string", "description": "연결할 인박스 항목 id(선택, 자기 담당만)" },
+                    "title": { "type": "string", "description": "이슈 제목(폴더 이름에 쓰임)" }
+                },
+                "required": ["title"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
             name: "list_team",
             description: "이 탭에 있는 팀들(또는 지정한 한 팀)의 구성과 각 창의 상태를 돌려줍니다.",
             input_schema: json!({
@@ -93,10 +161,98 @@ pub fn call(state: &AppState, caller: &Caller, name: &str, args: Value) -> Resul
         _ => return Err("arguments는 객체여야 합니다".into()),
     };
     match name {
+        "inbox_post" => inbox_post(state, caller, &args),
+        "inbox_note" => {
+            state.inbox.note(caller, &req_str(&args, "item")?, &req_str(&args, "text")?)?;
+            Ok(json!("메모를 기록했습니다."))
+        }
+        "inbox_propose_close" => {
+            state.inbox.propose_close(caller, &req_str(&args, "item")?, &req_str(&args, "final_opinion")?)?;
+            Ok(json!("종료를 제안했습니다. 사용자가 확인하면 완료됩니다."))
+        }
+        "inbox_list" => {
+            let filter = match opt_str(&args, "state")? {
+                None => None,
+                Some(s) => Some(ItemState::parse(&s).ok_or_else(|| format!("알 수 없는 상태입니다: {s}"))?),
+            };
+            Ok(json!(state.inbox.list_for(caller, filter)))
+        }
+        "issue_create" => issue_create(state, caller, &args),
         "list_team" => list_team(state, caller, &args),
         "handoff_done" => handoff_done(state, caller),
         _ => Err(format!("알 수 없는 도구입니다: {name}")),
     }
+}
+
+fn opt_str(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("{key}은(는) 문자열이어야 합니다")),
+    }
+}
+
+fn req_str(args: &Value, key: &str) -> Result<String, String> {
+    opt_str(args, key)?.ok_or_else(|| format!("{key}이(가) 필요합니다"))
+}
+
+/// Optional array of strings (missing / null → empty).
+fn str_list(args: &Value, key: &str) -> Result<Vec<String>, String> {
+    let bad = || format!("{key}은(는) 문자열 배열이어야 합니다");
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(a)) => a.iter().map(|v| v.as_str().map(str::to_string).ok_or_else(bad)).collect(),
+        Some(_) => Err(bad()),
+    }
+}
+
+/// Name and workspace of the caller's tab; `ws` is released before the inbox is used.
+fn caller_tab(state: &AppState, caller: &Caller) -> Result<(String, std::path::PathBuf), String> {
+    let ws = state.ws.lock().unwrap();
+    let tab = ws.tabs.get(&caller.tab).ok_or("호출한 창의 탭을 찾을 수 없습니다")?;
+    Ok((tab.name.clone(), tab.workspace.clone()))
+}
+
+/// Returns the new item's id as plain text.
+fn inbox_post(state: &AppState, caller: &Caller, args: &Value) -> Result<Value, String> {
+    let new = NewItem {
+        title: req_str(args, "title")?,
+        check: str_list(args, "check")?,
+        risk: str_list(args, "risk")?,
+        source: opt_str(args, "source")?.unwrap_or_default(),
+        refs: str_list(args, "refs")?,
+    };
+    let (tab_name, _) = caller_tab(state, caller)?;
+    Ok(json!(state.inbox.post(caller, &tab_name, new)?))
+}
+
+/// `{"issue": id, "path", "input", "output"}`. With `item`: the caller must own it, and an
+/// item that already has an issue gets that issue back (a retried call makes no new folder).
+fn issue_create(state: &AppState, caller: &Caller, args: &Value) -> Result<Value, String> {
+    let title = req_str(args, "title")?;
+    if title.trim().is_empty() {
+        return Err("title이(가) 비어 있습니다".into());
+    }
+    let reply = |id: &str, path: &std::path::Path| {
+        json!({ "issue": id, "path": path, "input": path.join("input"), "output": path.join("output") })
+    };
+    let item = opt_str(args, "item")?;
+    if let Some(item_id) = &item {
+        let it = state.inbox.get(item_id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {item_id}"))?;
+        inbox::check_owner(caller, &it)?;
+        if let (Some(id), Some(path)) = (&it.issue, &it.issue_path) {
+            return Ok(reply(id, path));
+        }
+    }
+    let (_, workspace) = caller_tab(state, caller)?;
+    let (id, path) = issues::create(&workspace, &title, chrono::Local::now().date_naive())?;
+    if let Some(item_id) = &item {
+        state
+            .inbox
+            .link_issue(caller, item_id, &id, &path)
+            .map_err(|e| format!("이슈 폴더({id})는 만들었지만 항목에 연결하지 못했습니다: {e}"))?;
+    }
+    Ok(reply(&id, &path))
 }
 
 /// `{"tab": <tab name>, "teams": [{"team", "panes": [{"pane","name","role","sessionName","status"}]}]}`;
@@ -168,9 +324,13 @@ mod tests {
     #[test]
     fn list_filters_by_role() {
         let names = |r| list(r).into_iter().map(|t| t.name).collect::<Vec<_>>();
-        assert_eq!(names(Role::Manager), ["list_team", "handoff_done"]);
-        assert_eq!(names(Role::Lead), ["list_team"]);
-        assert_eq!(names(Role::Handover), ["handoff_done"]);
-        assert!(names(Role::Member).is_empty());
+        assert_eq!(
+            names(Role::Manager),
+            ["inbox_post", "inbox_note", "inbox_propose_close", "inbox_list", "issue_create", "list_team", "handoff_done"]
+        );
+        assert_eq!(names(Role::Dispatcher), ["inbox_list", "handoff_done"]);
+        assert_eq!(names(Role::Lead), ["inbox_list", "list_team"]);
+        assert_eq!(names(Role::Handover), ["inbox_list", "handoff_done"]);
+        assert_eq!(names(Role::Member), ["inbox_list"]);
     }
 }

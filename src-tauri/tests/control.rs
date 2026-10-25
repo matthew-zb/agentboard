@@ -203,10 +203,13 @@ fn tools_list_is_filtered_by_role() {
     let d = fx.token(Role::Dispatcher);
     let l = fx.token(Role::Lead);
     let mb = fx.token(Role::Member);
-    assert_eq!(tool_names(&fx, &m), ["handoff_done", "list_team"]);
-    assert_eq!(tool_names(&fx, &d), ["handoff_done"]);
-    assert_eq!(tool_names(&fx, &l), ["list_team"]);
-    assert!(tool_names(&fx, &mb).is_empty());
+    assert_eq!(
+        tool_names(&fx, &m),
+        ["handoff_done", "inbox_list", "inbox_note", "inbox_post", "inbox_propose_close", "issue_create", "list_team"]
+    );
+    assert_eq!(tool_names(&fx, &d), ["handoff_done", "inbox_list"]);
+    assert_eq!(tool_names(&fx, &l), ["inbox_list", "list_team"]);
+    assert_eq!(tool_names(&fx, &mb), ["inbox_list"]);
 
     // tool defs are complete MCP tool objects
     let r = rpc(fx.addr, Some(&m), json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).json();
@@ -222,7 +225,7 @@ fn tools_list_is_filtered_by_role() {
     let res = call(&fx, &m, "no_such_tool", json!({}));
     assert_eq!(res["isError"], true);
     // planned but not yet implemented tools are refused as well
-    let res = call(&fx, &m, "inbox_post", json!({"title":"x"}));
+    let res = call(&fx, &m, "hire_lead", json!({"team":"x","brief_path":"x"}));
     assert_eq!(res["isError"], true);
 
     // list_team: the caller tab's teams
@@ -389,4 +392,91 @@ fn server_binds_loopback_only() {
     let r = raw(fx.addr, "POST", "/mcp", &[("Host", port_host.as_str()), ("Authorization", auth.as_str())], body);
     assert_eq!(r.status, 200, "{}", r.body);
     assert!(r.header("access-control-allow-origin").is_none());
+}
+
+fn text(res: &Value) -> String {
+    res["content"][0]["text"].as_str().unwrap().to_string()
+}
+
+/// Task 6: inbox tools over the real server — ownership, visibility, user-only done, issues.
+#[test]
+fn inbox_tools_over_mcp() {
+    let fx = fixture();
+    let m = fx.token(Role::Manager);
+    let d = fx.token(Role::Dispatcher);
+    let l = fx.token(Role::Lead);
+    let mgr_pane = fx.pane(Role::Manager);
+    let mgr_tab = fx.state.ws.lock().unwrap().panes[&mgr_pane].tab.clone();
+    let workspace = fx.state.ws.lock().unwrap().tabs[&mgr_tab].workspace.clone();
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    // post: Manager only; returns the id as plain text; owner = caller's tab
+    let post = json!({"title":"결제 실패 확인","check":["금액"],"risk":["중복 결제"],"source":"slack #billing"});
+    let res = call(&fx, &d, "inbox_post", post.clone());
+    assert_eq!(res["isError"], true, "{res}");
+    let res = call(&fx, &m, "inbox_post", post.clone());
+    assert_eq!(res["isError"], false, "{res}");
+    let id = text(&res);
+    let item = fx.state.inbox.get(&id).expect("stored");
+    assert_eq!((item.owner_tab.as_str(), item.owner_name.as_str()), (mgr_tab.as_str(), "billing"));
+    assert_eq!(item.timeline[0].who, "billing");
+    // retry of the identical post → same id
+    assert_eq!(text(&call(&fx, &m, "inbox_post", post)), id);
+    // bad arguments are Korean errors
+    let res = call(&fx, &m, "inbox_post", json!({"title":"x","check":"not a list","risk":[],"source":""}));
+    assert_eq!(res["isError"], true);
+    assert!(has_hangul(&text(&res)));
+
+    // list: dispatcher all, manager own, lead none (not an error)
+    let list = |tok: &str, args: Value| -> Vec<Value> {
+        let res = call(&fx, tok, "inbox_list", args);
+        assert_eq!(res["isError"], false, "{res}");
+        serde_json::from_str::<Value>(&text(&res)).unwrap().as_array().unwrap().clone()
+    };
+    assert_eq!(list(&d, json!({})).len(), 1);
+    assert_eq!(list(&m, json!({})).len(), 1);
+    assert_eq!(list(&m, json!({}))[0]["ownerTab"], mgr_tab.as_str());
+    assert_eq!(list(&m, json!({}))[0]["state"], "new");
+    assert!(list(&l, json!({})).is_empty());
+    assert!(list(&d, json!({"state":"done"})).is_empty());
+    assert_eq!(call(&fx, &d, "inbox_list", json!({"state":"bogus"}))["isError"], true);
+
+    // note / propose_close: only the owner Manager
+    assert_eq!(call(&fx, &d, "inbox_note", json!({"item":id,"text":"x"}))["isError"], true);
+    let res = call(&fx, &m, "inbox_note", json!({"item":id,"text":"확인 중"}));
+    assert_eq!(res["isError"], false, "{res}");
+    assert_eq!(call(&fx, &m, "inbox_note", json!({"item":"nope","text":"x"}))["isError"], true);
+    let res = call(&fx, &m, "inbox_propose_close", json!({"item":id,"final_opinion":"처리 완료"}));
+    assert_eq!(res["isError"], false, "{res}");
+    assert_eq!(list(&m, json!({"state":"close_proposed"})).len(), 1);
+    // no tool reaches done; the user does (Tauri command path)
+    assert_eq!(fx.state.inbox.get(&id).unwrap().state, app_lib::inbox::ItemState::CloseProposed);
+    fx.state.inbox.instruct(&id, "하나 더").unwrap();
+    assert_eq!(list(&m, json!({"state":"in_progress"})).len(), 1);
+
+    // issue_create: folder in the caller tab's workspace, linked; a retry returns the same issue
+    let res = call(&fx, &m, "issue_create", json!({"item":id,"title":"결제 실패"}));
+    assert_eq!(res["isError"], false, "{res}");
+    let v: Value = serde_json::from_str(&text(&res)).unwrap();
+    let issue = v["issue"].as_str().unwrap().to_string();
+    assert!(issue.ends_with("-결제-실패"), "{issue}");
+    let path = std::path::PathBuf::from(v["path"].as_str().unwrap());
+    assert_eq!(path, workspace.join("issues").join(&issue));
+    assert!(path.join("input").is_dir() && path.join("output").is_dir());
+    let again: Value = serde_json::from_str(&text(&call(&fx, &m, "issue_create", json!({"item":id,"title":"결제 실패"})))).unwrap();
+    assert_eq!(again["issue"], issue.as_str());
+    assert_eq!(std::fs::read_dir(workspace.join("issues")).unwrap().count(), 1);
+    assert_eq!(fx.state.inbox.get(&id).unwrap().issue.as_deref(), Some(issue.as_str()));
+    // without an item: just a folder; unknown item: error, nothing created
+    let v: Value = serde_json::from_str(&text(&call(&fx, &m, "issue_create", json!({"title":"메모 정리"})))).unwrap();
+    assert!(v["issue"].as_str().unwrap().ends_with("-메모-정리"));
+    assert_eq!(call(&fx, &m, "issue_create", json!({"item":"nope","title":"x"}))["isError"], true);
+    assert_eq!(call(&fx, &d, "issue_create", json!({"title":"x"}))["isError"], true);
+    assert_eq!(std::fs::read_dir(workspace.join("issues")).unwrap().count(), 2);
+
+    // the user's file copy lands in the issue folder
+    let src = workspace.join("note.md");
+    std::fs::write(&src, "x").unwrap();
+    let out = fx.state.inbox.add_files(&id, &[src], app_lib::inbox::Target::Output).unwrap();
+    assert_eq!(out, vec![path.join("output").join("note.md")]);
 }

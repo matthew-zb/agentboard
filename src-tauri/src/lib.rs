@@ -2,6 +2,8 @@ pub mod agentcfg;
 pub mod config;
 pub mod control;
 pub mod hookcli;
+pub mod inbox;
+pub mod issues;
 pub mod launcher;
 pub mod layout;
 pub mod mcp_tools;
@@ -46,6 +48,8 @@ pub trait Ui: Send + Sync {
     fn workspace_changed(&self, snap: &Snapshot);
     /// Forget the pane's output channel (pane left the model, or its process is gone).
     fn drop_channel(&self, id: &str);
+    /// Emit `inbox-changed` (`{"version": n}`) after an inbox mutation (leaf, no app lock).
+    fn inbox_changed(&self, _version: u64) {}
 }
 
 /// Lock order: see the module docs of `launcher`.
@@ -77,6 +81,9 @@ pub struct AppState {
     pub hooks: control::HookRouter,
     /// Last `handoff_done` per pane (nightly refresh, Task 11). Leaf lock.
     pub handoffs: Mutex<HashMap<PaneId, std::time::SystemTime>>,
+    /// Inbox store (`<workspaceRoot>/.agentboard/inbox`); its lock is a leaf (+ its own emit
+    /// lock), see `inbox` module docs.
+    pub inbox: inbox::Inbox,
 }
 
 impl AppState {
@@ -87,9 +94,14 @@ impl AppState {
         ui: Arc<dyn Ui>,
         effects: mpsc::Sender<Effects>,
         saver: persist::Saver,
-        startup_errors: Vec<String>,
+        mut startup_errors: Vec<String>,
         run_dir: std::path::PathBuf,
     ) -> Self {
+        // unreadable item files are skipped and listed with the startup errors (file names only)
+        let inbox_dir = loaded.settings.workspace_root.join(".agentboard").join("inbox");
+        let emit_ui = ui.clone();
+        let (inbox, inbox_errors) = inbox::Inbox::load(inbox_dir, Arc::new(move |v| emit_ui.inbox_changed(v)));
+        startup_errors.extend(inbox_errors);
         AppState {
             ws: Mutex::new(ws),
             loaded: RwLock::new(loaded),
@@ -106,6 +118,7 @@ impl AppState {
             run_dir,
             hooks: control::HookRouter::new(),
             handoffs: Mutex::new(HashMap::new()),
+            inbox,
         }
     }
 }
@@ -192,6 +205,10 @@ impl Ui for AppSink {
 
     fn drop_channel(&self, id: &str) {
         self.channels.remove(id);
+    }
+
+    fn inbox_changed(&self, version: u64) {
+        let _ = self.app.emit(inbox::INBOX_CHANGED, inbox::InboxChanged { version });
     }
 }
 
@@ -338,6 +355,47 @@ fn app_exit(app: AppHandle, state: State<'_, AppState>) {
     app.exit(0);
 }
 
+/// Inbox applet (Task 10): items newest first (done ones only with `show_done`) + version.
+#[tauri::command]
+fn inbox_list(state: State<'_, AppState>, show_done: bool) -> inbox::InboxList {
+    state.inbox.list(show_done)
+}
+
+#[tauri::command]
+fn inbox_get(state: State<'_, AppState>, id: String) -> Result<inbox::InboxItem, String> {
+    state.inbox.get(&id).ok_or_else(|| format!("인박스 항목을 찾을 수 없습니다: {id}"))
+}
+
+#[tauri::command]
+fn inbox_mark_read(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.inbox.mark_read(&id)
+}
+
+/// The user confirms a proposed close (`close_proposed` → `done`).
+#[tauri::command]
+fn inbox_confirm_done(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.inbox.confirm_done(&id)
+}
+
+/// Copy files into the item's issue `input/` or `output/` (never overwriting); returns the new
+/// files. Runs on a blocking thread (copies may be large).
+#[tauri::command]
+async fn inbox_add_files(
+    app: AppHandle,
+    id: String,
+    paths: Vec<String>,
+    target: inbox::Target,
+) -> Result<Vec<String>, String> {
+    let paths: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        state.inbox.add_files(&id, &paths, target)
+    })
+    .await
+    .map_err(|e| format!("파일 복사 작업이 중단되었습니다 — {e}"))??;
+    Ok(res.into_iter().map(|p| p.to_string_lossy().into_owned()).collect())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -358,6 +416,11 @@ pub fn run() {
             missing_dirs,
             running_count,
             app_exit,
+            inbox_list,
+            inbox_get,
+            inbox_mark_read,
+            inbox_confirm_done,
+            inbox_add_files,
         ])
         .setup(|app| {
             // load_all = load_settings + ensure_dotdir (incl. powershell profile) + load
