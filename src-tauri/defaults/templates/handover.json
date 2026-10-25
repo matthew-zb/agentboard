@@ -1,6 +1,6 @@
 {
   "name": "handover",
   "layout": {
-    "pane": { "name": "handover", "focus": true, "prompt": "/loop 10m <확인 작업>" }
+    "pane": { "name": "handover", "focus": true, "prompt": "/loop 10m {확인 작업}" }
   }
 }

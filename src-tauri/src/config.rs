@@ -678,8 +678,8 @@ pub fn sanitize_config(mut c: Config, file: &Path) -> (Config, Vec<ConfigError>)
         let before = errs.len();
         if t.name.trim().is_empty() {
             errs.push(sem_err(file, format!("{p}.name"), "탭 이름이 비어 있음"));
-        } else if t.name == "dispatcher" {
-            errs.push(sem_err(file, format!("{p}.name"), "'dispatcher'는 예약된 탭 이름임"));
+        } else if crate::roles::reserved_name(&t.name).is_some() {
+            errs.push(sem_err(file, format!("{p}.name"), format!("'{}'은(는) 예약된 탭 이름임", t.name)));
         } else if names.contains(&t.name) {
             errs.push(sem_err(file, format!("{p}.name"), format!("탭 이름 '{}'이(가) 중복됨", t.name)));
         }
@@ -1103,7 +1103,7 @@ pub fn edit_tab_entry(path: &Path, name: &str, dir: &str, edit: &TabEntryEdit) -
         };
         match edit {
             TabEntryEdit::Rename(new) => {
-                if tabs.iter().any(|v| v.get("name").and_then(|n| n.as_str()) == Some(new.as_str())) {
+                if tabs.iter().enumerate().any(|(j, v)| j != i && v.get("name").and_then(|n| n.as_str()) == Some(new.as_str())) {
                     return Err(format!("config.json에 이름이 '{new}'인 다른 탭이 이미 있습니다"));
                 }
                 tabs[i].as_object_mut().ok_or("config.json의 tabs 항목이 객체가 아닙니다")?.insert("name".into(), new.clone().into());
@@ -1628,16 +1628,26 @@ mod tests {
         assert_eq!(errs[0].json_path.as_deref(), Some("layout.children"));
     }
 
+    /// Task 12 nit: renaming an entry to its own name is not a duplicate of itself.
+    #[test]
+    fn edit_tab_entry_rename_to_own_name_is_not_a_duplicate() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.json");
+        std::fs::write(&p, r#"{"tabs":[{"name":"billing","role":"manager","dir":"b"},{"name":"ops","role":"manager","dir":"o"}]}"#).unwrap();
+        assert!(edit_tab_entry(&p, "billing", "b", &TabEntryEdit::Rename("billing".into())).is_ok());
+        assert!(edit_tab_entry(&p, "billing", "b", &TabEntryEdit::Rename("ops".into())).unwrap_err().contains("ops"));
+    }
+
     #[test]
     fn config_tab_names_unique_and_dispatcher_reserved() {
         let (c, _) = parse_config(
-            r#"{"tabs":[{"name":"dispatcher","dir":"a"},{"name":"b","dir":"b"},{"name":"b","dir":"c"}]}"#,
+            r#"{"tabs":[{"name":"dispatcher","dir":"a"},{"name":"b","dir":"b"},{"name":"b","dir":"c"},{"name":"AgentBoard","dir":"d"}]}"#,
             Path::new("config.json"),
         )
         .unwrap();
         let errs = validate_config(&c, Path::new("config.json"));
         let paths: Vec<_> = errs.iter().map(|e| e.json_path.clone().unwrap()).collect();
-        assert_eq!(paths, ["tabs[0].name", "tabs[2].name"]);
+        assert_eq!(paths, ["tabs[0].name", "tabs[2].name", "tabs[3].name"]);
     }
 
     #[test]
@@ -1755,7 +1765,7 @@ mod tests {
         let t = tpl_of("handover");
         let l = t.layout.leaves();
         assert_eq!(l.len(), 1);
-        assert_eq!(l[0].prompt.as_deref(), Some("/loop 10m <확인 작업>"));
+        assert_eq!(l[0].prompt.as_deref(), Some("/loop 10m {확인 작업}"));
         // manager: the Manager pane (focus) inside the template's team area (slot "team")
         let t = tpl_of("manager");
         let LayoutNode::Split { slot, .. } = &t.layout else { panic!("split") };

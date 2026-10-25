@@ -115,6 +115,23 @@ pub fn parse_roles(v: &serde_json::Value, file: &Path) -> (BTreeMap<Role, RoleCo
     (out, errs)
 }
 
+/// Names that may never be a tab / session name: `dispatcher` (the Dispatcher tab) and
+/// `agentboard` in any case — the app's bridge sends as `from-name="agentboard"` and role
+/// prompts grant that sender user authority (R21), so no session may carry that name.
+/// Returns the Korean reason.
+pub fn reserved_name(name: &str) -> Option<String> {
+    if name == "dispatcher" {
+        return Some("'dispatcher'는 예약된 탭 이름입니다".into());
+    }
+    if name.eq_ignore_ascii_case(AGENTBOARD) {
+        return Some(format!("'{name}'은(는) 앱이 메시지를 보낼 때 쓰는 예약된 이름입니다"));
+    }
+    None
+}
+
+/// The app's sender name on the cross-session bridge (`from-name`).
+pub const AGENTBOARD: &str = "agentboard";
+
 /// Session name (`--name`) of an agent: standing roles use the tab name; a team lead is
 /// `<tab>-<team>-lead`, member `n` is `<tab>-<team>-m<n>` (numbering from 1, chosen by the
 /// caller). A team role without a team id uses `team` as the id.
@@ -140,6 +157,16 @@ mod tests {
         assert_eq!(session_name("billing", Role::Manager, Some("ignored"), 3), "billing");
         assert_eq!(session_name("dispatcher", Role::Dispatcher, None, 0), "dispatcher");
         assert_eq!(session_name("handover", Role::Handover, None, 0), "handover");
+    }
+
+    #[test]
+    fn reserved_names() {
+        for n in ["dispatcher", "agentboard", "AgentBoard", "AGENTBOARD"] {
+            assert!(reserved_name(n).is_some(), "{n}");
+        }
+        for n in ["billing", "agentboard2", "my-agentboard", "Dispatcher2"] {
+            assert!(reserved_name(n).is_none(), "{n}");
+        }
     }
 
     #[test]

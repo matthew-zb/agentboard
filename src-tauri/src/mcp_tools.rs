@@ -1176,6 +1176,8 @@ mod tests {
         std::fs::create_dir_all(f.root.join("x")).unwrap();
         for args in [
             json!({"name":"dispatcher","dir":"x"}),
+            json!({"name":"agentboard","dir":"x"}),
+            json!({"name":"AgentBoard","dir":"x"}),
             json!({"name":"billing","dir":"x"}),
             json!({"name":"","dir":"x"}),
             json!({"name":"y","dir":"../out"}),

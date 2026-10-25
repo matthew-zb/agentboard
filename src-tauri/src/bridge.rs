@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 /// Every message body starts with this, so the receiving Claude knows the app sent it.
 pub const PREFIX: &str = "[AgentBoard] ";
 /// Sender name in the cross-session envelope (spike P1; no `"`, `<`, `>`, newline).
-pub const FROM_NAME: &str = "agentboard";
+pub const FROM_NAME: &str = crate::roles::AGENTBOARD;
 /// A message not delivered within this time fails.
 pub const QUEUE_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long a message waits for a usable pipe registration before the PTY fallback may run.

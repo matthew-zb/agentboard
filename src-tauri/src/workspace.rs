@@ -32,9 +32,10 @@ pub const TEAM_ID_MAX: usize = 24;
 /// Sizes of a team area made by the first hire: standing pane | teams.
 const TEAM_AREA_SIZES: [f32; 2] = [55.0, 45.0];
 
-/// Team ids: 1–24 characters of `[a-z0-9-]` (they end up in session names and folder names).
+/// Team ids: 1–24 characters of `[a-z0-9-]` (they end up in session names and folder names);
+/// `agentboard` is reserved (the app's sender name).
 pub fn valid_team_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= TEAM_ID_MAX && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    !id.is_empty() && id != crate::roles::AGENTBOARD && id.len() <= TEAM_ID_MAX && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// `slot` of a team's column split: `team:<id>`.
@@ -622,6 +623,9 @@ impl Workspace {
         let mut names = BTreeSet::new();
         for p in self.panes.values() {
             if let Some(n) = &p.session_name {
+                if n.eq_ignore_ascii_case(crate::roles::AGENTBOARD) {
+                    return Err(format!("세션 이름 '{n}'은(는) 예약되어 있습니다"));
+                }
                 if !names.insert(n) {
                     return Err(format!("세션 이름 '{n}'이(가) 중복됩니다"));
                 }
@@ -1491,13 +1495,13 @@ impl Workspace {
         format!("p{}", self.counters.pane)
     }
 
-    /// Tab names are unique across the workspace; `dispatcher` is reserved.
+    /// Tab names are unique across the workspace; `dispatcher` and `agentboard` are reserved.
     fn check_tab_name(&self, name: &str, except: Option<&str>) -> Result<(), String> {
         if name.trim().is_empty() {
             return Err("탭 이름이 비어 있습니다".into());
         }
-        if name == "dispatcher" {
-            return Err("'dispatcher'는 예약된 탭 이름입니다".into());
+        if let Some(why) = crate::roles::reserved_name(name) {
+            return Err(why);
         }
         // the name becomes a session name (--name) and is typed into prompts
         if name.chars().any(char::is_control) {
@@ -1511,7 +1515,7 @@ impl Workspace {
 
     /// `base`, or `base-2`, `base-3`, … whichever is free.
     fn unique_tab_name(&self, base: &str) -> String {
-        let taken = |n: &str| n == "dispatcher" || self.tabs.values().any(|t| t.name == n);
+        let taken = |n: &str| crate::roles::reserved_name(n).is_some() || self.tabs.values().any(|t| t.name == n);
         if !taken(base) {
             return base.to_string();
         }
@@ -1802,6 +1806,25 @@ mod tests {
     }
 
     #[test]
+    fn team_ids_reserve_agentboard() {
+        assert!(valid_team_id("batch") && valid_team_id("a-1"));
+        for bad in ["", "agentboard", "Batch", "a_b", &"x".repeat(TEAM_ID_MAX + 1)] {
+            assert!(!valid_team_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn create_tab_refuses_reserved_names() {
+        let l = loaded_fixture();
+        let mut ws = Workspace::from_config(&l);
+        let before = ws.clone();
+        for bad in ["agentboard", "AGENTBOARD", "dispatcher"] {
+            assert!(ws.apply(create(bad, "solo"), &l).is_err(), "{bad}");
+            assert_eq!(ws, before);
+        }
+    }
+
+    #[test]
     fn from_config_creates_dispatcher_and_tabs() {
         let l = loaded_fixture();
         let ws = Workspace::from_config(&l);
@@ -2031,7 +2054,7 @@ mod tests {
         let mut ws = Workspace::from_config(&l);
         let api = tab(&ws, "api").id.clone();
         let before = ws.clone();
-        for bad in ["dispatcher", "  "] {
+        for bad in ["dispatcher", "  ", "agentboard", "AgentBoard"] {
             assert!(ws.apply(WsCommand::RenameTab { tab: api.clone(), name: bad.into() }, &l).is_err());
             assert_eq!(ws, before);
         }
