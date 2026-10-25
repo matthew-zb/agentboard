@@ -136,13 +136,14 @@ let hooks = {
   report: (e) => console.error('[agentboard]', e),
   keyFilter: () => true,
   syncTargets: () => null,
+  onBell: () => {},
 };
 
 /**
  * Wire the module to the app: `send(cmd)` (renders its result), `onFocus(group, tab, pane)`
  * (pane clicked while not focused), `report(error)` (status bar message),
  * `keyFilter(paneId, KeyboardEvent) -> bool` (xterm attachCustomKeyEventHandler: false = an app
- * shortcut, xterm must not process it), `syncTargets(paneId) -> paneId[] | null` (sync input).
+ * shortcut, xterm must not process it), `syncTargets(paneId) -> paneId[] | null` (sync input), `onBell(paneId)` (terminal bell in a live pane).
  */
 export function configurePanes(h) {
   hooks = { ...hooks, ...h };
@@ -265,6 +266,10 @@ function createEntry(id) {
     // terminal replies stay with the source pane. No echo loop: other panes' onData is not involved.
     for (const t of fanoutIds(id, hooks.syncTargets(id), d, (x) => entries.get(x))) toPty(t, d);
   };
+  // BEL inside the replayed snapshot (not live yet) is history, not a new request.
+  term.onBell(() => {
+    if (e.live) hooks.onBell(id);
+  });
   term.onData(input);
   term.onBinary((d) => {
     if (!e.inputBlocked && !isDead(e.model) && !e.suppressInput) api.write(id, d).catch(() => {});

@@ -273,3 +273,24 @@ IME·전달:
 알려진 한계: 동기화 중 터미널이 스스로 보내는 응답(예: 커서 위치 질의 답)도 같은 경로라 다른 창에도 전달된다.
 
 결과: (미기록)
+
+## Task 15 — 주의(attention) 표시 (사용자 확인 필요)
+
+구현자는 앱 창을 직접 조작할 수 없으므로(R8) 아래는 모두 **사용자 확인 필요**다. `npx tauri dev`는 시작 오류 없이 떴다.
+
+동작 요약:
+- `term.onBell` → 그 창이 포커스 창(포커스된 그룹 → 활성 탭 → lastFocused)이 아니면 `SetAttention{on:true}`. 이미 ⚠인 창은 다시 보내지 않는다. 앱 창 자체가 포커스를 잃은 상태면 포커스된 창이어도 표시하고, 창이 다시 포커스를 받으면 `SetFocus`(같은 창)로 해제한다.
+- 첫 attach 때 재생되는 스냅샷 안의 BEL은 무시한다(과거 출력).
+- 포커스는 절대 자동으로 옮기지 않는다. 표시: 창 헤더 ⚠, 탭 바 배지, 상태 표시줄(Task 11).
+- `Alt+a`(`pane.nextAttention`): 그룹 → 탭 → 창 순서로 다음 ⚠ 창으로 `SetFocus`. 남은 ⚠가 없으면 처음 시작한 위치로 돌아간다.
+
+### Claude Code 터미널 벨 설정 (README에 포함할 것 — Task 17)
+Claude Code에서 `/config` → 알림 채널(notification channel)을 terminal bell로 설정한다(`preferredNotifChannel: "terminal_bell"`). 그래야 권한 승인 대기 시 BEL이 울려 AgentBoard가 ⚠를 표시한다.
+
+### Step 1 — 수동 확인
+- [ ] 사용자 확인 필요 — 비활성 탭의 창에서 `powershell -c "[console]::beep(); Write-Host \"`a\""`를 실행하거나 Claude 권한 프롬프트를 띄운다 → 헤더 ⚠와 탭 배지가 표시되고, 포커스는 그대로다.
+- [ ] 사용자 확인 필요 — `Alt+a` → 그 창으로 이동하고 ⚠가 해제된다.
+- [ ] 사용자 확인 필요 — 다시 `Alt+a` → 원래 위치로 돌아온다.
+- [ ] 사용자 확인 필요 — 앱 창이 다른 앱 뒤에 있을 때 벨 → ⚠ 표시, 창을 다시 활성화하면 ⚠ 해제.
+
+결과: (미기록)

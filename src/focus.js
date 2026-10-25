@@ -46,6 +46,24 @@ export function nextAttention(order, current, attention, origin) {
   return { target: after || cands[0], origin: origin || current || null };
 }
 
+/** Pane ids that currently show attention. */
+export function attentionSet(ws) {
+  return new Set(Object.values((ws && ws.panes) || {}).filter((p) => p.attention).map((p) => p.id));
+}
+
+/**
+ * Should a terminal bell in `paneId` send SetAttention{on:true}? Not when the pane already shows
+ * attention (no spam) or is the focused pane of a focused window (the user is looking at it).
+ * A bell in the focused pane of an unfocused window still flags it (cleared by the SetFocus
+ * sent when the window regains focus).
+ */
+export function shouldFlagBell(ws, paneId, windowFocused) {
+  const p = ws && ws.panes && ws.panes[paneId];
+  if (!p || p.attention) return false;
+  if (windowFocused && focusedPaneId(ws) === paneId) return false;
+  return true;
+}
+
 /** True when the workspace's focus chain already reflects the requested `{group, tab?, pane?}`. */
 export function focusMatches(ws, req) {
   if (!ws || !req || !ws.focus || ws.focus.groupId !== req.group) return false;

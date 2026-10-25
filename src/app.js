@@ -27,7 +27,18 @@ import {
 } from './groups.js';
 import { buildKeymap, installKeyRouter } from './keys.js';
 import { planCommand, registerCommand, runCommand, hasCommand, CORE_IDS } from './commands.js';
-import { applyFocus, requestFocus, settleFocus, flash, focusLocation } from './focus.js';
+import {
+  applyFocus,
+  requestFocus,
+  settleFocus,
+  flash,
+  focusLocation,
+  nextAttention,
+  paneOrder,
+  currentRef,
+  attentionSet,
+  shouldFlagBell,
+} from './focus.js';
 import { leafIds } from './layout.js';
 import {
   configureOverlays,
@@ -206,6 +217,28 @@ function openErrors() {
     return showErrors(lines);
   }, showError);
 }
+
+// ---------------------------------------------------------------- attention (Task 15)
+
+let attentionOrigin = null; // where Alt+a started (returns there when nothing is left)
+
+/** Terminal bell: flag the pane. Never moves focus. */
+function onBell(paneId) {
+  const ws = current && current.workspace;
+  if (!shouldFlagBell(ws, paneId, document.hasFocus())) return;
+  quiet(sendCmd({ type: 'setAttention', pane: paneId, on: true }));
+}
+
+registerCommand('pane.nextAttention', () =>
+  enqueue(() => {
+    const ws = current && current.workspace;
+    if (!ws) return undefined;
+    const r = nextAttention(paneOrder(ws), currentRef(ws), attentionSet(ws), attentionOrigin);
+    attentionOrigin = r.origin;
+    if (!r.target) return undefined;
+    return execute([{ type: 'setFocus', group: r.target.group, tab: r.target.tab, pane: r.target.pane }]);
+  }),
+);
 
 registerCommand('pane.pick', () => pick('pane'));
 registerCommand('tab.moveTo', () => pick('moveTo'));
@@ -400,6 +433,7 @@ configurePanes({
   onFocus: setFocus,
   report: showError,
   keyFilter: (paneId, ev) => router.termKeyFilter(paneId, ev),
+  onBell,
 });
 api.onWorkspaceChanged(render);
 api
@@ -415,4 +449,12 @@ refreshConfigErrors();
 // overlay keeps it.
 window.addEventListener('focus', () => {
   if (!overlayOpen()) applyFocus(current);
+  // A bell that arrived while the window was unfocused flagged the focused pane; seeing it
+  // again clears it (SetFocus on the already focused pane; focus does not move).
+  const ws = current && current.workspace;
+  const id = ws && focusedPaneId(ws);
+  if (id && ws.panes[id] && ws.panes[id].attention) {
+    const r = currentRef(ws);
+    enqueue(() => execute([{ type: 'setFocus', group: r.group, tab: r.tab, pane: r.pane }]));
+  }
 });

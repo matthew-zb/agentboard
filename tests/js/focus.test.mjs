@@ -55,3 +55,33 @@ test('focusMatches: a pending focus request is satisfied only by a matching snap
   assert.equal(focusMatches(ws, { group: 'g1', tab: 't1', pane: null }), false);
   assert.equal(focusMatches(ws, { group: 'g2', tab: null, pane: null }), false);
 });
+
+import { shouldFlagBell, attentionSet } from '../../src/focus.js';
+
+const bellWs = (attn = false) => ({
+  groupLayout: { leaf: 'g1' },
+  groups: { g1: { id: 'g1', tabIds: ['t1', 't2'], activeTabId: 't1' } },
+  focus: { groupId: 'g1' },
+  tabs: {
+    t1: { id: 't1', layout: { leaf: 'a' }, lastFocusedPaneId: 'a' },
+    t2: { id: 't2', layout: { leaf: 'b' }, lastFocusedPaneId: 'b' },
+  },
+  panes: { a: { id: 'a', tab: 't1' }, b: { id: 'b', tab: 't2', attention: attn } },
+});
+
+test('shouldFlagBell: background pane flags, focused pane in focused window does not', () => {
+  assert.equal(shouldFlagBell(bellWs(), 'b', true), true);
+  assert.equal(shouldFlagBell(bellWs(), 'a', true), false);
+  assert.equal(shouldFlagBell(bellWs(), 'a', false), true); // unfocused window still flags
+});
+
+test('shouldFlagBell: no spam when already flagged, unknown pane ignored', () => {
+  assert.equal(shouldFlagBell(bellWs(true), 'b', true), false);
+  assert.equal(shouldFlagBell(bellWs(), 'zz', true), false);
+  assert.equal(shouldFlagBell(null, 'a', true), false);
+});
+
+test('attentionSet collects flagged pane ids', () => {
+  assert.deepEqual([...attentionSet(bellWs(true))], ['b']);
+  assert.deepEqual([...attentionSet(null)], []);
+});
