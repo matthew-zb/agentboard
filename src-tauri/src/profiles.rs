@@ -230,7 +230,8 @@ pub fn resolve_cmd(cmd: &str) -> Option<PathBuf> {
 
 /// Bytes to type into the PTY to submit `text`: newlines become CR (or stay LF inside a bracketed paste).
 pub fn encode_submit(text: &str, s: &Submit) -> Vec<u8> {
-    let norm = text.replace("\r\n", "\n");
+    // the text must not end the bracketed paste early or inject escape sequences
+    let norm = text.replace("\r\n", "\n").replace("\x1b[201~", "").replace('\x1b', "");
     let mut out = Vec::new();
     if s.bracketed_paste {
         out.extend_from_slice(b"\x1b[200~");
@@ -361,6 +362,16 @@ mod tests {
     #[test]
     fn encode_submit_plain() {
         assert_eq!(encode_submit("a\nb", &Submit { bracketed_paste: false, key: "\r".into() }), b"a\rb\r".to_vec());
+    }
+
+    #[test]
+    fn encode_submit_cannot_break_out_of_bracketed_paste() {
+        let text = "a\x1b[201~\x1b[31mb\x1bc";
+        assert_eq!(
+            encode_submit(text, &Submit { bracketed_paste: true, key: "\r".into() }),
+            b"\x1b[200~a[31mbc\x1b[201~\r".to_vec()
+        );
+        assert_eq!(encode_submit(text, &Submit { bracketed_paste: false, key: "\r".into() }), b"a[31mbc\r".to_vec());
     }
 
     #[test]
