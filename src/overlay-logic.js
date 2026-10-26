@@ -198,6 +198,7 @@ const NOT_LISTED = new Set(['app.palette', 'pane.breakToTab']);
  * unbound); `has(id)` = a handler is registered. Actions:
  * `{type:'command', id}` | `{type:'ws', cmds}` | `{type:'rename', tab}` | `{type:'errors'}` |
  * `{type:'sidebar'}` | `{type:'openDoc'}` (pick a workspace .md file → OpenDoc) |
+ * `{type:'reloadConfig'}` (config_reload: settings re-read without restarting any pane) |
  * `{type:'autostart', on}` (login autostart; listed only when `autostart` — the current state,
  * true/false — is known).
  */
@@ -209,6 +210,7 @@ export function paletteItems(ws, { bindings = {}, has = () => true, autostart = 
   if (c && !c.tab.isDispatcher) out.push({ label: '탭 이름 바꾸기', action: { type: 'rename', tab: c.tab.id } });
   if (c && c.pane) out.push({ label: '현재 창을 새 탭으로 떼어내기', action: { type: 'ws', cmds: [{ type: 'breakPaneToTab', pane: c.pane }] } });
   out.push({ label: '설정 오류 보기', action: { type: 'errors' } });
+  out.push({ label: '설정 다시 읽기', hint: '재시작 없이', action: { type: 'reloadConfig' } });
   out.push({ label: '문서 열기', hint: 'md 파일', action: { type: 'openDoc' } });
   out.push({ label: '사이드바 토글', action: { type: 'sidebar' } });
   if (autostart === true) out.push({ label: '로그인 시 자동 실행 끄기', hint: '현재: 켜짐', action: { type: 'autostart', on: false } });
@@ -378,6 +380,58 @@ export async function closeFlow(st, deps) {
   } finally {
     st.busy = false;
   }
+}
+
+// ---------------------------------------------------------------- settings reload
+
+const strings = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x) : []);
+
+/**
+ * Toast after `config_reload` succeeded (`{added, keptMissing, promptsUpdated}`), e.g.
+ * `설정을 다시 읽었습니다 — 새 탭: a, b · 닫지 않은 탭: c · 시작 프롬프트 갱신 2`; parts that do
+ * not apply are left out.
+ */
+export function reloadReportText(r) {
+  const parts = [];
+  const added = strings(r && r.added);
+  const kept = strings(r && r.keptMissing);
+  const n = r && Number.isInteger(r.promptsUpdated) ? r.promptsUpdated : 0;
+  if (added.length) parts.push(`새 탭: ${added.join(', ')}`);
+  if (kept.length) parts.push(`닫지 않은 탭: ${kept.join(', ')}`);
+  if (n > 0) parts.push(`시작 프롬프트 갱신 ${n}`);
+  return parts.length ? `설정을 다시 읽었습니다 — ${parts.join(' · ')}` : '설정을 다시 읽었습니다';
+}
+
+/** Error panel lines for a refused reload: the backend's `파일:줄:열 — 원인` list (or a single
+ * error) under a line saying nothing was changed. */
+export function reloadErrorLines(err) {
+  const head = '설정에 오류가 있어 다시 읽지 않았습니다 — 아무것도 바뀌지 않았습니다';
+  if (Array.isArray(err)) return [head, ...err.map(String)];
+  const msg = err && err.message ? err.message : String(err ?? '');
+  return msg ? [head, msg] : [head];
+}
+
+/**
+ * Palette "설정 다시 읽기": `config_reload` (no pane restarts) → report toast, then the key
+ * settings are fetched again (keybindings.json may have changed). A refused reload (validation
+ * errors) goes to the error panel and nothing else happens. Resolves true on success.
+ * deps: { reload(), keybindings(), setKeymap(bindings), toast(msg, kind?), showErrors(lines) }
+ */
+export async function reloadFlow(deps) {
+  let report;
+  try {
+    report = await deps.reload();
+  } catch (err) {
+    deps.showErrors(reloadErrorLines(err));
+    return false;
+  }
+  deps.toast(reloadReportText(report), 'info');
+  try {
+    deps.setKeymap(await deps.keybindings());
+  } catch (err) {
+    deps.toast(err);
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------- environment (Task 12)

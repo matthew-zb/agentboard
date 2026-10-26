@@ -240,6 +240,18 @@ pub struct Counters {
     pub pane: u64,
 }
 
+/// What a config reload did (`config_reload` reply: `{added, keptMissing, promptsUpdated}`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReloadReport {
+    /// Config role tabs that were not open and now are (config order).
+    pub added: Vec<String>,
+    /// Open Manager / handover tabs that config.json no longer lists: reported, not closed.
+    pub kept_missing: Vec<String>,
+    /// Standing panes whose stored start prompt changed to the template's.
+    pub prompts_updated: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -757,15 +769,31 @@ impl Workspace {
             }
         }
         // 5. config role tabs missing from workspace.json (R27)
+        let (added, _, errors) = self.add_missing_role_tabs(loaded, "다시 시작하세요");
+        // 6. effects
+        let spawn = self.panes.keys().map(|id| (id.clone(), standing.contains(id) || added.contains(id))).collect();
+        (Effects { spawn, kill: Vec::new() }, errors)
+    }
+
+    /// Step 5 of [`Workspace::restore_roles`] (R27), also used by a config reload: open the
+    /// config role tabs (`manager` / `handover`) that are not open — same name, dir and role —
+    /// as at first start (template from config, else defaultTemplate) at the end of
+    /// `defaultGroup` (else the focused group), with no focus or active-tab change. A config tab
+    /// whose name is used by another tab, whose template is missing, or a second handover is
+    /// skipped with a Korean message (`retry` ends the advice: what the user does after fixing
+    /// it). Returns the added panes, the added tab names (config order) and the messages.
+    fn add_missing_role_tabs(&mut self, loaded: &Loaded, retry: &str) -> (BTreeSet<PaneId>, Vec<String>, Vec<String>) {
+        let cfg = &loaded.config;
         let mut errors = Vec::new();
         let mut added: BTreeSet<PaneId> = BTreeSet::new();
+        let mut names = Vec::new();
         for spec in cfg.tabs.iter().filter(|s| s.role.is_some()) {
             if self.tabs.values().any(|t| t.name == spec.name && t.dir == spec.dir && t.role == spec.role) {
                 continue;
             }
             if self.tabs.values().any(|t| t.name == spec.name) {
                 errors.push(format!(
-                    "config.json의 역할 탭 '{}'을(를) 열지 않았습니다 — 같은 이름의 다른 탭이 이미 있습니다(그 탭의 이름을 바꾸거나 닫은 뒤 다시 시작하세요)",
+                    "config.json의 역할 탭 '{}'을(를) 열지 않았습니다 — 같은 이름의 다른 탭이 이미 있습니다(그 탭의 이름을 바꾸거나 닫은 뒤 {retry})",
                     spec.name
                 ));
                 continue;
@@ -781,6 +809,7 @@ impl Workspace {
             };
             let tid = self.build_tab(&spec.name, &spec.dir, tpl, false, spec.role, loaded);
             added.extend(self.tabs[&tid].layout.leaves());
+            names.push(spec.name.clone());
             let leaves = self.group_layout.leaves();
             let gid = cfg
                 .default_group
@@ -789,9 +818,57 @@ impl Workspace {
                 .unwrap_or_else(|| self.focus.group_id.clone());
             self.groups.get_mut(&gid).unwrap().tab_ids.push(tid);
         }
-        // 6. effects
-        let spawn = self.panes.keys().map(|id| (id.clone(), standing.contains(id) || added.contains(id))).collect();
-        (Effects { spawn, kill: Vec::new() }, errors)
+        (added, names, errors)
+    }
+
+    /// Config reload: each role tab's standing pane takes its start prompt from the tab's
+    /// template again (the template pane of the same name, as restore step 4 does). Nothing is
+    /// restarted — the prompt is typed at the pane's next fresh start (nightly refresh, restart
+    /// with a prompt, app start). Returns how many prompts changed.
+    fn refresh_standing_prompts(&mut self, loaded: &Loaded) -> usize {
+        let mut changed = 0;
+        for t in self.tabs.values() {
+            let Some(tpl) = loaded.templates.get(&t.template) else { continue };
+            for pid in t.layout.leaves() {
+                let Some(p) = self.panes.get_mut(&pid).filter(|p| p.role.is_some_and(|r| r.is_standing()) && !p.kind.is_applet()) else {
+                    continue;
+                };
+                let Some(spec) = tpl.layout.leaves().into_iter().find(|s| s.name == p.name && s.applet.is_none()) else { continue };
+                if p.prompt != spec.prompt {
+                    p.prompt = spec.prompt.clone();
+                    changed += 1;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Config reload with the newly loaded `loaded` (no restart, the model's third mutation path
+    /// besides `apply` and restore prep): open the config role tabs that are not open
+    /// ([`Workspace::add_missing_role_tabs`]), refresh the standing panes' stored start prompts,
+    /// and report open Manager / handover tabs that config.json no longer lists (they stay open
+    /// with their roles). All or nothing: a tab that cannot be opened, or a model that would not
+    /// validate, is an `Err` and nothing changes. Effects spawn only the added tabs' panes
+    /// (new sessions with their start prompts); no other pane is touched.
+    pub fn reload_roles(&mut self, loaded: &Loaded) -> Result<(Effects, ReloadReport), Vec<String>> {
+        let mut next = self.clone();
+        let cfg = &loaded.config;
+        let kept_missing: Vec<String> = next
+            .tabs
+            .values()
+            .filter(|t| matches!(t.role, Some(Role::Manager | Role::Handover)))
+            .filter(|t| !cfg.tabs.iter().any(|s| s.name == t.name && s.dir == t.dir && s.role == t.role))
+            .map(|t| t.name.clone())
+            .collect();
+        let (added, names, errors) = next.add_missing_role_tabs(loaded, "설정을 다시 읽으세요");
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let prompts_updated = next.refresh_standing_prompts(loaded);
+        next.normalize_and_validate().map_err(|e| vec![format!("설정을 반영할 수 없습니다 — {e}")])?;
+        *self = next;
+        let spawn = added.into_iter().map(|id| (id, true)).collect();
+        Ok((Effects { spawn, kill: Vec::new() }, ReloadReport { added: names, kept_missing, prompts_updated }))
     }
 
     /// Panes whose process is alive (`starting` or `running`). Applets have no process.

@@ -34,6 +34,7 @@
 - 새 업무 영역이 생겼고 사용자가 원할 때만 `create_manager_tab(name, dir, template?)`를 부른다(template 생략 = `manager`).
 - `dir`은 workspaceRoot 기준 상대경로이고 **폴더가 미리 있어야** 한다. 없으면 만들지 사용자에게 먼저 묻고, 승인받으면 만든 뒤 호출한다.
 - 탭은 포커스를 뺏지 않고 다른 그룹에 열린다. 처음 쓰는 폴더면 사용자가 그 창에서 폴더 신뢰 질문에 답해야 한다고 알린다.
+- config.json·템플릿을 고친 뒤에는 `config_reload()`를 부른다. 다른 창은 재시작되지 않고, config에만 있던 역할 탭(handover 포함)이 열린다. 오류가 오면 그 줄을 고치고 다시 부른다.
 
 ## 야간 정리
 `[AgentBoard] 야간 정리` 메시지를 받으면: 진행 중인 사용자 요청·아직 전달하지 못한 일을 workspaceRoot의 `DISPATCHER.md`에 적고, 그 경로를 메시지에 나온 handover 세션에게 보고한 뒤 **마지막에** `handoff_done()`을 부른다. 곧 새 세션으로 다시 시작되며, 파일에 적지 않은 내용은 사라진다.

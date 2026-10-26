@@ -62,6 +62,9 @@ pub trait Ui: Send + Sync {
     /// Emit `env-changed` (no payload): environment check results or the skip list changed
     /// (Task 12; the status bar re-reads `env_status`).
     fn env_changed(&self) {}
+    /// Emit `config-reloaded` (no payload): settings were read again at runtime; the frontend
+    /// re-reads keybindings and the error list.
+    fn config_reloaded(&self) {}
 }
 
 /// Lock order: see the module docs of `launcher`.
@@ -254,7 +257,14 @@ impl Ui for AppSink {
     fn env_changed(&self) {
         let _ = self.app.emit(ENV_CHANGED, ());
     }
+
+    fn config_reloaded(&self) {
+        let _ = self.app.emit(CONFIG_RELOADED, ());
+    }
 }
+
+/// Event: config.json / templates / profiles / keybindings were read again (`config_reload`).
+pub const CONFIG_RELOADED: &str = "config-reloaded";
 
 /// Event: environment check results / skip list changed (Task 12).
 pub const ENV_CHANGED: &str = "env-changed";
@@ -362,6 +372,19 @@ fn ws_snapshot(state: State<'_, AppState>) -> Snapshot {
 #[tauri::command]
 fn config_errors(state: State<'_, AppState>) -> Vec<String> {
     launcher::error_lines(&state)
+}
+
+/// Read config.json, templates, agent profiles and keybindings again without restarting:
+/// `Ok({added, keptMissing, promptsUpdated})`, or the error lines (`file:line:col: …`) with
+/// nothing changed (`launcher::reload_config_from`). File IO off the UI thread.
+#[tauri::command]
+async fn config_reload(app: AppHandle) -> Result<workspace::ReloadReport, Vec<String>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or_else(|| vec!["앱 상태가 아직 준비되지 않았습니다".to_string()])?;
+        launcher::reload_config(&state)
+    })
+    .await
+    .map_err(|e| vec![format!("설정을 다시 읽는 작업이 중단되었습니다 — {e}")])?
 }
 
 #[tauri::command]
@@ -831,6 +854,7 @@ pub fn run() {
             ws_snapshot,
             config_errors,
             get_keybindings,
+            config_reload,
             get_passthrough,
             list_workspace_dirs,
             create_workspace_dir,
