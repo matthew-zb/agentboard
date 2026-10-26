@@ -303,11 +303,36 @@ fn pty_attach(
     Ok(Response::new(snap))
 }
 
+/// Most bytes one `pty_write_raw` call may carry (terminal replies and mouse reports are tiny).
+pub const RAW_WRITE_MAX: usize = 64 * 1024;
+
+/// User keystrokes / paste: counts as input (R4 — bridge PTY fallback, nightly quiet check).
+fn write_user(state: &AppState, pane: &str, bytes: &[u8]) -> Result<(), String> {
+    bridge::note_input(state, pane);
+    state.pty.write(pane, bytes)
+}
+
+/// Terminal replies (CPR, DA, focus, mouse reports) and xterm binary data: written as-is,
+/// never counted as input.
+fn write_raw(state: &AppState, pane: &str, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > RAW_WRITE_MAX {
+        return Err(format!("입력이 너무 깁니다: {}바이트(최대 {RAW_WRITE_MAX})", bytes.len()));
+    }
+    state.pty.write(pane, bytes)
+}
+
+/// IPC contract: user input only (`term.onData` minus terminal replies, paste, sync fan-out).
 #[tauri::command]
 fn pty_write(state: State<'_, AppState>, pane: String, data: String) -> Result<(), String> {
     // real keystrokes only (R4): the bridge's PTY fallback and Task 11's quiet check use it
-    bridge::note_input(&state, &pane);
-    state.pty.write(&pane, data.as_bytes())
+    write_user(&state, &pane, data.as_bytes())
+}
+
+/// IPC contract: terminal replies (UTF-8 bytes) and `term.onBinary` (one byte per char), as a
+/// number array 0–255 of at most [`RAW_WRITE_MAX`] items. Not counted as user input.
+#[tauri::command]
+fn pty_write_raw(state: State<'_, AppState>, pane: String, bytes: Vec<u8>) -> Result<(), String> {
+    write_raw(&state, &pane, &bytes)
 }
 
 #[tauri::command]
@@ -710,6 +735,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             pty_attach,
             pty_write,
+            pty_write_raw,
             pty_resize,
             ws_command,
             ws_snapshot,
@@ -953,5 +979,62 @@ mod tests {
         // unknown ids: nothing to drop, not current
         assert!(!chs.remove_if_current("nope", g2, &pty));
         pty.remove("c");
+    }
+
+    struct NullUi;
+    impl Ui for NullUi {
+        fn workspace_changed(&self, _: &Snapshot) {}
+        fn drop_channel(&self, _: &str) {}
+    }
+
+    /// AppState whose PtyManager runs an idle `cmd.exe` as pane "p" (PTY only, not in the model).
+    struct WriteFx {
+        state: AppState,
+        _rx: mpsc::Receiver<Effects>,
+        _keep: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    impl Drop for WriteFx {
+        fn drop(&mut self) {
+            self.state.pty.remove("p");
+        }
+    }
+
+    fn write_fx() -> WriteFx {
+        let root = tempfile::tempdir().unwrap();
+        let appdata = tempfile::tempdir().unwrap();
+        let s = serde_json::json!({ "workspaceRoot": root.path().to_string_lossy() });
+        std::fs::write(appdata.path().join("settings.json"), s.to_string()).unwrap();
+        config::ensure_dotdir(root.path()).unwrap();
+        let loaded = config::load_all(appdata.path());
+        let ws = Workspace::from_config(&loaded);
+        let (tx, rx) = mpsc::channel();
+        let pty = PtyManager::new_per_child_job(Arc::new(NullSink));
+        pty.spawn("p", cmd(&[])).unwrap();
+        let state =
+            AppState::new(ws, loaded, pty, Arc::new(NullUi), tx, persist::Saver::disabled(), Vec::new(), appdata.path().join("run"));
+        WriteFx { state, _rx: rx, _keep: (root, appdata) }
+    }
+
+    /// Terminal replies / mouse reports (pty_write_raw) are not user activity: they must not
+    /// hold back the bridge's PTY fallback or the nightly quiet check (R4).
+    #[test]
+    fn raw_write_does_not_note_input_but_user_write_does() {
+        let f = write_fx();
+        write_raw(&f.state, "p", b"\x1b[I").unwrap();
+        assert!(f.state.last_input.lock().unwrap().get("p").is_none(), "a focus report is not input");
+        write_user(&f.state, "p", b"x").unwrap();
+        assert!(f.state.last_input.lock().unwrap().get("p").is_some(), "a keystroke is input");
+    }
+
+    #[test]
+    fn raw_write_rejects_oversized_payload() {
+        let f = write_fx();
+        let err = write_raw(&f.state, "p", &vec![b'a'; RAW_WRITE_MAX + 1]).unwrap_err();
+        assert!(err.contains("너무 깁니다"), "{err}");
+        assert!(f.state.last_input.lock().unwrap().get("p").is_none());
+        // exactly the maximum passes the size check (an unknown pane then fails on its own)
+        let err = write_raw(&f.state, "nope", &vec![b'a'; RAW_WRITE_MAX]).unwrap_err();
+        assert!(err.contains("unknown pane"), "{err}");
     }
 }
