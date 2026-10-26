@@ -1027,6 +1027,47 @@ mod tests {
         assert_eq!(f.call("dispatcher", "inbox_list", json!({})).unwrap().as_array().unwrap().len(), 1);
     }
 
+    /// QA #16 (2단계): an item belongs to its Manager by tab name (R29), not by tab id. After a
+    /// fresh start — workspace.json gone, tabs renumbered (here: config lists ops first) — the
+    /// inbox read back from disk still belongs to the same Manager, and only to it.
+    #[test]
+    fn inbox_items_stay_with_the_manager_after_a_fresh_start() {
+        let f = fx(TWO_MANAGERS);
+        let id = f.call("billing", "inbox_post", json!({"title":"정산","check":[],"risk":[],"source":"s"})).unwrap();
+        let id = id.as_str().unwrap().to_string();
+        let old_tab = f.who("billing").tab;
+        std::fs::write(
+            f.root.join(".agentboard/config.json"),
+            r#"{"tabs":[{"name":"ops","role":"manager","dir":"ops"},{"name":"billing","role":"manager","dir":"billing"}]}"#,
+        )
+        .unwrap();
+        let loaded = load_all(&f.appdata);
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        let (tx, _rx2) = mpsc::channel();
+        let pty = PtyManager::new_per_child_job(Arc::new(NullSink));
+        let state = AppState::new(
+            Workspace::from_config(&loaded),
+            loaded,
+            pty,
+            Arc::new(NullUi),
+            tx,
+            crate::persist::Saver::disabled(),
+            Vec::new(),
+            f.appdata.join("run"),
+        );
+        let who = |s: &str| {
+            let ws = state.ws.lock().unwrap();
+            let p = ws.panes.values().find(|p| p.session_name.as_deref() == Some(s)).unwrap();
+            Caller { pane: p.id.clone(), role: p.role.unwrap(), tab: p.tab.clone(), tab_name: ws.tabs[&p.tab].name.clone(), team: None, session_name: s.into() }
+        };
+        assert_ne!(who("billing").tab, old_tab, "the tab ids were renumbered");
+        let mine = call(&state, &who("billing"), "inbox_list", json!({})).unwrap();
+        assert_eq!(mine.as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect::<Vec<_>>(), [id.as_str()]);
+        assert!(call(&state, &who("ops"), "inbox_list", json!({})).unwrap().as_array().unwrap().is_empty());
+        call(&state, &who("billing"), "inbox_note", json!({"item": id, "text": "이어서"})).unwrap();
+        assert!(call(&state, &who("ops"), "inbox_note", json!({"item": id, "text": "x"})).is_err());
+    }
+
     /// Review #7: an extra prompt typed into the new session's PTY carries no control
     /// characters (an ESC sequence such as end-of-paste or ^C would act as keystrokes).
     #[test]
