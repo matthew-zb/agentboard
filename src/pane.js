@@ -153,6 +153,31 @@ export function fanoutIds(sourceId, targets, data, entryOf) {
   return out;
 }
 
+/** UTF-8 bytes of a string (terminal replies from term.onData). */
+export const utf8Bytes = (s) => Array.from(new TextEncoder().encode(s));
+
+/** xterm onBinary data (one char per byte, 0–255) as bytes — not UTF-8 encoded. */
+export const binaryBytes = (s) => Array.from(s, (c) => c.charCodeAt(0) & 0xff);
+
+/**
+ * Deliver what term.onData produced in `sourceId`. Terminal replies (focus reports, mouse
+ * reports, CPR, DA, …) go as raw bytes to the source pane only — `io.writeRaw`, not counted as
+ * the user's typing (R4, R21). User input goes through `io.write` to the source and every
+ * eligible sync target (`fanoutIds`). `io = {write(id, str), writeRaw(id, bytes)}`.
+ */
+export function routeInput(sourceId, targets, data, entryOf, io) {
+  if (isTerminalReply(data)) {
+    io.writeRaw(sourceId, utf8Bytes(data));
+    return;
+  }
+  for (const t of fanoutIds(sourceId, targets, data, entryOf)) io.write(t, data);
+}
+
+/** xterm onBinary data (e.g. X10 mouse reports): raw bytes to the source pane only. */
+export function routeBinary(sourceId, data, io) {
+  io.writeRaw(sourceId, binaryBytes(data));
+}
+
 // ---------------------------------------------------------------- runtime
 
 const entries = new Map();
@@ -351,6 +376,8 @@ function createEntry(id) {
       }
     });
   };
+  // Terminal replies / binary data: not user input, so a failure is not reported in the pane.
+  const io = { write: toPty, writeRaw: (target, bytes) => api.writeRaw(target, bytes).catch(() => {}) };
   const input = (d) => {
     if (e.inputBlocked) return;
     if (isDead(e.model)) {
@@ -359,8 +386,9 @@ function createEntry(id) {
     }
     if (e.suppressInput) return;
     // Sync input: user input is written once per Running pane of the tab (source included);
-    // terminal replies stay with the source pane. No echo loop: other panes' onData is not involved.
-    for (const t of fanoutIds(id, hooks.syncTargets(id), d, (x) => entries.get(x))) toPty(t, d);
+    // terminal replies stay with the source pane, as raw bytes that do not count as typing.
+    // No echo loop: other panes' onData is not involved.
+    routeInput(id, hooks.syncTargets(id), d, (x) => entries.get(x), io);
   };
   // BEL inside the replayed snapshot (not live yet) is history, not a new request.
   term.onBell(() => {
@@ -368,7 +396,7 @@ function createEntry(id) {
   });
   term.onData(input);
   term.onBinary((d) => {
-    if (!e.inputBlocked && !isDead(e.model) && !e.suppressInput) api.write(id, d).catch(() => {});
+    if (!e.inputBlocked && !isDead(e.model) && !e.suppressInput) routeBinary(id, d, io);
   });
 
   el.addEventListener('mousedown', () => {

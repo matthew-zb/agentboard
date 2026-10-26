@@ -44,3 +44,32 @@ test('clipboard wrappers go through __TAURI__.clipboardManager', async () => {
   assert.equal(await readClipboardText(), '');
   delete globalThis.__TAURI__;
 });
+
+// ---- first-use fixes F1: pty_write (user input) / pty_write_raw (terminal replies, binary)
+import { write, writeRaw } from '../../src/api.js';
+
+function fakeInvoke() {
+  const calls = [];
+  globalThis.__TAURI__ = { core: { invoke: async (cmd, args) => calls.push([cmd, args]) } };
+  return calls;
+}
+
+test('writeRaw sends pty_write_raw { pane, bytes } as a plain number array', async () => {
+  const calls = fakeInvoke();
+  // a Uint8Array inside the args object would be JSON-serialized as {"0":27,...}, not an array
+  await writeRaw('p1', new Uint8Array([0x1b, 0x5b, 0x4d, 0xa0, 0xff]));
+  await writeRaw('p2', [0x1b, 0x5b, 0x49]);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0][0], 'pty_write_raw');
+  assert.equal(Array.isArray(calls[0][1].bytes), true);
+  assert.deepEqual(calls[0][1], { pane: 'p1', bytes: [0x1b, 0x5b, 0x4d, 0xa0, 0xff] });
+  assert.deepEqual(calls[1], ['pty_write_raw', { pane: 'p2', bytes: [0x1b, 0x5b, 0x49] }]);
+  delete globalThis.__TAURI__;
+});
+
+test('write keeps sending pty_write { pane, data } (user input contract)', async () => {
+  const calls = fakeInvoke();
+  await write('p1', '한글 a\r');
+  assert.deepEqual(calls, [['pty_write', { pane: 'p1', data: '한글 a\r' }]]);
+  delete globalThis.__TAURI__;
+});
