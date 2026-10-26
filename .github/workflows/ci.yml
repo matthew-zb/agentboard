@@ -1,0 +1,44 @@
+name: AgentBoard CI
+
+on:
+  push:
+    branches: ['**'] # branches only: tag pushes are build.yml's (release)
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  js:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22 # the quoted test:js glob needs Node >= 21
+      # tests/js import only node: built-ins and the committed src/vendor: no npm ci needed
+      - run: npm run test:js
+
+  rust:
+    runs-on: windows-latest # ConPTY, named pipe and HKCU tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      # tests that need a real Claude session are #[ignore]
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # package.json versions and the committed src/vendor must match (npm run vendor is deterministic)
+  vendor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run vendor
+      - run: git diff --exit-code -- src/vendor
