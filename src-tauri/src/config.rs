@@ -163,8 +163,8 @@ struct RawApplet {
     focus: bool,
 }
 
-/// Applet kinds the frontend knows.
-pub const APPLET_KINDS: [&str; 1] = ["inbox"];
+/// Applet kinds the frontend knows: the inbox and the memo (`MEMO.md`, below the inbox).
+pub const APPLET_KINDS: [&str; 2] = ["inbox", "memo"];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1741,6 +1741,38 @@ mod tests {
         std::fs::remove_file(dot.join("config.json")).unwrap();
         ensure_dotdir(d.path()).unwrap();
         assert_eq!(std::fs::read_to_string(dot.join("config.json")).unwrap(), STARTER_CONFIG);
+    }
+
+    /// Memo (spec 2026-10-26 §2): the dispatcher's right column is split top/bottom —
+    /// inbox 65 : memo 35 — and the user resizes it with the existing border drag / keys.
+    #[test]
+    fn dispatcher_inbox_template_has_memo_below_inbox() {
+        let (file, text) = DEFAULT_TEMPLATES.iter().find(|(n, _)| *n == "dispatcher-inbox.json").unwrap();
+        let t = parse_template(text, Path::new(file)).unwrap();
+        assert!(validate_template(&t, Path::new(file), &agents(&["claude"])).is_empty());
+        let LayoutNode::Split { dir: Dir::Horizontal, sizes, children, .. } = &t.layout else { panic!("root: horizontal split") };
+        assert_eq!(sizes, &[60.0, 40.0]);
+        assert!(matches!(&children[0], LayoutNode::Leaf(p) if p.name == "dispatcher" && p.applet.is_none()));
+        let LayoutNode::Split { dir: Dir::Vertical, sizes, children: column, .. } = &children[1] else {
+            panic!("right column: vertical split")
+        };
+        assert_eq!(sizes, &[65.0, 35.0]);
+        let applets: Vec<(&str, Option<&str>)> = column
+            .iter()
+            .map(|c| match c {
+                LayoutNode::Leaf(p) => (p.name.as_str(), p.applet.as_deref()),
+                _ => panic!("column children are applets"),
+            })
+            .collect();
+        assert_eq!(applets, [("inbox", Some("inbox")), ("memo", Some("memo"))]);
+    }
+
+    #[test]
+    fn applet_kind_memo_is_accepted() {
+        let t = tpl(r#"{"name":"x","layout":{"applet":{"name":"m","kind":"memo"}}}"#);
+        assert!(validate_template(&t, f(), &agents(&[])).is_empty());
+        let LayoutNode::Leaf(p) = &t.layout else { panic!("leaf") };
+        assert_eq!(p.applet.as_deref(), Some("memo"));
     }
 
     #[test]

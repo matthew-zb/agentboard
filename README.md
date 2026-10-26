@@ -204,7 +204,7 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
 
 | 템플릿 | 배치 | 시작 프롬프트 |
 |---|---|---|
-| `dispatcher-inbox` | dispatcher \| 인박스 애플릿 | 환경 점검·인덱스·인박스 리뷰 |
+| `dispatcher-inbox` | dispatcher \| (위) 인박스 애플릿 / (아래) 메모 | 환경 점검·인덱스·인박스 리뷰 |
 | `handover` | 창 하나 | `/loop 10m {확인 작업}` — **직접 고치세요**(예: `/loop 10m holla로 새 슬랙 멘션과 메일을 확인해 새 메시지만 dispatcher에게 전달`) |
 | `manager` | Manager \| 셸(PowerShell), 이 분할이 팀 영역(`"slot": "team"`) | 계획·진행 내역 리뷰, 진행 중인 팀 재채용 |
 | `dispatcher`·`solo`·`team-3` | 1단계 그대로 | — |
@@ -251,6 +251,16 @@ dispatcher 탭 오른쪽 창(`{"applet":{"name":"inbox","kind":"inbox"}}`)입니
 | `Tab` | 상세의 이슈 파일 목록으로 → `j`/`k`, md 파일에서 `Enter`로 문서 탭 열기 |
 
 지시는 dispatcher 세션의 메시지 수신함(named pipe)으로 들어가므로 dispatcher 입력란에 쓰던 글을 건드리지 않습니다. dispatcher가 꺼져 있으면 보내지 않고 오류만 보여 줍니다.
+
+### 메모
+
+dispatcher 오른쪽 열의 인박스 아래 창(`{"applet":{"name":"memo","kind":"memo"}}`, 기본 비율 인박스 65 : 메모 35, 경계 드래그나 `Alt+Shift+J/K`로 조절)입니다. 사용자가 고른 오늘 할 일의 짧은 제목을 적어 두고 리뷰하는 곳이며, 에이전트가 고르는 업무 목록이 아닙니다.
+
+- 파일은 `<workspaceRoot>/MEMO.md` 하나입니다. 없으면 앱이 시작할 때 작성 기준 헤더를 넣어 만들고, 있으면 건드리지 않습니다.
+- **처음 나오는 `## 메모` 줄 아래가 본문**이고, 메모 창에는 본문만 보입니다. 그 위(작성 기준)는 보이지 않습니다. `## 메모` 줄이 없으면 파일 전체를 보여 주고 경고를 띄웁니다.
+- 키: 읽기 `j`/`k`·`g`/`G` 스크롤, `e`(또는 더블클릭) 편집, `r` 다시 읽기. 편집 `Ctrl+Enter` 저장, `Esc` 취소(바뀐 내용이 있으면 `Y`/`N`, `Enter`는 무시). 편집 중에도 `Alt+…` 앱 단축키는 동작하고 쓰던 글은 남습니다.
+- dispatcher는 사용자가 요구할 때만 파일을 직접 고칩니다(역할 지시). 마지막에 쓴 쪽이 이기며, 앱은 내용이 바뀔 때마다 직전 내용을 `.agentboard/memo.bak`에 한 벌 남깁니다. 편집 중에 파일이 바뀌면 "외부에서 바뀜 — 저장하면 덮어씀" 알림만 띄웁니다.
+- **이미 쓰던 설치**: 복사된 `.agentboard/templates/dispatcher-inbox.json`·`roles/*.md`와 저장된 배치는 바뀌지 않습니다. 메모를 붙이려면 앱을 끈 상태에서 `.agentboard/templates/dispatcher-inbox.json`(필요하면 `roles/dispatcher.md`도)과 `%APPDATA%/agentboard/workspace.json`을 지우고 다시 시작하세요(직접 고친 내용은 먼저 옮겨 두세요).
 
 ### 문서 탭
 

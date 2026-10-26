@@ -238,7 +238,7 @@ const RENAME_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50)
 /// `rename`, retried while Windows reports the target as in use (an indexer, antivirus or
 /// sync client holding the item file briefly: sharing / lock violation, access denied) —
 /// review #10. Other errors fail at once.
-fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut attempt = 1;
     loop {
         match std::fs::rename(from, to) {

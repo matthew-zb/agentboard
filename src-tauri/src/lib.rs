@@ -12,6 +12,7 @@ pub mod issues;
 pub mod launcher;
 pub mod layout;
 pub mod mcp_tools;
+pub mod memo;
 pub mod nightly;
 pub mod persist;
 pub mod profiles;
@@ -82,6 +83,8 @@ pub struct AppState {
     pub startup_errors: Vec<String>,
     /// Set by the first confirmed exit (`app_exit`); later calls are ignored.
     pub exiting: AtomicBool,
+    /// The memo's last known content (`memo.rs`; leaf lock).
+    pub memo: memo::MemoState,
     /// Per-pane bearer tokens of role panes (leaf lock inside).
     pub tokens: agentcfg::Tokens,
     /// Control server base URL (`http://127.0.0.1:<port>`), set by the control server (Task 5)
@@ -140,6 +143,7 @@ impl AppState {
             saver,
             startup_errors,
             exiting: AtomicBool::new(false),
+            memo: memo::MemoState::default(),
             tokens: agentcfg::Tokens::new(),
             ctrl_url: Mutex::new(None),
             run_dir,
@@ -543,6 +547,48 @@ fn workspace_root(state: &AppState) -> std::path::PathBuf {
     state.loaded.read().unwrap().settings.workspace_root.clone()
 }
 
+/// `memo_read` reply: the file relative to workspaceRoot (for `doc_watch`) and its whole text.
+#[derive(Serialize)]
+struct MemoText {
+    path: String,
+    text: String,
+}
+
+/// `loaded` is read (released) before the memo lock is taken.
+fn memo_read_in(state: &AppState) -> Result<MemoText, String> {
+    let (path, text) = memo::read(&workspace_root(state), &state.memo)?;
+    Ok(MemoText { path, text })
+}
+
+fn memo_save_in(state: &AppState, text: &str) -> Result<(), String> {
+    memo::save(&workspace_root(state), &state.memo, text)
+}
+
+/// The memo applet's text: `{path: "MEMO.md", text}` — the whole file; header/body are split by
+/// the frontend. Created from the header draft when missing; an external edit since the app's
+/// last read/save is backed up first (`memo.rs`). File IO off the UI thread.
+#[tauri::command]
+async fn memo_read(app: AppHandle) -> Result<MemoText, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        memo_read_in(&state)
+    })
+    .await
+    .map_err(|e| format!("메모를 읽는 작업이 중단되었습니다 — {e}"))?
+}
+
+/// Save the memo applet's whole text (header kept by the frontend): the current file goes to
+/// `.agentboard/memo.bak` first, then an atomic write.
+#[tauri::command]
+async fn memo_save(app: AppHandle, text: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<AppState>().ok_or("앱 상태가 아직 준비되지 않았습니다")?;
+        memo_save_in(&state, &text)
+    })
+    .await
+    .map_err(|e| format!("메모를 저장하는 작업이 중단되었습니다 — {e}"))?
+}
+
 /// Read a document (`path`: absolute or relative to workspaceRoot). Validated on every call
 /// (`docs::resolve_doc`): an existing `.md` inside workspaceRoot after resolving links.
 #[tauri::command]
@@ -807,6 +853,8 @@ pub fn run() {
             doc_unwatch,
             doc_open_url,
             doc_image,
+            memo_read,
+            memo_save,
             env_status,
             autostart_get,
             autostart_set,
@@ -818,6 +866,10 @@ pub fn run() {
             let loaded = config::load_all(&appdata);
             let ws_path = appdata.join("workspace.json");
             let mut startup_errors = Vec::new();
+            // spec: MEMO.md (the memo next to the dispatcher) exists from the start; never overwritten
+            if let Err(e) = memo::ensure(&loaded.settings.workspace_root) {
+                startup_errors.push(format!("MEMO.md를 만들 수 없습니다 — {e}"));
+            }
             let mut saving = true;
             // tab ids are trustworthy for the legacy inbox migration only in a restored layout
             let mut restored = false;
@@ -1058,6 +1110,20 @@ mod tests {
         let state =
             AppState::new(ws, loaded, pty, Arc::new(NullUi), tx, persist::Saver::disabled(), Vec::new(), appdata.path().join("run"));
         WriteFx { state, _rx: rx, _keep: (root, appdata) }
+    }
+
+    /// IPC contract of the memo: `memo_read` → `{path: "MEMO.md", text}` under workspaceRoot
+    /// (created from the header draft when missing), `memo_save({text})` writes the whole file.
+    #[test]
+    fn memo_commands_use_the_workspace_root() {
+        let f = write_fx();
+        let root = workspace_root(&f.state);
+        let m = memo_read_in(&f.state).unwrap();
+        assert_eq!(serde_json::to_value(&m).unwrap(), serde_json::json!({"path": "MEMO.md", "text": memo::DEFAULT_MEMO}));
+        assert_eq!(std::fs::read_to_string(root.join("MEMO.md")).unwrap(), memo::DEFAULT_MEMO);
+        memo_save_in(&f.state, "x").unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("MEMO.md")).unwrap(), "x");
+        assert_eq!(std::fs::read_to_string(root.join(".agentboard/memo.bak")).unwrap(), memo::DEFAULT_MEMO);
     }
 
     /// The exit (flush up to 5 s, kill all) runs off the UI thread now, so the window stays

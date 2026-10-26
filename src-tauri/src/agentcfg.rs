@@ -434,6 +434,19 @@ mod tests {
         assert_eq!(role_prompt(Role::Member, &loaded).unwrap(), default_role_prompt(Role::Member));
     }
 
+    /// Memo spec §4: MEMO.md holds the items the user picked; only the dispatcher edits it, and
+    /// only when the user asks (the app does not enforce this — prompt level).
+    #[test]
+    fn role_prompts_carry_the_memo_rule() {
+        let d = default_role_prompt(Role::Dispatcher);
+        for must in ["`MEMO.md`", "사용자가 요구할 때만", "`## 메모` 아래 본문", "스스로 고르거나", "헤더(작성 기준)는 건드리지 않는다"] {
+            assert!(d.contains(must), "dispatcher: missing {must}");
+        }
+        for r in [Role::Handover, Role::Manager, Role::Lead, Role::Member] {
+            assert!(default_role_prompt(r).contains("`MEMO.md`는 고치지 않는다"), "{}: missing the memo rule", r.as_str());
+        }
+    }
+
     #[test]
     fn default_role_prompts_cover_the_rules_and_fit_a_cmd_line() {
         for r in Role::ALL {
