@@ -17,6 +17,7 @@ pub mod nightly;
 pub mod persist;
 pub mod profiles;
 pub mod roles;
+pub mod teams;
 pub mod workspace;
 pub mod pty;
 pub mod ring;
