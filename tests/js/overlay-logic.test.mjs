@@ -527,3 +527,87 @@ test('envStatusFlag: failing items only, skipped marked, required highlighted', 
   assert.equal(envItemLabel('folder-trust:a'), 'a 폴더 신뢰');
   assert.equal(envItemLabel('x'), 'x 없음');
 });
+
+// ---- settings reload (config_reload, no restart) ----
+import { reloadReportText, reloadErrorLines, reloadFlow } from '../../src/overlay-logic.js';
+
+test('paletteItems: "설정 다시 읽기" entry', () => {
+  const it = paletteItems(fixture(), {}).find((i) => i.action.type === 'reloadConfig');
+  assert.deepEqual(it, { label: '설정 다시 읽기', hint: '재시작 없이', action: { type: 'reloadConfig' } });
+  // also while the Dispatcher tab is focused (no tab-specific condition)
+  const ws = fixture();
+  ws.groups.g1.activeTabId = 't1';
+  assert.ok(paletteItems(ws, {}).some((i) => i.action.type === 'reloadConfig'));
+});
+
+test('reloadReportText: added / kept tabs and updated prompts, empty parts left out', () => {
+  assert.equal(
+    reloadReportText({ added: ['a', 'b'], keptMissing: ['c'], promptsUpdated: 2 }),
+    '설정을 다시 읽었습니다 — 새 탭: a, b · 닫지 않은 탭: c · 시작 프롬프트 갱신 2',
+  );
+  assert.equal(reloadReportText({ added: ['handover'], keptMissing: [], promptsUpdated: 0 }), '설정을 다시 읽었습니다 — 새 탭: handover');
+  assert.equal(reloadReportText({ added: [], keptMissing: ['old'], promptsUpdated: 0 }), '설정을 다시 읽었습니다 — 닫지 않은 탭: old');
+  assert.equal(reloadReportText({ added: [], keptMissing: [], promptsUpdated: 1 }), '설정을 다시 읽었습니다 — 시작 프롬프트 갱신 1');
+  assert.equal(reloadReportText({ added: [], keptMissing: [], promptsUpdated: 0 }), '설정을 다시 읽었습니다');
+  assert.equal(reloadReportText(null), '설정을 다시 읽었습니다');
+  assert.equal(reloadReportText({ added: 'x' }), '설정을 다시 읽었습니다'); // malformed parts ignored
+});
+
+test('reloadErrorLines: the backend\'s error list under a "nothing changed" line', () => {
+  const head = '설정에 오류가 있어 다시 읽지 않았습니다 — 아무것도 바뀌지 않았습니다';
+  assert.deepEqual(reloadErrorLines(['config.json:3:5 — 원인', 'templates/x.json:1:1 — 원인2']), [head, 'config.json:3:5 — 원인', 'templates/x.json:1:1 — 원인2']);
+  assert.deepEqual(reloadErrorLines('설정을 읽을 수 없습니다'), [head, '설정을 읽을 수 없습니다']);
+  assert.deepEqual(reloadErrorLines(new Error('IPC 실패')), [head, 'IPC 실패']);
+  assert.deepEqual(reloadErrorLines([]), [head]);
+});
+
+function reloadDeps({ fail = null, keysFail = false } = {}) {
+  const log = [];
+  return {
+    log,
+    reload: async () => {
+      log.push(['reload']);
+      if (fail) throw fail;
+      return { added: ['handover'], keptMissing: [], promptsUpdated: 1 };
+    },
+    keybindings: async () => {
+      log.push(['keybindings']);
+      if (keysFail) throw new Error('키 설정을 읽지 못했습니다');
+      return { 'pane.focusLeft': 'Alt+h' };
+    },
+    setKeymap: (b) => log.push(['setKeymap', b]),
+    toast: (m, kind) => log.push(['toast', String(m), kind]),
+    showErrors: (lines) => log.push(['showErrors', lines]),
+  };
+}
+
+test('reloadFlow: success toasts the report and refreshes the keymap', async () => {
+  const d = reloadDeps();
+  assert.equal(await reloadFlow(d), true);
+  assert.deepEqual(d.log, [
+    ['reload'],
+    ['toast', '설정을 다시 읽었습니다 — 새 탭: handover · 시작 프롬프트 갱신 1', 'info'],
+    ['keybindings'],
+    ['setKeymap', { 'pane.focusLeft': 'Alt+h' }],
+  ]);
+  // the keymap could not be re-read: the reload still succeeded, the problem is toasted
+  const k = reloadDeps({ keysFail: true });
+  assert.equal(await reloadFlow(k), true);
+  assert.deepEqual(k.log.at(-1), ['toast', 'Error: 키 설정을 읽지 못했습니다', undefined]);
+  assert.ok(!k.log.some((e) => e[0] === 'setKeymap'));
+});
+
+test('app.js wires "설정 다시 읽기" to reloadFlow and re-reads keys on config-reloaded', () => {
+  const src = readFileSync(new URL('../../src/app.js', import.meta.url), 'utf8');
+  assert.match(src, /case 'reloadConfig':\s*return reloadSettings\(\);/);
+  const flow = src.slice(src.indexOf('return reloadFlow({'), src.indexOf('return reloadFlow({') + 260);
+  for (const dep of ['api.configReload()', 'api.keybindings()', 'setKeymap: applyKeybindings', 'showErrors']) assert.ok(flow.includes(dep), dep);
+  const ev = src.slice(src.indexOf("api.on('config-reloaded'"), src.indexOf("api.on('config-reloaded'") + 120);
+  assert.match(ev, /loadKeybindings\(\)/);
+});
+
+test('reloadFlow: errors go to the error panel and nothing else happens', async () => {
+  const d = reloadDeps({ fail: ['config.json:2:1 — 잘못된 값'] });
+  assert.equal(await reloadFlow(d), false);
+  assert.deepEqual(d.log, [['reload'], ['showErrors', ['설정에 오류가 있어 다시 읽지 않았습니다 — 아무것도 바뀌지 않았습니다', 'config.json:2:1 — 잘못된 값']]]);
+});

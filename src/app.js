@@ -58,7 +58,7 @@ import { mountInbox, configureInbox } from './inbox.js';
 import { mountDoc, configureDocView, renderMarkdown, loadImages } from './docview.js';
 import { mountMemo, configureMemo } from './memo.js';
 import { configureCopyMode, toggleCopyMode, copyActive, pruneCopySessions } from './copy-ui.js';
-import { pickCommands, paletteItems, missingDirsFlow, closeFlow, envStatusFlag } from './overlay-logic.js';
+import { pickCommands, paletteItems, missingDirsFlow, closeFlow, envStatusFlag, reloadFlow } from './overlay-logic.js';
 import { hiddenAttentionTabs, statusEntryText } from './attention-logic.js';
 
 const $ = (id) => document.getElementById(id);
@@ -219,9 +219,35 @@ function runPaletteAction(a) {
       return openDocPicker();
     case 'autostart':
       return setAutostart(a.on);
+    case 'reloadConfig':
+      return reloadSettings();
     default:
       return undefined;
   }
+}
+
+// ---------------------------------------------------------------- settings reload
+
+/** Key settings (keybindings.json, defaults merged) → the router's keymap and palette hints. */
+function applyKeybindings(b) {
+  bindings = b || {};
+  router.setKeymap(buildKeymap(bindings));
+}
+
+function loadKeybindings() {
+  return api.keybindings().then(applyKeybindings, showError);
+}
+
+/** Palette "설정 다시 읽기": config_reload (no pane restarts) → report toast + fresh keymap;
+ * a refused reload opens the error panel. */
+function reloadSettings() {
+  return reloadFlow({
+    reload: () => api.configReload(),
+    keybindings: () => api.keybindings(),
+    setKeymap: applyKeybindings,
+    toast,
+    showErrors,
+  }).finally(refreshConfigErrors);
 }
 
 // ---------------------------------------------------------------- document tabs (Task 14)
@@ -575,10 +601,13 @@ api
   .snapshot()
   .then(render)
   .then(checkMissingDirs, showError);
-api.keybindings().then((b) => {
-  bindings = b || {};
-  router.setKeymap(buildKeymap(bindings));
-}, showError);
+loadKeybindings();
+// settings re-read at runtime (palette, or the dispatcher's MCP config_reload): key settings
+// and the config error count may have changed
+api.on('config-reloaded', () => {
+  loadKeybindings();
+  refreshConfigErrors();
+});
 refreshConfigErrors();
 // Re-activating the app window returns DOM focus to the current pane (spec §6.4); an open
 // overlay keeps it.
