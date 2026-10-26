@@ -28,7 +28,7 @@ use launcher::PromptJob;
 use pty::{PtyManager, PtySink};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use tauri::ipc::{Channel, InvokeResponseBody, Response};
@@ -80,6 +80,8 @@ pub struct AppState {
     pub saver: persist::Saver,
     /// Startup problems outside config files (e.g. a discarded workspace.json), shown in the error list.
     pub startup_errors: Vec<String>,
+    /// Set by the first confirmed exit (`app_exit`); later calls are ignored.
+    pub exiting: AtomicBool,
     /// Per-pane bearer tokens of role panes (leaf lock inside).
     pub tokens: agentcfg::Tokens,
     /// Control server base URL (`http://127.0.0.1:<port>`), set by the control server (Task 5)
@@ -137,6 +139,7 @@ impl AppState {
             emit_lock: Mutex::new(()),
             saver,
             startup_errors,
+            exiting: AtomicBool::new(false),
             tokens: agentcfg::Tokens::new(),
             ctrl_url: Mutex::new(None),
             run_dir,
@@ -420,12 +423,28 @@ fn running_count(state: State<'_, AppState>) -> usize {
     state.ws.lock().unwrap().running_count()
 }
 
-/// Confirmed app exit: save workspace.json, kill every pane process, exit.
+/// True for the first call only: one exit runs, a second close click meanwhile does nothing.
+fn begin_exit(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::SeqCst)
+}
+
+/// Confirmed app exit: save workspace.json (up to `persist::FLUSH_WAIT`), kill every pane
+/// process, exit — on a blocking thread, so the window is not frozen meanwhile. Only the first
+/// call acts.
 #[tauri::command]
-fn app_exit(app: AppHandle, state: State<'_, AppState>) {
-    state.saver.flush();
-    state.pty.kill_all();
-    app.exit(0);
+async fn app_exit(app: AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else { return app.exit(0) };
+    if !begin_exit(&state.exiting) {
+        return;
+    }
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        if let Some(state) = app.try_state::<AppState>() {
+            state.saver.flush();
+            state.pty.kill_all();
+        }
+        app.exit(0);
+    })
+    .await;
 }
 
 /// Inbox applet (Task 10): items newest first (done ones only with `show_done`) + version.
@@ -1014,6 +1033,16 @@ mod tests {
         let state =
             AppState::new(ws, loaded, pty, Arc::new(NullUi), tx, persist::Saver::disabled(), Vec::new(), appdata.path().join("run"));
         WriteFx { state, _rx: rx, _keep: (root, appdata) }
+    }
+
+    /// The exit (flush up to 5 s, kill all) runs off the UI thread now, so the window stays
+    /// responsive: a second close click meanwhile must not start a second exit.
+    #[test]
+    fn app_exit_runs_once() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(begin_exit(&flag));
+        assert!(!begin_exit(&flag), "an exit is already running");
+        assert!(!begin_exit(&flag));
     }
 
     /// Terminal replies / mouse reports (pty_write_raw) are not user activity: they must not

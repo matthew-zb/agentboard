@@ -133,6 +133,24 @@ fn exit_code_is_reported() {
     assert_eq!(sink.exit("p3"), Some(3));
 }
 
+/// Each pane's input goes through its own writer thread; it ends with the process, and a
+/// write or resize after the exit reports it instead of queuing forever.
+#[test]
+fn writer_thread_ends_when_process_exits() {
+    let (sink, m) = setup();
+    m.spawn("w1", spec("cmd.exe", &[], cwd())).unwrap();
+    assert!(m.writer_alive("w1"), "a running pane has a writer");
+    m.spawn("w2", spec("cmd.exe", &["/c", "exit 0"], cwd())).unwrap();
+    assert!(wait_until(|| sink.exit("w2").is_some()));
+    assert!(wait_until(|| !m.writer_alive("w2")), "writer thread still running after the exit");
+    let err = m.write("w2", b"x").unwrap_err();
+    assert!(err.contains("has exited"), "{err}");
+    assert!(m.resize("w2", 100, 30).unwrap_err().contains("has exited"));
+    assert!(!m.writer_alive("unknown-id"));
+    m.kill("w1");
+    assert!(wait_until(|| !m.writer_alive("w1")));
+}
+
 #[test]
 fn write_reaches_process() {
     let (sink, m) = setup();

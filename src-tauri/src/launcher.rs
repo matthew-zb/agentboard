@@ -6,7 +6,8 @@
 //! App locks: `AppState::ws` (Mutex), `AppState::loaded` (RwLock, read-only except `create_manager_tab`),
 //! `AppState::prompts` (Mutex), `AppState::effects` (Mutex<Sender>), `AppSink::channels`
 //! (Mutex, reached through `AppState::ui` / the managed `Arc<AppSink>`). PtyManager-internal
-//! locks: per-pane `flush_lock`, the `panes` map, writer/master/killer.
+//! locks: per-pane `flush_lock`, the `panes` map, writer/master/killer, the per-pane input
+//! queue (`InputQueue`).
 //!
 //! * Allowed nestings (outer -> inner): `ws -> loaded(read)`, `ws -> prompts`,
 //!   `ws -> PtyManager::is_running/current_gen/job_error` (only the `panes` map lock /
@@ -19,6 +20,15 @@
 //! * PtyManager `spawn/kill/remove` are called only from the launcher worker thread
 //!   (`run_effects`); MCP / nightly / other threads must go through `execute` → `submit`
 //!   (R13). `write`/`resize`/`attach_with` may be called from command threads.
+//! * Input queue (pty.rs): `write`/`resize` take the `panes` map lock (released), then the
+//!   pane's queue lock — a leaf held only to push, never across process IO — and return at
+//!   once (`Ok` = queued). Each pane's writer thread pops under the queue lock, releases it,
+//!   then takes the pane's writer (per chunk) or master lock to apply the op; it takes no app
+//!   lock and never `flush_lock`. The reader thread queues the DSR reply (queue lock only).
+//!   The waiter closes the queue, then takes writer → master to drop them. So `write` and
+//!   `resize` never block on a process and may be called under any app lock; IPC order of
+//!   `pty_write` / `pty_write_raw` / `pty_resize` (sync commands on the UI thread) is the
+//!   order the PTY sees.
 //!
 //! # Spawn generations
 //!
