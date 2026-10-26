@@ -111,3 +111,57 @@ test('only movement and resize chords auto-repeat', () => {
   for (const id of ['pane.close', 'pane.splitRight', 'group.close', 'pane.restart', 'tab.moveLeft', 'pane.maximize'])
     assert.equal(isRepeatable(id), false, id);
 });
+
+// ---- QA phase 1 (docs/spikes.md Task 12 Step 5 / Task 13 / QA #2): the checklist's shortcuts
+import { CORE_IDS } from '../../src/commands.js';
+
+/** Every shortcut the phase-1 checklist presses, as `KeyboardEvent.code` + modifiers → command. */
+const CHECKLIST_KEYS = [
+  // spikes.md:209 / :211 / :212 / :213 — panes
+  ['KeyH', 'A', 'pane.focusLeft'], ['KeyJ', 'A', 'pane.focusDown'], ['KeyK', 'A', 'pane.focusUp'], ['KeyL', 'A', 'pane.focusRight'],
+  ['Backslash', 'A', 'pane.splitRight'], ['Minus', 'A', 'pane.splitDown'],
+  ['KeyX', 'A', 'pane.close'], ['KeyZ', 'A', 'pane.maximize'], ['KeyR', 'A', 'pane.restart'],
+  ['KeyH', 'AS', 'pane.resizeLeft'], ['KeyJ', 'AS', 'pane.resizeDown'], ['KeyK', 'AS', 'pane.resizeUp'], ['KeyL', 'AS', 'pane.resizeRight'],
+  // :216 / :217 / :218 — tabs and groups
+  ['KeyH', 'CA', 'tab.prev'], ['KeyL', 'CA', 'tab.next'], ['KeyJ', 'CA', 'tab.last'], ['KeyK', 'CA', 'tab.dispatcher'],
+  ...[1, 2, 3, 4, 5, 6, 7, 8, 9].flatMap((n) => [[`Digit${n}`, 'A', `tab.goto${n}`], [`Digit${n}`, 'CA', `group.goto${n}`]]),
+  // :219 / :220 / :221 / :222
+  ['Backslash', 'CA', 'group.splitRight'], ['Minus', 'CA', 'group.splitDown'],
+  ['KeyH', 'CAS', 'tab.moveLeft'], ['KeyL', 'CAS', 'tab.moveRight'], ['KeyJ', 'CAS', 'tab.moveDown'], ['KeyK', 'CAS', 'tab.moveUp'],
+  ['KeyX', 'CA', 'group.close'], ['KeyZ', 'CA', 'group.maximize'],
+  // :223 (+ Task 13 :266-:273, Task 14, Task 15) — the keys wired by later tasks
+  ['KeyQ', 'A', 'pane.pick'], ['KeyA', 'A', 'pane.nextAttention'], ['KeyC', 'A', 'pane.copyMode'], ['KeyI', 'A', 'tab.syncInput'],
+  ['KeyN', 'A', 'tab.new'], ['KeyM', 'CA', 'tab.moveTo'], ['KeyG', 'CA', 'group.mergeInto'], ['Semicolon', 'A', 'app.palette'],
+  ['KeyV', 'CS', 'pane.paste'],
+];
+
+const checklistEvent = (code, mods, extra = {}) => ({
+  code,
+  key: 'ㅗ', // a Hangul jamo: the router matches `code`, never `key`
+  ctrlKey: mods.includes('C'),
+  altKey: mods.includes('A'),
+  shiftKey: mods.includes('S'),
+  metaKey: false,
+  isComposing: true,
+  ...extra,
+});
+
+test('every checklist shortcut resolves to its command, also while composing Korean', () => {
+  const defaults = JSON.parse(readFileSync(new URL('../../src-tauri/defaults/keybindings.json', import.meta.url), 'utf8'));
+  const km = buildKeymap(defaults);
+  for (const [code, mods, id] of CHECKLIST_KEYS) {
+    assert.equal(matchEvent(km, checklistEvent(code, mods)), id, `${mods}+${code}`);
+    assert.equal(matchEvent(km, checklistEvent(code, mods, { key: code.slice(-1).toLowerCase(), isComposing: false })), id, `${mods}+${code} (no IME)`);
+  }
+  // an extra modifier never matches a neighbour's chord (Alt+h ≠ Alt+Shift+H ≠ Ctrl+Alt+h)
+  assert.equal(matchEvent(km, checklistEvent('KeyH', 'CAS', { metaKey: true })), null);
+});
+
+test('every checklist shortcut has a handler: a core command or one app.js registers', () => {
+  const app = readFileSync(new URL('../../src/app.js', import.meta.url), 'utf8');
+  for (const [, , id] of CHECKLIST_KEYS) {
+    const handled = CORE_IDS.includes(id) || app.includes(`registerCommand('${id}'`);
+    assert.ok(handled, `${id} has no handler (its key would be swallowed doing nothing)`);
+  }
+  assert.match(app, /for \(const id of CORE_IDS\)/, 'core commands are registered in a loop');
+});
