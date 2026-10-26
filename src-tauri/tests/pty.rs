@@ -270,6 +270,63 @@ fn job_kills_children_when_app_exits() {
     assert!(wait_until(|| !pid_alive(pid)), "ping {pid} survived app exit");
 }
 
+/// Helper, only active when re-executed by `breakaway_child_survives_app_exit`: like the app,
+/// it puts itself into the kill-on-close job, then starts a process outside it.
+#[test]
+fn breakaway_child_helper() {
+    if std::env::var("AGENTBOARD_BREAKAWAY_CHILD").is_err() {
+        return;
+    }
+    let m = PtyManager::new(Arc::new(Quiet));
+    assert!(m.job_error().is_none(), "{:?}", m.job_error());
+    let mut cmd = std::process::Command::new("ping");
+    // no inherited pipes: the parent's `output()` must not wait for ping to finish
+    cmd.args(["-n", "60", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let child = app_lib::winjob::spawn_outside_job(&mut cmd).expect("breakaway spawn");
+    println!("CHILDPID={}", child.id());
+    std::process::exit(0); // the OS closes the job handle: everything still in the job dies
+}
+
+/// Counterpart of `job_kills_children_when_app_exits`: a process started with
+/// `spawn_outside_job` (the browser for a document link) outlives the app.
+#[test]
+fn breakaway_child_survives_app_exit() {
+    if std::env::var("AGENTBOARD_BREAKAWAY_CHILD").is_ok() {
+        return;
+    }
+    use std::io::BufRead;
+    let mut helper = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "breakaway_child_helper", "--nocapture", "--test-threads=1"])
+        .env("AGENTBOARD_BREAKAWAY_CHILD", "1")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Read only up to the pid line: the surviving ping inherits the helper's stdout handle
+    // (std passes every inheritable handle), so the pipe stays open until ping ends.
+    let mut seen = String::new();
+    let mut pid = None;
+    for line in std::io::BufReader::new(helper.stdout.take().unwrap()).lines() {
+        let line = line.unwrap();
+        // the harness prints "test breakaway_child_helper ... " on the same line
+        if let Some(p) = line.split("CHILDPID=").nth(1) {
+            pid = Some(p.trim().parse::<u32>().unwrap());
+            break;
+        }
+        seen.push_str(&line);
+        seen.push('\n');
+    }
+    let pid = pid.unwrap_or_else(|| panic!("helper output: {seen}"));
+    assert!(helper.wait().unwrap().success(), "helper failed: {seen}");
+    // the helper (the "app") is gone and its job closed; that kills within ms when it does
+    std::thread::sleep(Duration::from_millis(1500));
+    let alive = pid_alive(pid);
+    let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).output();
+    assert!(alive, "ping {pid} died with the app's job");
+}
+
 #[test]
 fn snapshot_equals_delivered_output() {
     let (sink, m) = setup();

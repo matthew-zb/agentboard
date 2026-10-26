@@ -619,11 +619,36 @@ fn doc_unwatch(state: State<'_, AppState>, pane_id: String) {
 }
 
 /// An http(s) link of a document → the system browser (opener plugin's Rust API; the frontend
-/// gets no opener capability). Anything else is refused.
+/// gets no opener capability). Anything else is refused. The browser is started outside the
+/// app's job object so that it outlives the app (`docs::open_external`).
 #[tauri::command]
 fn doc_open_url(url: String) -> Result<(), String> {
-    let url = docs::check_external_url(&url)?;
+    docs::open_external(&url, spawn_url_opener, open_url_directly)
+}
+
+/// The opener as a process outside the app's job: `<this exe> --open-url <url>` (main.rs).
+/// Arguments go through CreateProcess quoting, no shell.
+#[cfg(windows)]
+fn spawn_url_opener(url: &str) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.arg(docs::OPEN_URL_FLAG).arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    winjob::spawn_outside_job(&mut cmd).map(drop) // not waited for: it opens the url and exits
+}
+
+#[cfg(not(windows))]
+fn spawn_url_opener(_url: &str) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+fn open_url_directly(url: &str) -> Result<(), String> {
     tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| format!("브라우저를 열 수 없습니다 — {e}"))
+}
+
+/// `agentboard.exe --open-url <url>` (started by [`doc_open_url`]): open it and return the
+/// exit code; no Tauri/WebView.
+pub fn run_open_url(url: &str) -> i32 {
+    docs::run_open_url_with(url, open_url_directly)
 }
 
 /// Files of the inbox item's issue folder (`input/`, `output/`), for the inbox detail. The
