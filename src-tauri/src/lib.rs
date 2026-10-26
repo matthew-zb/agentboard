@@ -66,6 +66,9 @@ pub trait Ui: Send + Sync {
     /// Emit `config-reloaded` (no payload): settings were read again at runtime; the frontend
     /// re-reads keybindings and the error list.
     fn config_reloaded(&self) {}
+    /// Emit `board-changed` (no payload): a hook updated the dashboard board, or the nightly
+    /// state changed (the dashboard re-reads `board_status`).
+    fn board_changed(&self) {}
 }
 
 /// Lock order: see the module docs of `launcher`.
@@ -265,6 +268,10 @@ impl Ui for AppSink {
 
     fn config_reloaded(&self) {
         let _ = self.app.emit(CONFIG_RELOADED, ());
+    }
+
+    fn board_changed(&self) {
+        let _ = self.app.emit(board::BOARD_CHANGED, ());
     }
 }
 
@@ -573,6 +580,13 @@ async fn inbox_add_files(
 
 fn workspace_root(state: &AppState) -> std::path::PathBuf {
     state.loaded.read().unwrap().settings.workspace_root.clone()
+}
+
+/// Dashboard status: per role pane (current generation) idle, last prompt/reply, context size,
+/// and the nightly machine's phase. In memory only; `board-changed` says when to re-read.
+#[tauri::command]
+fn board_status(state: State<'_, AppState>) -> board::BoardStatus {
+    board::status(&state)
 }
 
 /// `memo_read` reply: the file relative to workspaceRoot (for `doc_watch`) and its whole text.
@@ -884,6 +898,7 @@ pub fn run() {
             doc_image,
             memo_read,
             memo_save,
+            board_status,
             env_status,
             autostart_get,
             autostart_set,

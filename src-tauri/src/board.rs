@@ -13,12 +13,13 @@
 //! The board lock is a leaf: nothing else is taken while it is held.
 
 use crate::control::{Caller, HookRouter};
+use crate::nightly::Phase;
 use crate::workspace::PaneId;
 use crate::AppState;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,7 +38,7 @@ pub struct BoardEntry {
     pub last_prompt: Option<String>,
     /// First [`SNIPPET_MAX`] characters of the last assistant message (Stop).
     pub last_reply: Option<String>,
-    /// Context size from the transcript's last usage (Task BC2).
+    /// Context size from the transcript tail's last usage, read on Stop ([`Board::context_for`]).
     pub context_tokens: Option<u64>,
     /// Epoch milliseconds of the last hook.
     pub updated_at: u64,
@@ -67,6 +68,8 @@ pub enum HookKind {
 #[derive(Default)]
 pub struct Board {
     inner: Mutex<HashMap<PaneId, BoardEntry>>,
+    /// Context sizes per transcript ([`Board::context_for`]; leaf lock).
+    ctx: Mutex<HashMap<PathBuf, CtxCached>>,
 }
 
 impl Board {
@@ -142,6 +145,14 @@ fn note(state: &AppState, caller: &Caller, body: &Value, kind: HookKind) {
     let Some(gen) = state.pty.current_gen(&caller.pane) else { return }; // no process
     let stdin = body.get("stdin").unwrap_or(&Value::Null);
     state.board.apply(&caller.pane, gen, kind, stdin, now_ms());
+    // the turn ended: its context size, from the transcript tail (no board lock held while reading)
+    if kind == HookKind::Stop {
+        if let Some(t) = state.board.get(&caller.pane).and_then(|e| e.transcript) {
+            let tokens = state.board.context_for(&t);
+            state.board.set_context(&caller.pane, gen, tokens);
+        }
+    }
+    state.ui.board_changed();
 }
 
 /// Entries of the panes' current generations (the board lock, then the PtyManager `panes`
@@ -166,6 +177,112 @@ fn snippet(s: &str) -> String {
     s.trim().chars().take(SNIPPET_MAX).collect()
 }
 
+// ───────── context size ─────────
+
+/// Bytes read from the end of a transcript (as session-board did): the last turn is near the end.
+pub const TAIL_BYTES: u64 = 512 * 1024;
+/// Transcripts remembered by the context cache (sessions restart nightly: old paths go away).
+const CTX_CACHE_MAX: usize = 64;
+
+/// The session's context size from its transcript (`path`): the `usage` of the last assistant
+/// message in the tail — input + cache-read + cache-creation tokens, i.e. what the next turn
+/// sends. `None` without a readable file or usage in the tail.
+pub(crate) fn context_tokens_of(path: &Path) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let start = f.metadata().ok()?.len().saturating_sub(TAIL_BYTES);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let skip = usize::from(start > 0); // the first line of a tail is cut
+    for line in text.lines().skip(skip).collect::<Vec<_>>().into_iter().rev() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if v.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(u) = v.pointer("/message/usage") else { continue };
+        let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+        return Some(n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens"));
+    }
+    None
+}
+
+/// A transcript's context size as of its (mtime, size).
+struct CtxCached {
+    mtime: SystemTime,
+    size: u64,
+    tokens: Option<u64>,
+}
+
+impl Board {
+    /// [`context_tokens_of`], cached by (path, mtime, size): an unchanged transcript is not read
+    /// again. The cache lock is a leaf held across the tail read.
+    pub fn context_for(&self, path: &Path) -> Option<u64> {
+        let meta = std::fs::metadata(path).ok()?;
+        let (mtime, size) = (meta.modified().ok()?, meta.len());
+        let mut cache = self.ctx.lock().unwrap();
+        if let Some(c) = cache.get(path).filter(|c| c.mtime == mtime && c.size == size) {
+            return c.tokens;
+        }
+        let tokens = context_tokens_of(path);
+        if cache.len() >= CTX_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), CtxCached { mtime, size, tokens });
+        tokens
+    }
+
+    /// Set the pane's context size if its entry is still generation `gen`.
+    fn set_context(&self, pane: &str, gen: u64, tokens: Option<u64>) {
+        if let Some(e) = self.inner.lock().unwrap().get_mut(pane).filter(|e| e.gen == gen) {
+            e.context_tokens = tokens;
+        }
+    }
+}
+
+// ───────── board_status ─────────
+
+/// Event emitted after a hook was applied and after the nightly state changed (no payload);
+/// the frontend then calls `board_status`.
+pub const BOARD_CHANGED: &str = "board-changed";
+
+/// `board_status().nightly`: `{lastRun: "YYYY-MM-DD"|null, phase, pending, held}`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NightlyStatus {
+    pub last_run: Option<String>,
+    /// `idle` | `notifying` | `waiting` | `restarting`.
+    pub phase: &'static str,
+    /// Targets that have not called `handoff_done` yet (waiting phase).
+    pub pending: Vec<PaneId>,
+    /// Panes whose restart waits for the user to stop typing.
+    pub held: Vec<PaneId>,
+}
+
+/// The `board_status` reply (IPC contract of the dashboard plan).
+#[derive(Debug, Serialize)]
+pub struct BoardStatus {
+    pub panes: BTreeMap<PaneId, BoardEntry>,
+    pub nightly: NightlyStatus,
+}
+
+/// Panes of their current generation, plus the nightly machine's view (board lock, PtyManager
+/// `panes` map, nightly machine lock — one at a time).
+pub fn status(state: &AppState) -> BoardStatus {
+    let (last_run, phase, held) = state.nightly.view();
+    let (name, pending) = match phase {
+        Phase::Idle => ("idle", Vec::new()),
+        Phase::Notifying => ("notifying", Vec::new()),
+        Phase::Waiting { pending, .. } => ("waiting", pending.into_iter().collect()),
+        Phase::Restarting => ("restarting", Vec::new()),
+    };
+    BoardStatus {
+        panes: panes(state),
+        nightly: NightlyStatus { last_run: last_run.map(|d| d.format("%Y-%m-%d").to_string()), phase: name, pending, held },
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
@@ -186,16 +303,24 @@ mod tests {
         fn output(&self, _: &str, _: u64, _: &[u8]) {}
         fn exited(&self, _: &str, _: u64, _: i32) {}
     }
-    struct NullUi;
-    impl Ui for NullUi {
+    /// Counts `board-changed` emits.
+    #[derive(Default)]
+    struct CountUi {
+        board: std::sync::atomic::AtomicUsize,
+    }
+    impl Ui for CountUi {
         fn workspace_changed(&self, _: &Snapshot) {}
         fn drop_channel(&self, _: &str) {}
+        fn board_changed(&self) {
+            self.board.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Manager tab "billing"; `pane` = its role pane.
     struct Fx {
         state: AppState,
         pane: String,
+        ui: Arc<CountUi>,
         _rx: mpsc::Receiver<Effects>,
         _keep: (tempfile::TempDir, tempfile::TempDir),
     }
@@ -238,6 +363,9 @@ mod tests {
             let h = self.state.hooks.get(event).unwrap_or_else(|| panic!("no handler for {event}"));
             h(&self.state, &self.caller(), &json!({"event": event, "stdin": stdin, "socket": null, "msgToken": null, "cwd": "."}));
         }
+        fn board_events(&self) -> usize {
+            self.ui.board.load(std::sync::atomic::Ordering::SeqCst)
+        }
         fn entry(&self) -> BoardEntry {
             panes(&self.state).get(&self.pane).cloned().expect("board entry")
         }
@@ -257,9 +385,10 @@ mod tests {
         let pane = ws.panes.values().find(|p| p.role == Some(Role::Manager)).expect("manager pane").id.clone();
         let (tx, rx) = mpsc::channel();
         let pty = PtyManager::new_per_child_job(Arc::new(NullSink));
+        let ui = Arc::new(CountUi::default());
         let state =
-            AppState::new(ws, loaded, pty, Arc::new(NullUi), tx, crate::persist::Saver::disabled(), Vec::new(), appdata.path().join("run"));
-        Fx { state, pane, _rx: rx, _keep: (root, appdata) }
+            AppState::new(ws, loaded, pty, ui.clone(), tx, crate::persist::Saver::disabled(), Vec::new(), appdata.path().join("run"));
+        Fx { state, pane, ui, _rx: rx, _keep: (root, appdata) }
     }
 
     #[test]
@@ -334,5 +463,110 @@ mod tests {
         f.state.pty.remove(&f.pane);
         f.hook("UserPromptSubmit", json!({"prompt": "late"}));
         assert_eq!(f.state.board.get(&f.pane).unwrap().last_prompt, None);
+    }
+
+    // ---- BC2: context size, nightly phase, board_status, board-changed ----
+
+    fn assistant(input: u64, read: u64, created: u64) -> String {
+        json!({"type": "assistant", "message": {"role": "assistant", "model": "m",
+            "usage": {"input_tokens": input, "cache_read_input_tokens": read, "cache_creation_input_tokens": created, "output_tokens": 9}}})
+        .to_string()
+    }
+
+    #[test]
+    fn context_from_transcript_tail_uses_last_usage() {
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join("s.jsonl");
+        let lines = [
+            json!({"type": "user", "message": {"role": "user", "content": "a"}}).to_string(),
+            assistant(10, 100, 5),
+            assistant(3, 40_000, 200),
+            json!({"type": "assistant", "message": {"role": "assistant", "content": []}}).to_string(), // no usage
+            "not json".to_string(),
+            json!({"type": "user", "message": {"role": "user", "content": "b"}}).to_string(),
+        ];
+        std::fs::write(&t, lines.join("\n") + "\n").unwrap();
+        assert_eq!(context_tokens_of(&t), Some(3 + 40_000 + 200), "the last assistant usage: input + cache read + cache creation");
+        assert_eq!(context_tokens_of(&d.path().join("missing.jsonl")), None);
+        // only the tail is read: a usage before the last TAIL_BYTES does not count
+        let big = d.path().join("big.jsonl");
+        let filler = json!({"type": "user", "message": {"content": "x".repeat(1000)}}).to_string();
+        let mut text = assistant(1, 1, 1) + "\n";
+        while text.len() < TAIL_BYTES as usize + 4096 {
+            text.push_str(&filler);
+            text.push('\n');
+        }
+        std::fs::write(&big, &text).unwrap();
+        assert_eq!(context_tokens_of(&big), None);
+        // Stop fills the entry from the session's transcript
+        let f = fixture();
+        f.spawn();
+        f.hook("SessionStart", json!({"transcript_path": t.to_string_lossy()}));
+        assert_eq!(f.entry().context_tokens, None, "read on Stop");
+        f.hook("Stop", json!({"last_assistant_message": "끝", "transcript_path": t.to_string_lossy()}));
+        assert_eq!(f.entry().context_tokens, Some(40_203));
+    }
+
+    /// (path, mtime, size) cache: an unchanged file is not read again.
+    #[test]
+    fn context_cache_reuses_unchanged_file() {
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join("s.jsonl");
+        std::fs::write(&t, assistant(100, 0, 0) + "\n").unwrap();
+        let board = Board::default();
+        assert_eq!(board.context_for(&t), Some(100));
+        let mtime = std::fs::metadata(&t).unwrap().modified().unwrap();
+        // same size, same mtime, different content: the cached value is used
+        std::fs::write(&t, assistant(200, 0, 0) + "\n").unwrap();
+        std::fs::File::options().write(true).open(&t).unwrap().set_modified(mtime).unwrap();
+        assert_eq!(board.context_for(&t), Some(100));
+        // a real change (size) is read again
+        std::fs::write(&t, assistant(2000, 0, 0) + "\n").unwrap();
+        assert_eq!(board.context_for(&t), Some(2000));
+    }
+
+    #[test]
+    fn nightly_phase_is_reported() {
+        let f = fixture();
+        let empty = serde_json::to_value(status(&f.state)).unwrap();
+        assert_eq!(empty["nightly"], json!({"lastRun": null, "phase": "idle", "pending": [], "held": []}));
+        assert!(empty["panes"].as_object().unwrap().is_empty());
+        // the standing panes (dispatcher, billing's Manager) run: tonight's run starts at 03:00
+        let ids: Vec<PaneId> = f.state.ws.lock().unwrap().panes.keys().cloned().collect();
+        for id in &ids {
+            f.state.ws.lock().unwrap().set_status(id, crate::workspace::PaneStatus::Running);
+        }
+        let before = f.board_events();
+        let local = chrono::NaiveDateTime::parse_from_str("2026-10-25 03:00", "%Y-%m-%d %H:%M").unwrap();
+        crate::nightly::tick(&f.state, None, local, std::time::Instant::now());
+        let s = serde_json::to_value(status(&f.state)).unwrap();
+        assert_eq!(s["nightly"]["lastRun"], "2026-10-25");
+        assert_eq!(s["nightly"]["phase"], "waiting");
+        let mut pending: Vec<String> = serde_json::from_value(s["nightly"]["pending"].clone()).unwrap();
+        pending.sort();
+        let mut standing: Vec<PaneId> = {
+            let ws = f.state.ws.lock().unwrap();
+            ws.panes.values().filter(|p| p.role.is_some()).map(|p| p.id.clone()).collect()
+        };
+        standing.sort();
+        assert_eq!(pending, standing);
+        assert_eq!(s["nightly"]["held"], json!([]));
+        assert!(f.board_events() > before, "a phase change emits board-changed");
+        // a tick without a phase change emits nothing
+        let quiet = f.board_events();
+        crate::nightly::tick(&f.state, None, local, std::time::Instant::now());
+        assert_eq!(f.board_events(), quiet);
+    }
+
+    #[test]
+    fn board_changed_follows_hooks() {
+        let f = fixture();
+        f.spawn();
+        let n = f.board_events();
+        f.hook("UserPromptSubmit", json!({"prompt": "a"}));
+        f.hook("Stop", json!({"last_assistant_message": "b"}));
+        assert_eq!(f.board_events(), n + 2);
+        let s = serde_json::to_value(status(&f.state)).unwrap();
+        assert_eq!(s["panes"][&f.pane]["lastReply"], "b");
     }
 }

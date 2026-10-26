@@ -78,9 +78,12 @@
 //!   Inbox relay (Task 10, `bridge::relay_*` from Tauri commands): `ws` (released), then the
 //!   inbox, then `inner`/`wake` via `send` — one at a time, never nested.
 //! * Attention (attention.rs, Task 9): `AppState::trust` (folder-trust timers) is a leaf.
-//! * Board (board.rs): `AppState::board` is a leaf. Hook handlers take the PtyManager `panes`
-//!   map (`current_gen`, released), then the board lock; `board::panes` takes the board lock
-//!   (released), then `panes` per entry.
+//! * Board (board.rs): `AppState::board` (entries) and its context cache are leaves. Hook
+//!   handlers take the PtyManager `panes` map (`current_gen`, released), then the board lock
+//!   (released), then on Stop the cache lock alone around the transcript tail read, then the
+//!   board lock again; `board::status` takes the nightly machine lock, the board lock and
+//!   `panes` one at a time. `nightly::tick` reads the machine's view before and after `step`
+//!   under the machine lock and emits `board-changed` after `perform`, with no lock held.
 //! * Memo (memo.rs): `AppState::memo` (`MemoState.last`) is a leaf, held across the MEMO.md /
 //!   memo.bak IO (reads and saves are serialized); `memo_read`/`memo_save` read workspaceRoot
 //!   from `loaded` (released) first and run on a blocking thread.
