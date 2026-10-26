@@ -381,7 +381,7 @@ fn config_errors(state: State<'_, AppState>) -> Vec<String> {
 async fn config_reload(app: AppHandle) -> Result<workspace::ReloadReport, Vec<String>> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.try_state::<AppState>().ok_or_else(|| vec!["앱 상태가 아직 준비되지 않았습니다".to_string()])?;
-        launcher::reload_config_from(&state, &appdata_dir())
+        launcher::reload_config(&state)
     })
     .await
     .map_err(|e| vec![format!("설정을 다시 읽는 작업이 중단되었습니다 — {e}")])?

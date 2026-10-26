@@ -546,6 +546,14 @@ fn execute_with_config(state: &AppState, cmd: WsCommand, name: &str, dir: &str, 
 /// keybindings / errors; `env-changed`: folder-trust items follow the tabs).
 /// Lock order: CONFIG_WRITE (no config edit in between) → `ws` → `loaded(write)` (the existing
 /// `ws -> loaded` nesting), both released before effects / publish.
+/// [`reload_config_from`] for the running app (Tauri command and MCP `config_reload`): the
+/// appdata folder is the parent of `AppState::run_dir` (`<appdata>/run`,
+/// `agentcfg::default_run_dir`; test states are built the same way).
+pub fn reload_config(state: &AppState) -> Result<crate::workspace::ReloadReport, Vec<String>> {
+    let appdata = state.run_dir.parent().map(std::path::Path::to_path_buf).unwrap_or_else(crate::appdata_dir);
+    reload_config_from(state, &appdata)
+}
+
 pub fn reload_config_from(state: &AppState, appdata: &std::path::Path) -> Result<crate::workspace::ReloadReport, Vec<String>> {
     let _cfg = config::CONFIG_WRITE.lock().unwrap_or_else(|e| e.into_inner());
     let new = config::load_all(appdata); // file IO, no app lock held
