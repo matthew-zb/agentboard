@@ -78,6 +78,9 @@
 //!   Inbox relay (Task 10, `bridge::relay_*` from Tauri commands): `ws` (released), then the
 //!   inbox, then `inner`/`wake` via `send` — one at a time, never nested.
 //! * Attention (attention.rs, Task 9): `AppState::trust` (folder-trust timers) is a leaf.
+//! * Memo (memo.rs): `AppState::memo` (`MemoState.last`) is a leaf, held across the MEMO.md /
+//!   memo.bak IO (reads and saves are serialized); `memo_read`/`memo_save` read workspaceRoot
+//!   from `loaded` (released) first and run on a blocking thread.
 //!   `spawn_pane` arms it after `spawn` returns (no app lock held); `poll_trust` (prompt timer
 //!   thread) and the SessionStart / Notification handlers take it, release it, then read
 //!   `current_gen` / `ws` one at a time and change the model only via `execute`.
