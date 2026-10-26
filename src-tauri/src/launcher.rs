@@ -147,14 +147,15 @@ pub fn profile_for<'a>(pane: &Pane, loaded: &'a Loaded) -> Option<&'a AgentProfi
     loaded.profiles.get(&pane.agent).or_else(|| loaded.profiles.get(&loaded.config.default_agent))
 }
 
-/// Per-spawn inputs of a role pane's extras (`agentcfg::role_spawn_extras`). Ignored for
-/// panes without a role.
+/// Per-spawn inputs of a role pane's extras (`agentcfg::role_spawn_extras`; ignored for panes
+/// without a role) and of every pane's inherited-environment cleanup.
 pub struct RoleLaunch<'a> {
     pub ctrl_url: &'a str,
     pub token: &'a str,
     pub run_dir: &'a std::path::Path,
-    /// Variable names of the app's own environment; the session-bound ones are not passed on
-    /// to a role session (`agentcfg::SESSION_BOUND_VARS`, R19). Injected for testability.
+    /// Variable names of the app's own environment (every pane). tmux/psmux markers are passed
+    /// on to no pane (`agentcfg::MULTIPLEXER_VARS`); session-bound Claude Code variables not to
+    /// a role session (`agentcfg::SESSION_BOUND_VARS`, R19). Injected for testability.
     pub parent_env: &'a [String],
 }
 
@@ -176,7 +177,8 @@ pub fn plan_spawn(pane: &Pane, loaded: &Loaded, launch: &RoleLaunch) -> Result<S
     let mut args: Vec<String> = profile.args.clone();
     let mut env = profile.env.clone();
     let mut role_env = Vec::new();
-    let mut env_remove = Vec::new();
+    // every pane: not a tmux pane, even when the app was started from a psmux shell
+    let mut env_remove = crate::agentcfg::inherited_multiplexer_vars(launch.parent_env.iter().cloned());
     if let Some(role) = pane.role {
         let (mut extra_args, extra_env) = crate::agentcfg::role_spawn_extras(
             pane,
@@ -196,7 +198,9 @@ pub fn plan_spawn(pane: &Pane, loaded: &Loaded, launch: &RoleLaunch) -> Result<S
         args.extend(extra_args);
         args.extend(loaded.config.role_config(role).args);
         role_env = extra_env;
-        env_remove = crate::agentcfg::inherited_claude_vars(launch.parent_env.iter().cloned());
+        let mut drop = crate::agentcfg::inherited_claude_vars(launch.parent_env.iter().cloned());
+        drop.append(&mut env_remove);
+        env_remove = drop;
     }
     args.extend(pane.args.iter().cloned());
     env.extend(pane.env.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -641,11 +645,8 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
     // `tokens` and `ctrl_url` are leaves, taken one at a time before `loaded`.
     let token = if pane.role.is_some() { state.tokens.issue(id) } else { String::new() };
     let ctrl_url = state.ctrl_url.lock().unwrap().clone().unwrap_or_else(|| PLACEHOLDER_CTRL_URL.to_string());
-    let parent_env: Vec<String> = if pane.role.is_some() {
-        std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect()
-    } else {
-        Vec::new()
-    };
+    // every pane: tmux/psmux markers are dropped for all, Claude session variables for role panes
+    let parent_env: Vec<String> = std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect();
     let launch = RoleLaunch { ctrl_url: &ctrl_url, token: &token, run_dir: &state.run_dir, parent_env: &parent_env };
     let (plan, job) = {
         let loaded = state.loaded.read().unwrap();
@@ -959,7 +960,7 @@ mod tests {
         let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:1", token: "t", run_dir: run.path(), parent_env: &parent };
         let mut p = pane("tool", fx.root.path().to_path_buf());
         let plain = plan_spawn(&p, &fx.loaded, &launch).unwrap();
-        assert!(plain.env_remove.is_empty(), "phase-1 panes inherit everything as before");
+        assert!(plain.env_remove.is_empty(), "plain panes drop only tmux/psmux markers (none here), not Claude's");
         p.role = Some(Role::Manager);
         p.session_name = Some("billing".into());
         let spec = plan_spawn(&p, &fx.loaded, &launch).unwrap();
@@ -968,6 +969,34 @@ mod tests {
             vec!["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SSE_PORT"]
         );
         assert!(!spec.env_remove.iter().any(|k| k == "CLAUDE_CODE_GIT_BASH_PATH" || k == "CLAUDE_CODE_USE_BEDROCK" || k == "PATH"));
+    }
+
+    /// AgentBoard started from a psmux (tmux) shell: its panes are ConPTY terminals, not tmux
+    /// panes, so no pane — plain or role — may inherit the tmux/psmux markers (Claude Code would
+    /// warn "tmux focus-events off" and switch its keyboard protocol). Nothing else is dropped.
+    #[test]
+    fn spawn_env_drops_tmux_and_psmux_vars() {
+        let fx = fixture();
+        let run = tempfile::tempdir().unwrap();
+        let parent: Vec<String> = ["PATH", "TMUX", "TMUX_PANE", "PSMUX_SESSION", "PSMUX_TARGET_SESSION", "psmux_other",
+            "CLAUDE_CODE_GIT_BASH_PATH", "TMUXINATOR_CONFIG", "MY_PSMUX_NOTE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:1", token: "t", run_dir: run.path(), parent_env: &parent };
+        let mut p = pane("tool", fx.root.path().to_path_buf());
+        let plain = plan_spawn(&p, &fx.loaded, &launch).unwrap();
+        p.role = Some(Role::Manager);
+        p.session_name = Some("billing".into());
+        let role = plan_spawn(&p, &fx.loaded, &launch).unwrap();
+        for (kind, spec) in [("plain", &plain), ("role", &role)] {
+            for k in ["TMUX", "TMUX_PANE", "PSMUX_SESSION", "PSMUX_TARGET_SESSION", "psmux_other"] {
+                assert!(spec.env_remove.iter().any(|r| r == k), "{kind} pane inherits {k}: {:?}", spec.env_remove);
+            }
+            for k in ["PATH", "CLAUDE_CODE_GIT_BASH_PATH", "TMUXINATOR_CONFIG", "MY_PSMUX_NOTE"] {
+                assert!(!spec.env_remove.iter().any(|r| r == k), "{kind} pane loses {k}: {:?}", spec.env_remove);
+            }
+        }
     }
 
     #[test]
