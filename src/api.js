@@ -220,6 +220,20 @@ export function docImage(doc, src) {
   return invoke('doc_image', { doc, src });
 }
 
+// ---------------------------------------------------------------- memo (next to the dispatcher)
+
+/** `{path, text}` of workspaceRoot/MEMO.md (created from the default header when missing); `path`
+ * is root-relative ("MEMO.md") for docWatch. An external change is backed up by the backend. */
+export function memoRead() {
+  return invoke('memo_read');
+}
+
+/** Write the whole MEMO.md `text` (header + body, joined by memo-logic.js); the previous content
+ * goes to `.agentboard/memo.bak` first. */
+export function memoSave(text) {
+  return invoke('memo_save', { text });
+}
+
 // ---------------------------------------------------------------- startup / environment (Task 12)
 
 /** Environment check items (cached; null until the first check after start finished). */

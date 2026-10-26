@@ -77,3 +77,309 @@ test('memo key map: e/r in read, Ctrl+Enter/Esc in edit, IME and modifiers ignor
   assert.equal(memoKeyAction(key('Enter', { ctrlKey: true, altKey: true }), 'edit'), null);
   assert.equal(memoKeyAction(null, 'read'), null);
 });
+
+// ---------------------------------------------------------------- MF2: the applet (fake DOM)
+import { mountMemo, configureMemo } from '../../src/memo.js';
+
+/** Minimal DOM for the applet: elements keep children/text/value; focus sets activeElement. */
+function fakeDocument() {
+  const doc = { activeElement: null, body: null };
+  const textNode = (t) => ({ tagName: '#text', children: [], textContent: String(t), contains: () => false });
+  const mk = (tag) => {
+    const classes = new Set();
+    const el = {
+      tagName: String(tag).toUpperCase(),
+      children: [],
+      parent: null,
+      dataset: {},
+      attrs: {},
+      listeners: {},
+      _text: '',
+      value: '',
+      scrollTop: 0,
+      scrollHeight: 1000,
+      selection: null,
+      classList: {
+        add: (...c) => c.forEach((x) => classes.add(x)),
+        remove: (...c) => c.forEach((x) => classes.delete(x)),
+        toggle: (c, on) => ((on === undefined ? !classes.has(c) : on) ? classes.add(c) : classes.delete(c)),
+        contains: (c) => classes.has(c),
+      },
+      get className() {
+        return [...classes].join(' ');
+      },
+      set className(v) {
+        classes.clear();
+        String(v).split(/\s+/).filter(Boolean).forEach((c) => classes.add(c));
+      },
+      set textContent(v) {
+        this._text = String(v);
+        this.children = [];
+      },
+      get textContent() {
+        return this._text + this.children.map((c) => c.textContent).join('');
+      },
+      set innerHTML(_) {
+        throw new Error('innerHTML used');
+      },
+      append(...c) {
+        c.forEach((x) => this.appendChild(typeof x === 'string' ? textNode(x) : x));
+      },
+      appendChild(c) {
+        c.parent = this;
+        this.children.push(c);
+        return c;
+      },
+      replaceChildren(...c) {
+        this.children = [];
+        this.append(...c);
+      },
+      setAttribute(k, v) {
+        this.attrs[k] = String(v);
+      },
+      getAttribute(k) {
+        return this.attrs[k] ?? null;
+      },
+      addEventListener(t, f) {
+        (this.listeners[t] ||= []).push(f);
+      },
+      removeEventListener(t, f) {
+        this.listeners[t] = (this.listeners[t] || []).filter((x) => x !== f);
+      },
+      contains(n) {
+        return n === this || this.children.some((c) => c.contains && c.contains(n));
+      },
+      closest() {
+        return null;
+      },
+      focus() {
+        doc.activeElement = this;
+      },
+      remove() {
+        if (this.parent) this.parent.children = this.parent.children.filter((c) => c !== this);
+      },
+      scrollBy(_x, y) {
+        this.scrollTop += y;
+      },
+      setSelectionRange(a, b) {
+        this.selection = [a, b];
+      },
+    };
+    return el;
+  };
+  doc.createElement = mk;
+  doc.createTextNode = textNode;
+  doc.body = mk('body');
+  return doc;
+}
+
+const tree = (el) => [el, ...(el.children || []).flatMap(tree)];
+const byClass = (root, c) => tree(root).find((e) => e.classList && e.classList.contains(c));
+const settle = async () => {
+  for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+};
+
+const HEADER = '# 메모 — 사용자가 고른 오늘 할 일\n\n작성 기준 (이 부분은 메모 창에 보이지 않는다)\n- 한 줄에 하나\n\n## 메모\n';
+const BODY = '- 결제 오류 회신 확인 — billing\n- 주간 보고 초안\n';
+
+/** Fake Tauri: memo_read / memo_save over an in-memory MEMO.md, doc-changed listeners. */
+function setup(text, { answer = true } = {}) {
+  const t = { text, calls: [], listeners: {}, rendered: [], confirms: [], toasts: [], answer };
+  globalThis.document = fakeDocument();
+  globalThis.__TAURI__ = {
+    core: {
+      invoke: async (cmd, args) => {
+        t.calls.push([cmd, args]);
+        if (cmd === 'memo_read') return { path: 'MEMO.md', text: t.text };
+        if (cmd === 'memo_save') t.text = args.text;
+        return null;
+      },
+    },
+    event: {
+      listen: async (ev, cb) => {
+        (t.listeners[ev] ||= []).push(cb);
+        return () => {
+          t.listeners[ev] = t.listeners[ev].filter((x) => x !== cb);
+        };
+      },
+    },
+  };
+  t.emit = (ev, payload) => (t.listeners[ev] || []).forEach((cb) => cb({ payload }));
+  t.cmds = (name) => t.calls.filter((c) => c[0] === name);
+  configureMemo({
+    render: async (body) => {
+      t.rendered.push(body);
+      const d = document.createElement('div');
+      d.textContent = body;
+      return { frag: d, images: [] };
+    },
+    loadImages: () => {},
+    confirm: async (msg, opts) => {
+      t.confirms.push([msg, opts]);
+      return t.answer;
+    },
+    toast: (m) => t.toasts.push(String(m)),
+  });
+  return t;
+}
+
+function teardown() {
+  delete globalThis.document;
+  delete globalThis.__TAURI__;
+}
+
+/** keydown at `target`, delivered to the root's listeners (bubble phase, like the browser). */
+const press = (target, code, mods = {}) => {
+  const ev = { code, target, ctrlKey: false, altKey: false, shiftKey: false, metaKey: false, isComposing: false, repeat: false, defaultPrevented: false, ...mods };
+  ev.preventDefault = () => {
+    ev.defaultPrevented = true;
+  };
+  ev.stopPropagation = () => {};
+  let root = target;
+  while (root.parent) root = root.parent;
+  for (const f of root.listeners.keydown || []) f(ev);
+  return ev;
+};
+
+test('memo view shows only the body', async () => {
+  const t = setup(HEADER + BODY);
+  const m = mountMemo('p-memo');
+  await settle();
+  assert.equal(t.rendered.at(-1), BODY);
+  assert.ok(!m.el.textContent.includes('작성 기준'), 'header text is not shown');
+  assert.ok(m.el.textContent.includes('결제 오류 회신 확인'));
+  assert.deepEqual(t.cmds('doc_watch'), [['doc_watch', { paneId: 'p-memo', path: 'MEMO.md' }]]);
+  assert.equal(byClass(m.el, 'memo-warn').classList.contains('hidden'), true);
+  m.dispose();
+  teardown();
+});
+
+test('memo edit saves header + edited body', async () => {
+  const t = setup(HEADER + BODY);
+  const m = mountMemo('p-memo');
+  await settle();
+  press(m.el, 'KeyE');
+  const ed = byClass(m.el, 'memo-edit');
+  assert.ok(ed && ed.tagName === 'TEXTAREA', 'editor shown');
+  assert.equal(ed.value, BODY);
+  assert.equal(document.activeElement, ed);
+  assert.deepEqual(ed.selection, [BODY.length, BODY.length]); // cursor at the end
+  ed.value = `${BODY}- 새 일\n`;
+  const ev = press(ed, 'Enter', { ctrlKey: true });
+  assert.equal(ev.defaultPrevented, true);
+  await settle();
+  assert.deepEqual(t.cmds('memo_save'), [['memo_save', { text: `${HEADER}${BODY}- 새 일\n` }]]);
+  assert.equal(t.text, `${HEADER}${BODY}- 새 일\n`);
+  assert.equal(byClass(m.el, 'memo-edit'), undefined, 'back to the read view');
+  assert.equal(t.rendered.at(-1), `${BODY}- 새 일\n`);
+  // typing keys inside the editor are not swallowed
+  press(m.el, 'KeyE');
+  const typed = press(byClass(m.el, 'memo-edit'), 'KeyJ');
+  assert.equal(typed.defaultPrevented, false);
+  m.dispose();
+  teardown();
+});
+
+test('memo esc with changes asks Y/N, Enter ignored', async () => {
+  const t = setup(HEADER + BODY, { answer: false });
+  const m = mountMemo('p-memo');
+  await settle();
+  // no changes: Esc leaves without asking
+  press(m.el, 'KeyE');
+  press(byClass(m.el, 'memo-edit'), 'Escape');
+  await settle();
+  assert.equal(t.confirms.length, 0);
+  assert.equal(byClass(m.el, 'memo-edit'), undefined);
+  // changed draft: Y/N (Enter does not answer); N keeps editing with the draft
+  press(m.el, 'KeyE');
+  const ed = byClass(m.el, 'memo-edit');
+  ed.value = '- 바뀐 초안\n';
+  press(ed, 'Escape');
+  await settle();
+  assert.equal(t.confirms.length, 1);
+  assert.deepEqual(t.confirms[0][1], { enterYes: false });
+  assert.equal(byClass(m.el, 'memo-edit'), ed, 'still editing');
+  assert.equal(ed.value, '- 바뀐 초안\n');
+  // Y discards: read view of the file as it is, nothing saved
+  t.answer = true;
+  press(ed, 'Escape');
+  await settle();
+  assert.equal(byClass(m.el, 'memo-edit'), undefined);
+  assert.equal(t.cmds('memo_save').length, 0);
+  assert.equal(t.rendered.at(-1), BODY);
+  m.dispose();
+  teardown();
+});
+
+test('memo external change while editing shows a notice and keeps the draft', async () => {
+  const t = setup(HEADER + BODY);
+  const m = mountMemo('p-memo');
+  await settle();
+  // read view: an external change re-renders; another pane's event is ignored
+  t.text = `${HEADER}- dispatcher가 고친 줄\n`;
+  t.emit('doc-changed', { paneId: 'other' });
+  await settle();
+  assert.equal(t.rendered.at(-1), BODY);
+  t.emit('doc-changed', { paneId: 'p-memo' });
+  await settle();
+  assert.equal(t.rendered.at(-1), '- dispatcher가 고친 줄\n');
+  // edit view: notice only, the draft stays
+  press(m.el, 'KeyE');
+  const ed = byClass(m.el, 'memo-edit');
+  ed.value = '- 내 초안\n';
+  const notice = byClass(m.el, 'memo-notice');
+  assert.equal(notice.classList.contains('hidden'), true);
+  t.text = `${HEADER}- 또 바뀜\n`;
+  t.emit('doc-changed', { paneId: 'p-memo' });
+  await settle();
+  assert.equal(notice.classList.contains('hidden'), false);
+  assert.equal(notice.textContent, '외부에서 바뀜 — 저장하면 덮어씀(Esc: 취소하고 다시 읽기)');
+  assert.equal(byClass(m.el, 'memo-edit'), ed);
+  assert.equal(ed.value, '- 내 초안\n');
+  // saving overwrites (last writer wins) with the header the user edited against
+  press(ed, 'Enter', { ctrlKey: true });
+  await settle();
+  assert.equal(t.text, `${HEADER}- 내 초안\n`);
+  assert.equal(notice.classList.contains('hidden'), true);
+  m.dispose();
+  teardown();
+});
+
+test('memo without marker shows a warning', async () => {
+  const t = setup('- 헤딩 없는 메모\n');
+  const m = mountMemo('p-memo');
+  await settle();
+  const warn = byClass(m.el, 'memo-warn');
+  assert.equal(warn.classList.contains('hidden'), false);
+  assert.ok(warn.textContent.includes('구분 헤딩(## 메모) 없음'));
+  assert.equal(t.rendered.at(-1), '- 헤딩 없는 메모\n');
+  // the whole file is edited and saved
+  press(m.el, 'KeyE');
+  const ed = byClass(m.el, 'memo-edit');
+  assert.equal(ed.value, '- 헤딩 없는 메모\n');
+  ed.value = '- 고침\n';
+  press(ed, 'Enter', { ctrlKey: true });
+  await settle();
+  assert.equal(t.text, '- 고침\n');
+  m.dispose();
+  teardown();
+});
+
+test('memo keeps CRLF on save and unwatches on dispose', async () => {
+  const t = setup('# h\r\n## 메모\r\n- a\r\n');
+  const m = mountMemo('p-memo');
+  await settle();
+  press(m.el, 'KeyE');
+  const ed = byClass(m.el, 'memo-edit');
+  ed.value = '- a\n- b\n'; // textarea values are LF-only
+  press(ed, 'Enter', { ctrlKey: true });
+  await settle();
+  assert.equal(t.text, '# h\r\n## 메모\r\n- a\r\n- b\r\n');
+  m.dispose();
+  assert.deepEqual(t.cmds('doc_unwatch'), [['doc_unwatch', { paneId: 'p-memo' }]]);
+  const reads = t.cmds('memo_read').length;
+  t.emit('doc-changed', { paneId: 'p-memo' });
+  await settle();
+  assert.equal(t.cmds('memo_read').length, reads, 'no reads after dispose');
+  teardown();
+});

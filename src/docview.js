@@ -164,8 +164,9 @@ function altSpan(img) {
  * table of contents (`{id → heading element}` in `anchors`) and the images to load: every
  * `<img>` loses its `src` in the first pass (no request is ever made for a document-written
  * URL); a relative path inside the root is kept for `doc_image`, anything else becomes text.
+ * Also used by the memo applet (memo.js) for MEMO.md's body.
  */
-async function renderMarkdown(text, rel, paneId) {
+export async function renderMarkdown(text, rel, paneId) {
   const { marked, purify, renderMath } = await engine();
   autoBudget = AUTO_HIGHLIGHT_BUDGET;
   const html = prefilterHtml(marked.parse(String(text)));
@@ -219,7 +220,7 @@ async function renderMarkdown(text, rel, paneId) {
 }
 
 /** Load the document's images through `doc_image` (data: URLs); failures become alt text. */
-function loadImages(rel, images, alive) {
+export function loadImages(rel, images, alive) {
   for (const { img, src } of images) {
     api.docImage(rel, src).then(
       (url) => {
