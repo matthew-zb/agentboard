@@ -1,0 +1,3 @@
+# Product defaults are embedded with include_str! — keep them LF on every checkout
+# (a Windows checkout with core.autocrlf=true turned MEMO.md defaults into CRLF).
+src-tauri/defaults/** text eol=lf
