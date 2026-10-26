@@ -4,6 +4,8 @@
 
 권장 순서: 준비 한 번(`npx tauri dev`, 또는 릴리스 설치본) → 아래 순서대로.
 
+**10-26 자동 판정(1단계 91개):** 기존 테스트가 덮음 27 · 이번에 테스트를 추가해 덮음 14 → **통과(자동) 41**, 사람이 봐야 하는 것(실제 키 전달·IME·WebView2 렌더·드래그·경고음·성능·작업 관리자) **보류(형님 실시) 50**. 항목마다 바로 아래 `실시 결과 10-26` 줄에 근거 테스트가 있다. 체크박스는 형님 확인 몫이라 그대로 두었다. JS 테스트는 이번에 실행했고(전부 통과), Rust 근거는 기존 통과 기록이다(이번에 다시 돌리지 않음). 단축키별 키→명령은 자동으로 확인됐으므로, 실제 키보드 확인은 아래 "QA 결과" 1~3에서 한 번에 하면 된다.
+
 | # | 절 | 내용 | 비고 |
 |---|---|---|---|
 | 1 | 기본 동작 확인 (Step 2) | 입력·`dir`·한글 폭·리사이즈 | Task 3 |
@@ -35,16 +37,24 @@
 
 ## 기본 동작 확인 (Step 2)
 - [ ] 사용자 확인 필요 — PowerShell 프롬프트에 입력이 된다.
+  - 실시 결과 10-26 | 보류(형님 실시) | PTY 쓰기·읽기는 src-tauri/tests/pty.rs:155·:83이 덮는다. 남은 확인: 앱 창 xterm에서 실제 입력
 - [ ] 사용자 확인 필요 — `dir` 출력이 어긋나지 않는다.
+  - 실시 결과 10-26 | 보류(형님 실시) | xterm 렌더링(열 맞춤)은 화면에서만 볼 수 있다
 - [ ] 사용자 확인 필요 — `echo 한글테스트`가 올바른 폭(글자 겹침/빈칸 없음)으로 표시된다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 한글 폭(unicode11) 렌더링은 화면에서만 볼 수 있다
 - [ ] 사용자 확인 필요 — 창 크기를 바꾸면 프롬프트 줄바꿈 폭이 따라간다(`$Host.UI.RawUI.WindowSize`로 열·행 확인).
+  - 실시 결과 10-26 | 보류(형님 실시) | 실제 창 크기·FitAddon·ConPTY. 논리는 tests/js/render.test.mjs:116(sizeChanged)
 
 ## S3 — ConPTY + xterm.js에서 Claude Code TUI
 같은 창에서 `claude` 실행 후 확인.
 - [ ] 사용자 확인 필요 — 색, 커서 위치, 상자 문자(┌─┐│└┘)가 깨지지 않는다.
+  - 실시 결과 10-26 | 보류(형님 실시) | Claude Code TUI 렌더링
 - [ ] 사용자 확인 필요 — 창 리사이즈 시 TUI가 새 크기로 다시 그려진다.
+  - 실시 결과 10-26 | 보류(형님 실시) | TUI 다시 그리기
 - [ ] 사용자 확인 필요 — 한글 입력(IME 조합 중 글자가 커서 위치에 보이고 확정 시 입력됨).
+  - 실시 결과 10-26 | 보류(형님 실시) | 실제 IME 조합
 - [ ] 사용자 확인 필요 — `Ctrl+V`로 이미지 붙여넣기 시 이미지 칩이 나타난다(클립보드에 이미지 복사 후).
+  - 실시 결과 10-26 | 보류(형님 실시) | 클립보드 이미지·Claude 이미지 칩
 
 기대 결과: 위 4개 모두 통과.
 실패 시 대안(스펙 §10 S3): `pane.js`의 unicode11 addon 설정 조정, ConPTY 플래그 조정.
@@ -53,10 +63,15 @@
 ## S2 — WebView2 브라우저 단축키 비활성화
 `src-tauri/src/webview.rs`가 적용된 상태에서 `claude` 창에서 확인.
 - [ ] 사용자 확인 필요 — `Ctrl+R`: 페이지 새로고침이 아니라 Claude 기록 검색이 열린다.
+  - 실시 결과 10-26 | 보류(형님 실시) | WebView2 가속키(webview.rs, 자동 테스트 없음)
 - [ ] 사용자 확인 필요 — `Ctrl+P`: 인쇄 대화가 뜨지 않는다.
+  - 실시 결과 10-26 | 보류(형님 실시) | WebView2 가속키
 - [ ] 사용자 확인 필요 — `F5`: 새로고침되지 않는다(화면·세션 유지).
+  - 실시 결과 10-26 | 보류(형님 실시) | WebView2 가속키
 - [ ] 사용자 확인 필요 — 릴리스 빌드: 우클릭 시 기본 컨텍스트 메뉴가 뜨지 않는다. 디버그 빌드(`tauri dev`)에서는 의도적으로 메뉴를 남겨 우클릭 > "Inspect"로 DevTools를 연다.
+  - 실시 결과 10-26 | 보류(형님 실시) | WebView2 컨텍스트 메뉴(릴리스 빌드)
 - [ ] 사용자 확인 필요 — 디버그 빌드: F12는 가속키라 동작하지 않을 수 있다. `AGENTBOARD_DEVTOOLS=1`로 실행하면(PowerShell: `$env:AGENTBOARD_DEVTOOLS='1'; npx tauri dev`) DevTools 창이 시작 시 열리는지 확인. Ctrl+R/F5는 디버그에서도 막혀 있어야 한다.
+  - 실시 결과 10-26 | 보류(형님 실시) | DevTools 창
 
 DevTools 정책(R9): 가속키 비활성화는 디버그·릴리스 공통. 컨텍스트 메뉴 비활성화는 릴리스만. 디버그 전용 `AGENTBOARD_DEVTOOLS=1`이 DevTools를 연다.
 
@@ -67,9 +82,12 @@ DevTools 정책(R9): 가속키 비활성화는 디버그·릴리스 공통. 컨�
 ## S1 — Alt 키 처리
 Task 11에서 `src/app.js`의 임시 프로브(`Alt+H` `preventDefault`)를 제거했다. `Alt+H` 항목은 Task 12 키 라우터가 들어온 뒤 확인한다.
 - [ ] 사용자 확인 필요 — `Alt`만 눌렀다 뗐을 때 xterm 포커스가 유지된다(이후 바로 타이핑됨).
+  - 실시 결과 10-26 | 보류(형님 실시) | WebView2·Windows의 Alt 처리. keyup 막기는 tests/js/router.test.mjs "a lone Alt keyup…"(신규)이 확인
 - [ ] 사용자 확인 필요 — `Alt`만 눌렀다 뗐을 때 경고음이 나지 않는다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 경고음은 실제 키·소리로만 확인된다
 - `Alt+h` 경고음은 프로브가 아니라 실제 단축키(창 포커스 왼쪽)로 Task 12 Step 5에서 확인한다(그 절의 "S1:" 항목).
 - [ ] 사용자 확인 필요 — 그 외 `Alt+글자`(예: `Alt+J`)에서 경고음 여부 기록.
+  - 실시 결과 10-26 | 보류(형님 실시) | 경고음은 실제 키·소리로만 확인된다
 
 기대 결과: 포커스 유지, 경고음 없음.
 실패 시 대안(스펙 §10 S1, 순서대로): (1) keyup의 Alt에 `preventDefault` 적용, (2) 그래도 안 되면 Rust 서브클래싱으로 `WM_SYSKEYDOWN/WM_SYSCHAR` 처리.
@@ -79,6 +97,7 @@ Task 11에서 `src/app.js`의 임시 프로브(`Alt+H` `preventDefault`)를 제�
 자동 확인: `cargo test`(launcher 단위 테스트), `npx tauri dev` 실행 시 콘솔의 시작 요약 줄
 `[agentboard] startup: tabs=… panes=… running=… failed=… config_errors=…`과 패닉 없음.
 - [ ] 사용자 확인 필요 — `$env:AGENTBOARD_DEVTOOLS='1'; npx tauri dev`로 실행하고 DevTools 콘솔에서
+  - 실시 결과 10-26 | 통과(자동) | src-tauri/src/workspace.rs:1828 from_config_creates_dispatcher_and_tabs(dispatcher + config 탭), src-tauri/src/launcher.rs:1435 execute_returns_emitted_snapshot, src-tauri/tests/pty.rs:83(창 프로세스 실행·상태). DevTools 호출 자체는 하지 않았다
   `await window.__TAURI__.core.invoke('ws_snapshot')`를 호출한다. `workspace.tabs`에 dispatcher 탭과
   config.json의 탭이 보이고, `workspace.panes[*].status.state`가 `running`이면 통과.
 - 실제 화면(탭·분할·포커스) 확인은 Task 11 Step 2에서 한다.
@@ -145,20 +164,28 @@ Task 11에서 `src/app.js`의 임시 프로브(`Alt+H` `preventDefault`)를 제�
 
 ### Step 2 — 화면 확인
 - [ ] 사용자 확인 필요 — `team` 탭에서 3분할(lead 60% | coder/tests 상하)이 보인다. 각 창 헤더에 이름·프로필·상태 기호(● 실행)가 표시되고, 포커스 창은 파란 테두리로 강조된다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 화면(3분할·헤더·파란 테두리). 상태 기호 논리는 tests/js/render.test.mjs:55
 - [ ] 사용자 확인 필요 — 다음 순서로 확인한다:
   1. 각 창에 글자를 출력한다.
   2. 탭 바에서 `dispatcher`를 클릭한다.
   3. 다시 `team`을 클릭한다.
 
   출력이 그대로 남아 있으면 통과다. 터미널이 재생성되면(화면이 지워지거나 스크롤백이 사라지면) 실패다.
+  - 실시 결과 10-26 | 보류(형님 실시) | xterm DOM 재사용은 화면. 논리는 tests/js/render.test.mjs:111(staleIds)
 - [ ] 사용자 확인 필요 — 창을 클릭하면 테두리와 상태 표시줄(`그룹 › 탭 › 창`)이 바뀌고, 바로 입력할 수 있다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 클릭·DOM 포커스. 경로 문구는 tests/js/render.test.mjs:211(statusParts)
 - [ ] 사용자 확인 필요 — 창 경계를 끌어 크기를 바꾼다. 놓은 뒤에도 크기가 유지되고, TUI가 새 크기로 다시 그려진다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 마우스 드래그·TUI 다시 그리기. 비율 계산은 tests/js/render.test.mjs:38(dragSizes)
 - [ ] 사용자 확인 필요 — `tests`(powershell)에서 `exit`를 입력한다:
   1. 헤더가 `○ 0`으로 바뀌고, 창 아래에 "Enter: 재시작" 줄이 보인다.
   2. Enter를 누르면 ◌ → ●로 바뀌고 새 프롬프트가 나온다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 실제 프로세스 종료·Enter. 논리는 tests/js/render.test.mjs:55(`○ 0`)·:78·:91(재시작 attach), src-tauri/src/workspace.rs:2068
 - [ ] 사용자 확인 필요 — 헤더 ⟳는 창을 재시작하고, ✕는 창을 닫는다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 헤더 버튼 클릭. 버튼 구성은 tests/js/render.test.mjs:326
 - [ ] 사용자 확인 필요 — 창 크기를 바꾸면 모든 보이는 창의 줄바꿈 폭이 따라간다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 실제 창 크기 변경·FitAddon
 - [ ] 사용자 확인 필요 — 콘솔 오류가 없는지 DevTools 콘솔에서 확인한다(`$env:AGENTBOARD_DEVTOOLS='1'; npx tauri dev`).
+  - 실시 결과 10-26 | 보류(형님 실시) | DevTools 콘솔
 
 결과: (미기록)
 
@@ -185,6 +212,8 @@ Task 11에서 `src/app.js`의 임시 프로브(`Alt+H` `preventDefault`)를 제�
 | WebGL 컨텍스트 손실 여부 | (미기록) |
 | 적용한 완화책 | (미기록) |
 
+- 실시 결과 10-26 | 보류(형님 실시) | Claude 9개 동시 실행 성능(CPU·지연·WebGL)은 실제 앱에서만 잰다
+
 ## Task 12 — 키 라우터 · 방향 이동 · 포커스 + 스파이크 S5 (사용자 확인 필요)
 
 자동 확인:
@@ -207,28 +236,47 @@ Task 11에서 `src/app.js`의 임시 프로브(`Alt+H` `preventDefault`)를 제�
 ### Step 5 — 수동 확인 (마우스 사용 금지)
 창:
 - [ ] 사용자 확인 필요 — `Alt+h/j/k/l`로 창 포커스가 이동하고, 그룹 경계도 넘어간다. 포커스 테두리와 상태 표시줄 경로가 따라온다.
+  - 실시 결과 10-26 | 통과(자동, 이번에 테스트 추가) | 키→명령 tests/js/keys.test.mjs "every checklist shortcut resolves…"(신규), 계획 tests/js/commands.test.mjs:49, 이웃 tests/js/geometry.test.mjs:7. 실제 키보드로 누르는 확인은 QA #1
 - [ ] 사용자 확인 필요 — 이동한 창에서 바로 타이핑된다(DOM 포커스).
+  - 실시 결과 10-26 | 보류(형님 실시) | WebView2의 DOM 포커스 이동. 포커스 요청 논리는 tests/js/focus.test.mjs:51
 - [ ] 사용자 확인 필요 — `Alt+\`는 좌우 분할, `Alt+-`는 상하 분할이다. 새 창이 시작된다.
+  - 실시 결과 10-26 | 통과(자동, 이번에 테스트 추가) | 키→명령 tests/js/keys.test.mjs "every checklist shortcut resolves…"(신규), tests/js/commands.test.mjs:84, src-tauri/src/workspace.rs:1941. 실제 키보드로 누르는 확인은 QA #1
 - [ ] 사용자 확인 필요 — `Alt+x`는 창을 닫는다. `Alt+z`는 최대화를 토글한다. `Alt+r`은 재시작(◌ → ●)이다.
+  - 실시 결과 10-26 | 통과(자동, 이번에 테스트 추가) | 키→명령 tests/js/keys.test.mjs "every checklist shortcut resolves…"(신규), tests/js/commands.test.mjs:84, src-tauri/src/workspace.rs:1965·:2461·:2068, tests/js/render.test.mjs:78. 실제 키보드로 누르는 확인은 QA #1
 - [ ] 사용자 확인 필요 — `Alt+Shift+H/J/K/L`은 경계를 그 방향으로 5%씩 옮긴다(tmux식: 해당 방향 경계가 있으면 늘리고, 없으면 반대쪽 경계를 당겨 줄인다). 탭 안에 그 축의 경계가 없으면 그룹 경계가 움직인다. 누르고 있으면 반복된다.
+  - 실시 결과 10-26 | 통과(자동, 이번에 테스트 추가) | 키→명령 tests/js/keys.test.mjs "every checklist shortcut resolves…"(신규), 반복은 tests/js/router.test.mjs "a held movement / resize key repeats…"(신규), tests/js/commands.test.mjs:109, src-tauri/src/workspace.rs:2319. 실제 키보드로 누르는 확인은 QA #1
 
 탭·그룹:
 - [ ] 사용자 확인 필요 — `Ctrl+Alt+h/l`은 그룹 안에서 이전·다음 탭으로 간다(양 끝에서 순환).
+  - 실시 결과 10-26 | 통과(자동, 이번에 테스트 추가) | 키→명령 tests/js/keys.test.mjs "every checklist shortcut resolves…"(신규), tests/js/commands.test.mjs:59. 실제 키보드로 누르는 확인은 QA #1
 - [ ] 사용자 확인 필요 — `Ctrl+Alt+j`는 직전 위치로 왕복한다. `Ctrl+Alt+k`는 Dispatcher 탭으로 간다.
+  - 실시 결과 10-26 | 통과(자동, 이번에 테스트 추가) | 키→명령 tests/js/keys.test.mjs "every checklist shortcut resolves…"(신규), tests/js/commands.test.mjs:59. 실제 키보드로 누르는 확인은 QA #1
 - [ ] 사용자 확인 필요 — `Alt+1..9`는 N번째 탭, `Ctrl+Alt+1..9`는 N번째 그룹으로 간다. 전환 뒤 포커스 창 테두리가 300ms 동안 한 번 강조된다.
+  - 실시 결과 10-26 | 통과(자동, 이번에 테스트 추가) | 키→명령 tests/js/keys.test.mjs "every checklist shortcut resolves…"(신규), tests/js/commands.test.mjs:59·:72. 300ms 테두리 강조는 화면(QA #1)
 - [ ] 사용자 확인 필요 — `Ctrl+Alt+\`(`Ctrl+Alt+-`)는 현재 탭을 오른쪽(아래) 새 그룹으로 옮긴다.
+  - 실시 결과 10-26 | 통과(자동, 이번에 테스트 추가) | 키→명령 tests/js/keys.test.mjs "every checklist shortcut resolves…"(신규), tests/js/commands.test.mjs:95, src-tauri/src/workspace.rs:2667. 실제 키보드로 누르는 확인은 QA #1
 - [ ] 사용자 확인 필요 — `Ctrl+Alt+Shift+H/L`은 탭 순서를 바꾼다. 탭 바 끝에서는 옆 그룹으로 넘어간다(왼쪽 그룹이면 끝, 오른쪽 그룹이면 맨 앞).
+  - 실시 결과 10-26 | 통과(자동, 이번에 테스트 추가) | 키→명령 tests/js/keys.test.mjs "every checklist shortcut resolves…"(신규), tests/js/commands.test.mjs:126, src-tauri/src/workspace.rs:2584·:2627. 실제 키보드로 누르는 확인은 QA #1
 - [ ] 사용자 확인 필요 — `Ctrl+Alt+Shift+J/K`는 아래·위 그룹으로 탭을 보낸다.
+  - 실시 결과 10-26 | 통과(자동, 이번에 테스트 추가) | 키→명령 tests/js/keys.test.mjs "every checklist shortcut resolves…"(신규), tests/js/commands.test.mjs:141. 실제 키보드로 누르는 확인은 QA #1
 - [ ] 사용자 확인 필요 — `Ctrl+Alt+x`는 그룹을 닫는다(형제 그룹과 합침). `Ctrl+Alt+z`는 그룹 최대화를 토글한다.
+  - 실시 결과 10-26 | 통과(자동, 이번에 테스트 추가) | 키→명령 tests/js/keys.test.mjs "every checklist shortcut resolves…"(신규), tests/js/commands.test.mjs:95, src-tauri/src/workspace.rs:2779. 실제 키보드로 누르는 확인은 QA #1
 - [ ] 사용자 확인 필요 — `Alt+q`, `Alt+a`, `Alt+c`, `Alt+i`, `Alt+n`, `Ctrl+Alt+m`, `Ctrl+Alt+g`, `Alt+;`, `Ctrl+Shift+V`를 누르면 터미널에 글자가 들어가지 않고 각 기능(번호 선택·주의 창 이동·복사 모드·입력 동기화·새 탭·탭 보내기·그룹 합치기·팔레트·붙여넣기)이 실행된다(세부는 Task 13~15 절).
+  - 실시 결과 10-26 | 통과(자동, 이번에 테스트 추가) | 키→명령 tests/js/keys.test.mjs "every checklist shortcut resolves…"(신규)(핸들러 등록 포함), xterm으로 안 감은 tests/js/router.test.mjs "app shortcuts run their command…"(신규). 실제 키보드로 누르는 확인은 QA #1
 
 IME·전달:
 - [ ] 사용자 확인 필요 — 한글 IME를 켠 상태(한글 조합 중 포함)에서 위 키를 반복해도 같은 결과가 나온다. 조합 중이던 글자가 남거나 엉뚱한 창에 들어가지 않는다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 실제 IME. 조합 중 매칭은 tests/js/keys.test.mjs:17 + 키→명령 tests/js/keys.test.mjs "every checklist shortcut resolves…"(신규)
 - [ ] 사용자 확인 필요 — Claude 창에서 `Ctrl+R`, `Ctrl+P`, `Alt+P`, `Alt+V`, `Shift+Tab`이 Claude로 전달된다.
+  - 실시 결과 10-26 | 보류(형님 실시) | WebView2 가속키(S2)·Claude 동작. 이 키들이 터미널로 가는 것은 tests/js/router.test.mjs(신규)·tests/js/keys.test.mjs:90
 - [ ] 사용자 확인 필요 — S1: `Alt`만 눌렀다 떼도 포커스가 유지되고 경고음이 없다. `Alt+h`에서도 경고음이 없다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 경고음은 실제 키·소리로만 확인된다
 - [ ] 사용자 확인 필요 — 앱 창을 `Alt+Tab`으로 떠났다 돌아오면 같은 창에서 바로 타이핑된다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 앱 창 활성화(Alt+Tab)·DOM 포커스
 - [ ] 사용자 확인 필요 — 다른 창에서 벨(⚠)이 울려도 포커스가 옮겨지지 않는다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/focus.test.mjs:72(표시 조건), SetAttention은 포커스를 바꾸지 않음 src-tauri/src/workspace.rs:2372
 - [ ] 사용자 확인 필요 — (선택) 프로필 `passthroughKeys`에 `"Alt+h"`를 넣은 창에서는 `Alt+h`가 프로그램으로 전달된다. 예: powershell 프로필, PSReadLine.
+  - 실시 결과 10-26 | 통과(자동, 이번에 테스트 추가) | tests/js/router.test.mjs "passthroughKeys hand the chord…"(신규), tests/js/keys.test.mjs:79
 
 결과: (미기록)
 
@@ -252,6 +300,8 @@ IME·전달:
 | 경계가 매번 움직임? | (미기록) |
 | 대안 적용 여부 | (미기록) |
 
+- 실시 결과 10-26 | 보류(형님 실시) | Windows 입력 언어 전환(Alt+Shift)은 실제 키보드로만 확인된다
+
 ## Task 13 — 오버레이: 번호 선택 · 커맨드 팔레트 · 새 탭 마법사 · 확인 대화 · 오류 보기 (사용자 확인 필요)
 
 구현자는 앱 창을 직접 조작할 수 없으므로(R8) 아래 결과는 모두 **사용자 확인 필요**다. 구현 중에는 단위 테스트와 브라우저 모의 하네스(가짜 `__TAURI__`, 스크래치 폴더, 커밋 안 함)로만 확인했다.
@@ -264,16 +314,27 @@ IME·전달:
 
 ### Step 5 — 수동 확인 (마우스 사용 금지)
 - [ ] 사용자 확인 필요 — `Alt+n` → 목록에 없는 이름(예: `t13-test`) 입력 → Enter → "'t13-test' 디렉토리를 만들까요?"에서 `Y` → ② 역할에서 `일반` Enter → ③ 템플릿 목록(기본 템플릿이 맨 위, "기본값" 표시)에서 Enter → 현재 그룹에 새 탭이 생기고 포커스된다. `<workspaceRoot>/t13-test` 폴더가 생겼는지 확인한다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/overlay-logic.test.mjs:273·:475, src-tauri/src/workspace.rs:1903, 폴더 이름 검증 src-tauri/src/launcher.rs:1546. 폴더 생성 명령(lib.rs:394) 자체는 테스트가 없다. 화면 흐름은 QA #1
 - [ ] 사용자 확인 필요 — `Alt+n` → 이미 탭이 있는 폴더 이름 → ② `일반` → ③ 템플릿 Enter → 오류 토스트가 뜨고 ① 단계로 돌아온다. `Esc`로 취소한다. (`Manager`를 고르는 경우는 2단계 Task 12 #7에서 확인한다.)
+  - 실시 결과 10-26 | 통과(자동) | tests/js/overlay-logic.test.mjs:282, src-tauri/src/workspace.rs:1924
 - [ ] 사용자 확인 필요 — `Alt+q` → 보이는 창마다 큰 번호 → 숫자로 그 창에 포커스. 다시 `Alt+q` 후 `h/j/k/l`로 방향 이동. `Alt+q` 후 2초 동안 아무것도 누르지 않으면 번호가 사라진다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/overlay-logic.test.mjs:123(pickerKey)·:159(pickCommands)·:67(2초). 번호 표시는 화면
 - [ ] 사용자 확인 필요 — `Ctrl+Alt+m` + 숫자 → 현재 탭이 그 그룹 끝으로 이동한다. `Ctrl+Alt+m` + `\` → 오른쪽에 새 그룹이 생기고 탭이 옮겨진다(현재 그룹에 탭이 2개 이상일 때).
+  - 실시 결과 10-26 | 통과(자동) | tests/js/overlay-logic.test.mjs:168
 - [ ] 사용자 확인 필요 — `Ctrl+Alt+g` + 숫자(또는 `hjkl`) → 현재 그룹이 고른 그룹에 합쳐진다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/overlay-logic.test.mjs:182, src-tauri/src/workspace.rs:2743
 - [ ] 사용자 확인 필요 — `Alt+;` → `이름` 입력 → "탭 이름 바꾸기" Enter → 새 이름 입력 후 Enter → 탭 바와 상태 표시줄 이름이 바뀐다. 입력 중 `Alt+h`, `Ctrl+Alt+l`을 눌러도 포커스·탭이 바뀌지 않는다.
+  - 실시 결과 10-26 | 통과(자동, 이번에 테스트 추가) | tests/js/overlay-logic.test.mjs:198(팔레트 항목), 입력 중 단축키 무동작은 tests/js/router.test.mjs "while an overlay is open…"(신규), src-tauri/src/workspace.rs:2052
 - [ ] 사용자 확인 필요 — `Alt+;` → "현재 창을 새 탭으로 떼어내기" → 창이 새 탭으로 옮겨진다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/overlay-logic.test.mjs:198, src-tauri/src/workspace.rs:2343
 - [ ] 사용자 확인 필요 — `<workspaceRoot>/.agentboard/templates/bad.json`에 잘못된 JSON(예: `{"layout": }`)을 넣고 재시작 → 상태 표시줄 `[설정 오류 1]` → `Alt+;` → "설정 오류 보기" → `bad.json:줄:열 — 원인` 형식의 줄이 보인다. `Esc`로 닫는다.
+  - 실시 결과 10-26 | 통과(자동) | src-tauri/src/config.rs:1578 syntax_error_has_line_and_col, 오류 수 tests/js/render.test.mjs:211. 오류 보기 패널은 화면
 - [ ] 사용자 확인 필요 — 한글 IME를 켠 상태에서 팔레트에 한글을 입력하면 조합이 정상이고, `Alt+q` 번호 오버레이 중 `ㅗ`(h) 등을 눌러도 터미널에 글자가 들어가지 않는다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 실제 IME 조합(팔레트 입력·번호 오버레이)
 - [ ] 사용자 확인 필요 — 오버레이를 닫으면 키 입력이 원래 창으로 다시 간다.
+  - 실시 결과 10-26 | 보류(형님 실시) | DOM 포커스 복귀. 키가 앱으로 돌아오는 것은 tests/js/router.test.mjs(신규)·tests/js/modal.test.mjs:30
 - [ ] 사용자 확인 필요 — (시작 시 폴더 확인) `config.json` tabs에 존재하지 않는 `dir`을 가진 탭을 넣고 시작 → "'<dir>' 디렉토리가 없습니다. 만들까요?" → `Y`면 폴더가 생기고 그 탭의 창이 재시작되어 실행된다. `N`이면 창은 실패 상태로 남는다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/overlay-logic.test.mjs:321·:341·:357·:378, src-tauri/src/launcher.rs:1198
 
 결과: (미기록)
 
@@ -291,12 +352,19 @@ IME·전달:
 
 ### Step 5 — 수동 확인
 - [ ] 사용자 확인 필요 — `Alt+c` → `k`·`v`·`j`·`y` → "복사했습니다" 토스트, 복사 모드 종료 → 다른 창에서 `Ctrl+Shift+V`로 같은 텍스트가 붙는다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/copymode.test.mjs:22·:71(k k v j y → 텍스트), 클립보드 tests/js/api.test.mjs:32, pane.paste 핸들러 키→명령 tests/js/keys.test.mjs "every checklist shortcut resolves…"(신규). 토스트·실제 클립보드는 QA #1
 - [ ] 사용자 확인 필요 — `Alt+c` 후 `Alt+l`(다른 창) → 그 창에 타이핑하면 정상 입력, `Alt+h`로 돌아오면 복사 모드가 유지된다. 탭을 갔다 와도 유지된다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 창별 복사 모드 상태(copy-ui.js, DOM). 앱 단축키 통과는 tests/js/router.test.mjs(신규)
 - [ ] 사용자 확인 필요 — 복사 모드에서 `PageUp/PageDown`, `g`/`G`, 방향키가 동작하고 커서 줄이 보이도록 스크롤된다. 한글 IME를 켠 채 `ㅓ`(j) 등을 눌러도 이동만 하고 PTY에 글자가 가지 않는다.
+  - 실시 결과 10-26 | 보류(형님 실시) | IME 부분은 실제 IME. 이동·스크롤은 tests/js/copymode.test.mjs:28·:44·:50·:104·:123
 - [ ] 사용자 확인 필요 — `/` → 검색어 → Enter → 일치 위치로 이동·강조, `n`/`N`으로 다음/이전, 없으면 토스트. `/` 입력 중 `Esc` 후에도 복사 모드가 유지된다. `Esc`/`q`로 종료하면 강조가 사라진다.
+  - 실시 결과 10-26 | 보류(형님 실시) | xterm 검색(addon-search). 논리는 tests/js/copymode.test.mjs:77. 알려진 차이: 처음 / 와 n/N이 커서 줄을 건너뜀(phase1-followups.md:65)
 - [ ] 사용자 확인 필요 — `Alt+i` → `[SYNC]` 표시 → 타이핑하면 탭의 모든 실행 중 창에 입력되고 중복 입력이 없다. 종료된 창에는 전달되지 않는다. `Alt+i`로 해제.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/render.test.mjs:263·:269(syncTargets)·:291(fanoutIds)·:211([SYNC]), src-tauri/src/workspace.rs:2461
 - [ ] 사용자 확인 필요 — 동기화 중 `Ctrl+Shift+V` → 모든 창에 한 번씩만 붙는다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/render.test.mjs:291(bracketed paste 한 번씩)·:343
 - [ ] 사용자 확인 필요 — 동기화를 켠 채 한 창에서 `claude`를 시작하거나 창 사이를 오가도, 다른 창에 `^[[I`·`^[[O`·`;1R` 같은 글자가 찍히지 않는다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/render.test.mjs:343, tests/js/replies.test.mjs(실측 시퀀스)
 
 참고: 터미널이 스스로 보내는 응답(커서 위치·장치 속성·포커스 in/out·마우스 보고)은 동기화 중에도 원래 창에만 전달된다(R21). 이 응답은 `pty_write_raw`로 보내므로 사용자 입력으로 기록되지 않는다(야간 정리의 입력 유예에 들어가지 않음).
 
@@ -317,9 +385,13 @@ Claude Code에서 `/config` → 알림 채널(notification channel)을 terminal 
 
 ### Step 1 — 수동 확인
 - [ ] 사용자 확인 필요 — 비활성 탭의 창에서 `powershell -c "[console]::beep(); Write-Host \"`a\""`를 실행하거나 Claude 권한 프롬프트를 띄운다 → 헤더 ⚠와 탭 배지가 표시되고, 포커스는 그대로다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/focus.test.mjs:72·:78, tests/js/render.test.mjs:64·:218. 실제 BEL·권한 프롬프트는 QA #7
 - [ ] 사용자 확인 필요 — `Alt+a` → 그 창으로 이동하고 ⚠가 해제된다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/focus.test.mjs:110, src-tauri/src/workspace.rs:2423
 - [ ] 사용자 확인 필요 — 다시 `Alt+a` → 원래 위치로 돌아온다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/focus.test.mjs:110·:119
 - [ ] 사용자 확인 필요 — 앱 창이 다른 앱 뒤에 있을 때 벨 → ⚠ 표시, 창을 다시 활성화하면 ⚠ 해제.
+  - 실시 결과 10-26 | 보류(형님 실시) | 앱 창 활성화. 창이 포커스를 잃었을 때 표시는 tests/js/focus.test.mjs:72
 
 결과: (미기록)
 
@@ -336,18 +408,29 @@ Claude Code에서 `/config` → 알림 채널(notification channel)을 terminal 
 
 ### S6 — 터미널 위에서 드래그 이벤트가 오버레이로 들어오는가
 - [ ] 사용자 확인 필요 — 탭을 잡고 다른 그룹의 터미널 영역 위로 끌면 파란 미리보기 사각형이 나타난다(xterm이 이벤트를 삼키지 않음).
+  - 실시 결과 10-26 | 보류(형님 실시) | WebView2 위 실제 드래그 이벤트(S6)
 - [ ] 사용자 확인 필요 — 드래그 중 Esc / 창 밖에서 놓기 / Alt+Tab 후 `.drop-overlay`가 남지 않는다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 실제 드래그(Esc·창 밖·Alt+Tab)
 - [ ] 사용자 확인 필요 — 드래그가 아예 시작되지 않거나 오버레이가 이벤트를 받지 못하면(WebView2 문제) **대체안**: 탭에서 `mousedown`/`mousemove`/`mouseup`으로 직접 구현한다. 4px 이상 움직이면 드래그 시작, 고스트 요소를 따라다니게 하고, `document.elementFromPoint`로 오버레이/탭 바를 찾아 같은 `dropZone`/`tabBarDrop`/`bodyDrop`을 호출한다. 결과를 아래에 기록한다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 위 두 항목이 실패할 때의 대안 지시 — 확인 항목 아님
 
 ### Step 5 — 4가지 드롭 + 클릭
 - [ ] 사용자 확인 필요 — 드롭이 실제로 실행되는지(조용히 사라지지 않는지): 드래그 중 마우스를 멈췄다 움직이거나 다른 창을 잠깐 건드려도 오버레이가 유지되고, 놓으면 이동/분할이 실제로 일어난다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 실제 드래그. 끊김 판정 논리는 tests/js/dnd.test.mjs:62·:67
 - [ ] 사용자 확인 필요 — 같은 그룹 탭 바 안에서 순서 변경(왼쪽/오른쪽 이동, 제자리에 놓으면 아무 일도 없음).
+  - 실시 결과 10-26 | 통과(자동) | tests/js/dnd.test.mjs:7·:16·:22·:38, src-tauri/src/workspace.rs:2627
 - [ ] 사용자 확인 필요 — 다른 그룹 탭 바 위(탭의 앞/뒤, 빈 영역=끝)로 이동.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/dnd.test.mjs:30·:42, src-tauri/src/workspace.rs:2584·:2649
 - [ ] 사용자 확인 필요 — 다른 그룹 본문 중앙에 놓으면 그 그룹 탭 끝에 추가된다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/dnd.test.mjs:47, src-tauri/src/workspace.rs:2584
 - [ ] 사용자 확인 필요 — 그룹 본문 가장자리(왼/오/위/아래)에 놓으면 그 방향으로 새 그룹이 생긴다. 탭이 하나뿐인 자기 그룹의 가장자리에 놓으면 한글 오류 토스트.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/dnd.test.mjs:47·:57, tests/js/dropzone.test.mjs:7·:18, src-tauri/src/workspace.rs:2667·:2708(탭 하나뿐 → 오류)
 - [ ] 사용자 확인 필요 — 놓은 뒤 포커스가 옮긴 탭의 마지막 창으로 가고 바로 타이핑된다.
+  - 실시 결과 10-26 | 통과(자동) | src-tauri/src/workspace.rs:2584(옮긴 탭 활성·포커스 그룹). 입력 포커스(DOM)는 QA #6
 - [ ] 사용자 확인 필요 — Dispatcher 탭도 끌어서 옮길 수 있다.
+  - 실시 결과 10-26 | 통과(자동) | src-tauri/src/workspace.rs:2818 dispatcher_tab_can_move_groups
 - [ ] 사용자 확인 필요 — 탭 클릭이 정상(활성 탭 전환, 터미널 포커스 유지)이고, 더블클릭해도 아무 일도 일어나지 않는다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 탭 클릭·더블클릭(DOM)
 
 결과: (미기록)
 
@@ -361,10 +444,15 @@ Claude Code에서 `/config` → 알림 채널(notification channel)을 terminal 
 - 닫기 요청 시 이미 열려 있던 다른 오버레이는 닫힌다.
 
 - [ ] 사용자 확인 필요 — 실행 중인 창이 있는 상태에서 X → 확인 대화에 올바른 개수가 표시된다. `N` → 앱이 그대로 유지된다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/overlay-logic.test.mjs:395
 - [ ] 사용자 확인 필요 — 확인 대화에서 `Enter`(숫자패드 `Enter` 포함)를 눌러도 닫히지 않고 대화가 그대로 남는다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/overlay-logic.test.mjs:429·:445
 - [ ] 사용자 확인 필요 — 대화가 열린 상태에서 `Alt+F4`를 한 번 더 눌러도 대화가 하나만 유지된다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/overlay-logic.test.mjs:412
 - [ ] 사용자 확인 필요 — `Y` → 앱이 닫히고, 작업 관리자에 `claude`·`pwsh`(`powershell`) 프로세스가 남지 않는다.
+  - 실시 결과 10-26 | 보류(형님 실시) | 작업 관리자 확인. 자식 정리는 src-tauri/tests/pty.rs:249 job_kills_children_when_app_exits
 - [ ] 사용자 확인 필요 — 모든 창을 `Alt+x`로 닫거나 프로세스를 종료해 실행 중 0개인 상태에서 X → 묻지 않고 바로 닫힌다.
+  - 실시 결과 10-26 | 통과(자동) | tests/js/overlay-logic.test.mjs:384
 
 결과: (미기록)
 
@@ -376,18 +464,25 @@ Claude Code에서 `/config` → 알림 채널(notification channel)을 terminal 
 
 1. **마우스 없이 전체 흐름** — [ ] 사용자 확인 필요
    마우스를 쓰지 않고: `Alt+n`(새 탭: 폴더 → 역할 `일반` → 템플릿) → `Alt+\`·`Alt+-`(분할) → `Alt+h/j/k/l`(창 이동, 그룹 경계 넘기) → `Alt+Shift+H/J/K/L`(크기 조절) → `Alt+c`(복사: `v`·`y`) → `Ctrl+Shift+V` 붙여넣기 → `Alt+1..9`, `Ctrl+Alt+h/l`(탭 전환) → `Ctrl+Alt+Shift+H/L` 또는 `Ctrl+Alt+m`(탭을 다른 그룹으로) → `Ctrl+Alt+g`(그룹 합치기) → `Alt+x`·`Ctrl+Alt+x`(닫기). 중간에 막히거나 마우스가 필요한 단계가 없어야 한다.
+   - 실시 결과 10-26 | 보류(형님 실시) | 단축키 하나하나의 키→명령은 자동으로 확인됐다(Task 12·13). 여기서는 실제 키보드로 처음부터 끝까지
 2. **한글 IME 켠 상태에서 모든 단축키** — [ ] 사용자 확인 필요
    한/영 키로 한글 입력 상태로 만든 뒤 1번의 단축키를 다시 눌러 동일하게 동작하는지 본다(`e.code` 기준 매칭).
+   - 실시 결과 10-26 | 보류(형님 실시) | 실제 IME. 조합 중 매칭 논리는 keys.test.mjs(신규 표)
 3. **Claude Code로 키 전달** — [ ] 사용자 확인 필요
    `claude` 창에서 `Ctrl+R`(기록 검색), `Ctrl+P`, `Alt+P`(모델 전환), `Alt+V`, `Shift+Tab`(모드 전환), `Ctrl+V`(클립보드 이미지 → 이미지 칩)가 모두 Claude Code에 전달되고 앱/WebView가 가로채지 않는다.
+   - 실시 결과 10-26 | 보류(형님 실시) | WebView2 가속키·Claude Code 동작
 4. **3×3 Claude 동시 실행 성능** — [ ] 사용자 확인 필요
    Task 11의 S4 절 설정으로 Claude 9개를 동시에 띄워 입력 지연·CPU/메모리를 본다(수치를 S4 "결과:"에 적는다).
+   - 실시 결과 10-26 | 보류(형님 실시) | 성능 측정(S4)
 5. **종료 → 재실행 복원, 고아 프로세스 없음** — [ ] 사용자 확인 필요
    그룹 2개·탭 여러 개·분할·포커스를 만든 뒤 앱을 닫는다(Task 17 확인 대화에서 `Y`). 즉시 작업 관리자(세부 정보)에서 `claude`·`pwsh`/`powershell`·`conhost`·`OpenConsole` 프로세스가 남지 않는지 센다(종료 전 개수와 비교). 다시 실행해 그룹/탭/레이아웃/포커스/최대화/동기화 상태가 복원되고 각 창 프로세스가 새로 실행되는지 본다. 앱을 작업 관리자에서 강제 종료한 경우에도 자식이 사라지는지(Job Object) 한 번 확인한다.
+   - 실시 결과 10-26 | 보류(형님 실시) | 실제 종료·재실행·작업 관리자. 자식 정리는 src-tauri/tests/pty.rs:249
 6. **마우스 드래그 4가지 드롭** — [ ] 사용자 확인 필요
    Task 16 Step 5 절의 항목(탭 바 순서 변경, 다른 그룹 탭 바, 그룹 본문 중앙, 그룹 가장자리 분할).
+   - 실시 결과 10-26 | 보류(형님 실시) | 실제 마우스 드래그. 드롭 위치 논리는 Task 16 Step 5(자동)
 7. **권한 승인 대기 시 ⚠** — [ ] 사용자 확인 필요
    Claude Code의 `/config`에서 알림 채널을 terminal bell로 설정(README 참고). 비활성 탭의 Claude가 권한 승인을 기다릴 때 ⚠가 표시되고 포커스는 그대로이며, `Alt+a`로 이동하고 다시 `Alt+a`로 돌아온다.
+   - 실시 결과 10-26 | 보류(형님 실시) | 실제 권한 프롬프트. Notification 처리는 src-tauri/src/attention.rs:304
 
 최종 결과: (미기록)
 
