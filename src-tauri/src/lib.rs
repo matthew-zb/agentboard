@@ -28,7 +28,7 @@ use launcher::PromptJob;
 use pty::{PtyManager, PtySink};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use tauri::ipc::{Channel, InvokeResponseBody, Response};
@@ -80,6 +80,8 @@ pub struct AppState {
     pub saver: persist::Saver,
     /// Startup problems outside config files (e.g. a discarded workspace.json), shown in the error list.
     pub startup_errors: Vec<String>,
+    /// Set by the first confirmed exit (`app_exit`); later calls are ignored.
+    pub exiting: AtomicBool,
     /// Per-pane bearer tokens of role panes (leaf lock inside).
     pub tokens: agentcfg::Tokens,
     /// Control server base URL (`http://127.0.0.1:<port>`), set by the control server (Task 5)
@@ -137,6 +139,7 @@ impl AppState {
             emit_lock: Mutex::new(()),
             saver,
             startup_errors,
+            exiting: AtomicBool::new(false),
             tokens: agentcfg::Tokens::new(),
             ctrl_url: Mutex::new(None),
             run_dir,
@@ -303,11 +306,36 @@ fn pty_attach(
     Ok(Response::new(snap))
 }
 
+/// Most bytes one `pty_write_raw` call may carry (terminal replies and mouse reports are tiny).
+pub const RAW_WRITE_MAX: usize = 64 * 1024;
+
+/// User keystrokes / paste: counts as input (R4 — bridge PTY fallback, nightly quiet check).
+fn write_user(state: &AppState, pane: &str, bytes: &[u8]) -> Result<(), String> {
+    bridge::note_input(state, pane);
+    state.pty.write(pane, bytes)
+}
+
+/// Terminal replies (CPR, DA, focus, mouse reports) and xterm binary data: written as-is,
+/// never counted as input.
+fn write_raw(state: &AppState, pane: &str, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > RAW_WRITE_MAX {
+        return Err(format!("입력이 너무 깁니다: {}바이트(최대 {RAW_WRITE_MAX})", bytes.len()));
+    }
+    state.pty.write(pane, bytes)
+}
+
+/// IPC contract: user input only (`term.onData` minus terminal replies, paste, sync fan-out).
 #[tauri::command]
 fn pty_write(state: State<'_, AppState>, pane: String, data: String) -> Result<(), String> {
     // real keystrokes only (R4): the bridge's PTY fallback and Task 11's quiet check use it
-    bridge::note_input(&state, &pane);
-    state.pty.write(&pane, data.as_bytes())
+    write_user(&state, &pane, data.as_bytes())
+}
+
+/// IPC contract: terminal replies (UTF-8 bytes) and `term.onBinary` (one byte per char), as a
+/// number array 0–255 of at most [`RAW_WRITE_MAX`] items. Not counted as user input.
+#[tauri::command]
+fn pty_write_raw(state: State<'_, AppState>, pane: String, bytes: Vec<u8>) -> Result<(), String> {
+    write_raw(&state, &pane, &bytes)
 }
 
 #[tauri::command]
@@ -395,12 +423,28 @@ fn running_count(state: State<'_, AppState>) -> usize {
     state.ws.lock().unwrap().running_count()
 }
 
-/// Confirmed app exit: save workspace.json, kill every pane process, exit.
+/// True for the first call only: one exit runs, a second close click meanwhile does nothing.
+fn begin_exit(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::SeqCst)
+}
+
+/// Confirmed app exit: save workspace.json (up to `persist::FLUSH_WAIT`), kill every pane
+/// process, exit — on a blocking thread, so the window is not frozen meanwhile. Only the first
+/// call acts.
 #[tauri::command]
-fn app_exit(app: AppHandle, state: State<'_, AppState>) {
-    state.saver.flush();
-    state.pty.kill_all();
-    app.exit(0);
+async fn app_exit(app: AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else { return app.exit(0) };
+    if !begin_exit(&state.exiting) {
+        return;
+    }
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        if let Some(state) = app.try_state::<AppState>() {
+            state.saver.flush();
+            state.pty.kill_all();
+        }
+        app.exit(0);
+    })
+    .await;
 }
 
 /// Inbox applet (Task 10): items newest first (done ones only with `show_done`) + version.
@@ -575,11 +619,36 @@ fn doc_unwatch(state: State<'_, AppState>, pane_id: String) {
 }
 
 /// An http(s) link of a document → the system browser (opener plugin's Rust API; the frontend
-/// gets no opener capability). Anything else is refused.
+/// gets no opener capability). Anything else is refused. The browser is started outside the
+/// app's job object so that it outlives the app (`docs::open_external`).
 #[tauri::command]
 fn doc_open_url(url: String) -> Result<(), String> {
-    let url = docs::check_external_url(&url)?;
+    docs::open_external(&url, spawn_url_opener, open_url_directly)
+}
+
+/// The opener as a process outside the app's job: `<this exe> --open-url <url>` (main.rs).
+/// Arguments go through CreateProcess quoting, no shell.
+#[cfg(windows)]
+fn spawn_url_opener(url: &str) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.arg(docs::OPEN_URL_FLAG).arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    winjob::spawn_outside_job(&mut cmd).map(drop) // not waited for: it opens the url and exits
+}
+
+#[cfg(not(windows))]
+fn spawn_url_opener(_url: &str) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+fn open_url_directly(url: &str) -> Result<(), String> {
     tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| format!("브라우저를 열 수 없습니다 — {e}"))
+}
+
+/// `agentboard.exe --open-url <url>` (started by [`doc_open_url`]): open it and return the
+/// exit code; no Tauri/WebView.
+pub fn run_open_url(url: &str) -> i32 {
+    docs::run_open_url_with(url, open_url_directly)
 }
 
 /// Files of the inbox item's issue folder (`input/`, `output/`), for the inbox detail. The
@@ -710,6 +779,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             pty_attach,
             pty_write,
+            pty_write_raw,
             pty_resize,
             ws_command,
             ws_snapshot,
@@ -953,5 +1023,72 @@ mod tests {
         // unknown ids: nothing to drop, not current
         assert!(!chs.remove_if_current("nope", g2, &pty));
         pty.remove("c");
+    }
+
+    struct NullUi;
+    impl Ui for NullUi {
+        fn workspace_changed(&self, _: &Snapshot) {}
+        fn drop_channel(&self, _: &str) {}
+    }
+
+    /// AppState whose PtyManager runs an idle `cmd.exe` as pane "p" (PTY only, not in the model).
+    struct WriteFx {
+        state: AppState,
+        _rx: mpsc::Receiver<Effects>,
+        _keep: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    impl Drop for WriteFx {
+        fn drop(&mut self) {
+            self.state.pty.remove("p");
+        }
+    }
+
+    fn write_fx() -> WriteFx {
+        let root = tempfile::tempdir().unwrap();
+        let appdata = tempfile::tempdir().unwrap();
+        let s = serde_json::json!({ "workspaceRoot": root.path().to_string_lossy() });
+        std::fs::write(appdata.path().join("settings.json"), s.to_string()).unwrap();
+        config::ensure_dotdir(root.path()).unwrap();
+        let loaded = config::load_all(appdata.path());
+        let ws = Workspace::from_config(&loaded);
+        let (tx, rx) = mpsc::channel();
+        let pty = PtyManager::new_per_child_job(Arc::new(NullSink));
+        pty.spawn("p", cmd(&[])).unwrap();
+        let state =
+            AppState::new(ws, loaded, pty, Arc::new(NullUi), tx, persist::Saver::disabled(), Vec::new(), appdata.path().join("run"));
+        WriteFx { state, _rx: rx, _keep: (root, appdata) }
+    }
+
+    /// The exit (flush up to 5 s, kill all) runs off the UI thread now, so the window stays
+    /// responsive: a second close click meanwhile must not start a second exit.
+    #[test]
+    fn app_exit_runs_once() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(begin_exit(&flag));
+        assert!(!begin_exit(&flag), "an exit is already running");
+        assert!(!begin_exit(&flag));
+    }
+
+    /// Terminal replies / mouse reports (pty_write_raw) are not user activity: they must not
+    /// hold back the bridge's PTY fallback or the nightly quiet check (R4).
+    #[test]
+    fn raw_write_does_not_note_input_but_user_write_does() {
+        let f = write_fx();
+        write_raw(&f.state, "p", b"\x1b[I").unwrap();
+        assert!(f.state.last_input.lock().unwrap().get("p").is_none(), "a focus report is not input");
+        write_user(&f.state, "p", b"x").unwrap();
+        assert!(f.state.last_input.lock().unwrap().get("p").is_some(), "a keystroke is input");
+    }
+
+    #[test]
+    fn raw_write_rejects_oversized_payload() {
+        let f = write_fx();
+        let err = write_raw(&f.state, "p", &vec![b'a'; RAW_WRITE_MAX + 1]).unwrap_err();
+        assert!(err.contains("너무 깁니다"), "{err}");
+        assert!(f.state.last_input.lock().unwrap().get("p").is_none());
+        // exactly the maximum passes the size check (an unknown pane then fails on its own)
+        let err = write_raw(&f.state, "nope", &vec![b'a'; RAW_WRITE_MAX]).unwrap_err();
+        assert!(err.contains("unknown pane"), "{err}");
     }
 }

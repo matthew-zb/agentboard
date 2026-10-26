@@ -328,3 +328,37 @@ test('headerButtons: no restart button on applet panes', () => {
   assert.deepEqual(headerButtons({ kind: { type: 'terminal' } }), ['restart', 'close']);
   assert.deepEqual(headerButtons({}), ['restart', 'close']);
 });
+
+// ---- first-use fixes F1: terminal replies / binary data are not user input (pty_write_raw)
+import { utf8Bytes, binaryBytes, routeInput, routeBinary } from '../../src/pane.js';
+
+test('utf8Bytes / binaryBytes', () => {
+  assert.deepEqual(utf8Bytes('\x1b[I'), [0x1b, 0x5b, 0x49]);
+  assert.deepEqual(utf8Bytes('한'), [0xed, 0x95, 0x9c]);
+  // xterm onBinary: one char per byte, 0x80–0xFF must stay single bytes (not UTF-8 encoded)
+  assert.deepEqual(binaryBytes('\x1b[M \xa1\xff'), [0x1b, 0x5b, 0x4d, 0x20, 0xa1, 0xff]);
+  assert.deepEqual(binaryBytes(''), []);
+});
+
+test('terminal replies and binary data go through writeRaw to the source pane only; user input through write', () => {
+  const calls = [];
+  const io = { write: (id, s) => calls.push(['write', id, s]), writeRaw: (id, b) => calls.push(['writeRaw', id, b]) };
+  const ents = { p1: {}, p2: {} };
+  const of = (id) => ents[id];
+  const sync = ['p1', 'p2'];
+  // focus report, SGR mouse motion, CPR, DA1: source only, raw, never through write
+  for (const d of ['\x1b[I', '\x1b[O', '\x1b[<35;10;5M', '\x1b[3;1R', '\x1b[?1;2c']) {
+    calls.length = 0;
+    routeInput('p1', sync, d, of, io);
+    assert.deepEqual(calls, [['writeRaw', 'p1', utf8Bytes(d)]], JSON.stringify(d));
+  }
+  // user input (keys, paste): write to the source and every sync target, no writeRaw
+  calls.length = 0;
+  routeInput('p1', sync, 'a', of, io);
+  routeInput('p1', null, '\x1b[200~x\x1b[201~', of, io);
+  assert.deepEqual(calls, [['write', 'p1', 'a'], ['write', 'p2', 'a'], ['write', 'p1', '\x1b[200~x\x1b[201~']]);
+  // onBinary (X10 mouse with coordinates above 95): raw bytes, source only
+  calls.length = 0;
+  routeBinary('p1', '\x1b[M \xa1', io);
+  assert.deepEqual(calls, [['writeRaw', 'p1', [0x1b, 0x5b, 0x4d, 0x20, 0xa1]]]);
+});

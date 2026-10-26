@@ -6,7 +6,8 @@
 //! App locks: `AppState::ws` (Mutex), `AppState::loaded` (RwLock, read-only except `create_manager_tab`),
 //! `AppState::prompts` (Mutex), `AppState::effects` (Mutex<Sender>), `AppSink::channels`
 //! (Mutex, reached through `AppState::ui` / the managed `Arc<AppSink>`). PtyManager-internal
-//! locks: per-pane `flush_lock`, the `panes` map, writer/master/killer.
+//! locks: per-pane `flush_lock`, the `panes` map, writer/master/killer, the per-pane input
+//! queue (`InputQueue`).
 //!
 //! * Allowed nestings (outer -> inner): `ws -> loaded(read)`, `ws -> prompts`,
 //!   `ws -> PtyManager::is_running/current_gen/job_error` (only the `panes` map lock /
@@ -19,6 +20,15 @@
 //! * PtyManager `spawn/kill/remove` are called only from the launcher worker thread
 //!   (`run_effects`); MCP / nightly / other threads must go through `execute` → `submit`
 //!   (R13). `write`/`resize`/`attach_with` may be called from command threads.
+//! * Input queue (pty.rs): `write`/`resize` take the `panes` map lock (released), then the
+//!   pane's queue lock — a leaf held only to push, never across process IO — and return at
+//!   once (`Ok` = queued). Each pane's writer thread pops under the queue lock, releases it,
+//!   then takes the pane's writer (per chunk) or master lock to apply the op; it takes no app
+//!   lock and never `flush_lock`. The reader thread queues the DSR reply (queue lock only).
+//!   The waiter closes the queue, then takes writer → master to drop them. So `write` and
+//!   `resize` never block on a process and may be called under any app lock; IPC order of
+//!   `pty_write` / `pty_write_raw` / `pty_resize` (sync commands on the UI thread) is the
+//!   order the PTY sees.
 //!
 //! # Spawn generations
 //!
@@ -137,14 +147,15 @@ pub fn profile_for<'a>(pane: &Pane, loaded: &'a Loaded) -> Option<&'a AgentProfi
     loaded.profiles.get(&pane.agent).or_else(|| loaded.profiles.get(&loaded.config.default_agent))
 }
 
-/// Per-spawn inputs of a role pane's extras (`agentcfg::role_spawn_extras`). Ignored for
-/// panes without a role.
+/// Per-spawn inputs of a role pane's extras (`agentcfg::role_spawn_extras`; ignored for panes
+/// without a role) and of every pane's inherited-environment cleanup.
 pub struct RoleLaunch<'a> {
     pub ctrl_url: &'a str,
     pub token: &'a str,
     pub run_dir: &'a std::path::Path,
-    /// Variable names of the app's own environment; the session-bound ones are not passed on
-    /// to a role session (`agentcfg::SESSION_BOUND_VARS`, R19). Injected for testability.
+    /// Variable names of the app's own environment (every pane). tmux/psmux markers are passed
+    /// on to no pane (`agentcfg::MULTIPLEXER_VARS`); session-bound Claude Code variables not to
+    /// a role session (`agentcfg::SESSION_BOUND_VARS`, R19). Injected for testability.
     pub parent_env: &'a [String],
 }
 
@@ -166,7 +177,8 @@ pub fn plan_spawn(pane: &Pane, loaded: &Loaded, launch: &RoleLaunch) -> Result<S
     let mut args: Vec<String> = profile.args.clone();
     let mut env = profile.env.clone();
     let mut role_env = Vec::new();
-    let mut env_remove = Vec::new();
+    // every pane: not a tmux pane, even when the app was started from a psmux shell
+    let mut env_remove = crate::agentcfg::inherited_multiplexer_vars(launch.parent_env.iter().cloned());
     if let Some(role) = pane.role {
         let (mut extra_args, extra_env) = crate::agentcfg::role_spawn_extras(
             pane,
@@ -186,7 +198,9 @@ pub fn plan_spawn(pane: &Pane, loaded: &Loaded, launch: &RoleLaunch) -> Result<S
         args.extend(extra_args);
         args.extend(loaded.config.role_config(role).args);
         role_env = extra_env;
-        env_remove = crate::agentcfg::inherited_claude_vars(launch.parent_env.iter().cloned());
+        let mut drop = crate::agentcfg::inherited_claude_vars(launch.parent_env.iter().cloned());
+        drop.append(&mut env_remove);
+        env_remove = drop;
     }
     args.extend(pane.args.iter().cloned());
     env.extend(pane.env.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -319,16 +333,71 @@ pub fn missing_dirs(ws: &Workspace) -> Vec<(TabId, String)> {
     ws.tabs.values().filter(|t| !t.workspace.is_dir()).map(|t| (t.id.clone(), t.dir.clone())).collect()
 }
 
-/// Validation for `create_workspace_dir`.
+/// Longest folder name (characters), the usual Windows component limit.
+pub const DIR_NAME_MAX: usize = 255;
+/// Characters Windows does not allow in a file or folder name.
+const DIR_NAME_FORBIDDEN: &str = "<>:\"/\\|?*";
+/// Folders the app (`.agentboard`) and git keep for themselves (case-insensitive like NTFS).
+const DIR_NAME_RESERVED: [&str; 2] = [".agentboard", ".git"];
+
+/// True for a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`,
+/// `COM¹²³`, `LPT¹²³`), case-insensitive, with or without an extension (`con.txt`, `aux.tar.gz`).
+fn is_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    if ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str()) {
+        return true;
+    }
+    let digit = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT"));
+    let mut chars = digit.unwrap_or_default().chars();
+    matches!((chars.next(), chars.next()), (Some(c), None) if c.is_ascii_digit() || "¹²³".contains(c))
+}
+
+/// Validation of one folder name the app creates or records for a new tab
+/// (`create_workspace_dir`, and each part of [`check_rel_dir`]). Besides `/ \ :` and `.`/`..`,
+/// refuses what Windows would reject or silently change: forbidden and control characters,
+/// leading/trailing spaces and a trailing dot (Win32 strips them, so `billing.` would name the
+/// existing `billing`), device names, over-long names, and `.agentboard` / `.git`.
+/// Not applied to folders already in config.json (they load as before).
 pub fn check_dir_name(name: &str) -> Result<(), String> {
     if name.trim().is_empty() {
         return Err("폴더 이름이 비어 있습니다".into());
     }
-    if name.contains(['/', '\\', ':']) {
-        return Err("폴더 이름에 / \\ : 는 쓸 수 없습니다".into());
+    if name.chars().count() > DIR_NAME_MAX {
+        return Err(format!("폴더 이름이 너무 깁니다(최대 {DIR_NAME_MAX}자)"));
+    }
+    if name.chars().any(char::is_control) {
+        return Err("폴더 이름에 제어 문자(줄바꿈·탭 등)는 쓸 수 없습니다".into());
+    }
+    if let Some(c) = name.chars().find(|c| DIR_NAME_FORBIDDEN.contains(*c)) {
+        return Err(format!("폴더 이름에 {c} 는 쓸 수 없습니다 (< > : \" / \\ | ? * 불가)"));
     }
     if name == "." || name == ".." {
         return Err("폴더 이름으로 . 이나 .. 은 쓸 수 없습니다".into());
+    }
+    if name != name.trim() || name.ends_with('.') {
+        return Err("폴더 이름의 앞뒤 공백과 끝의 점(.)은 쓸 수 없습니다 — Windows가 지워 다른 폴더를 가리키게 됩니다".into());
+    }
+    if is_device_name(name) {
+        return Err(format!("'{name}'은(는) Windows 장치 이름이라 폴더 이름으로 쓸 수 없습니다"));
+    }
+    if DIR_NAME_RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+        return Err(format!("'{name}'은(는) 앱·git이 쓰는 폴더라 쓸 수 없습니다"));
+    }
+    Ok(())
+}
+
+/// Validation of a new work tab's folder, relative to workspaceRoot (MCP `create_manager_tab`
+/// and the wizard's Manager choice): `/`- or `\`-separated parts, each a valid
+/// [`check_dir_name`] — so no `.`/`..`, no empty part, nothing absolute.
+pub fn check_rel_dir(dir: &str) -> Result<(), String> {
+    if dir.is_empty() {
+        return Err("폴더 경로가 비어 있습니다".into());
+    }
+    for part in dir.split(['/', '\\']) {
+        if part.is_empty() {
+            return Err("경로에 빈 부분이 있습니다(// 또는 앞뒤의 /)".into());
+        }
+        check_dir_name(part).map_err(|e| if part == dir { e } else { format!("'{part}': {e}") })?;
     }
     Ok(())
 }
@@ -576,11 +645,8 @@ fn spawn_pane(state: &AppState, id: &str, inject: bool) {
     // `tokens` and `ctrl_url` are leaves, taken one at a time before `loaded`.
     let token = if pane.role.is_some() { state.tokens.issue(id) } else { String::new() };
     let ctrl_url = state.ctrl_url.lock().unwrap().clone().unwrap_or_else(|| PLACEHOLDER_CTRL_URL.to_string());
-    let parent_env: Vec<String> = if pane.role.is_some() {
-        std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect()
-    } else {
-        Vec::new()
-    };
+    // every pane: tmux/psmux markers are dropped for all, Claude session variables for role panes
+    let parent_env: Vec<String> = std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect();
     let launch = RoleLaunch { ctrl_url: &ctrl_url, token: &token, run_dir: &state.run_dir, parent_env: &parent_env };
     let (plan, job) = {
         let loaded = state.loaded.read().unwrap();
@@ -894,7 +960,7 @@ mod tests {
         let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:1", token: "t", run_dir: run.path(), parent_env: &parent };
         let mut p = pane("tool", fx.root.path().to_path_buf());
         let plain = plan_spawn(&p, &fx.loaded, &launch).unwrap();
-        assert!(plain.env_remove.is_empty(), "phase-1 panes inherit everything as before");
+        assert!(plain.env_remove.is_empty(), "plain panes drop only tmux/psmux markers (none here), not Claude's");
         p.role = Some(Role::Manager);
         p.session_name = Some("billing".into());
         let spec = plan_spawn(&p, &fx.loaded, &launch).unwrap();
@@ -903,6 +969,34 @@ mod tests {
             vec!["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SSE_PORT"]
         );
         assert!(!spec.env_remove.iter().any(|k| k == "CLAUDE_CODE_GIT_BASH_PATH" || k == "CLAUDE_CODE_USE_BEDROCK" || k == "PATH"));
+    }
+
+    /// AgentBoard started from a psmux (tmux) shell: its panes are ConPTY terminals, not tmux
+    /// panes, so no pane — plain or role — may inherit the tmux/psmux markers (Claude Code would
+    /// warn "tmux focus-events off" and switch its keyboard protocol). Nothing else is dropped.
+    #[test]
+    fn spawn_env_drops_tmux_and_psmux_vars() {
+        let fx = fixture();
+        let run = tempfile::tempdir().unwrap();
+        let parent: Vec<String> = ["PATH", "TMUX", "TMUX_PANE", "PSMUX_SESSION", "PSMUX_TARGET_SESSION", "psmux_other",
+            "CLAUDE_CODE_GIT_BASH_PATH", "TMUXINATOR_CONFIG", "MY_PSMUX_NOTE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let launch = RoleLaunch { ctrl_url: "http://127.0.0.1:1", token: "t", run_dir: run.path(), parent_env: &parent };
+        let mut p = pane("tool", fx.root.path().to_path_buf());
+        let plain = plan_spawn(&p, &fx.loaded, &launch).unwrap();
+        p.role = Some(Role::Manager);
+        p.session_name = Some("billing".into());
+        let role = plan_spawn(&p, &fx.loaded, &launch).unwrap();
+        for (kind, spec) in [("plain", &plain), ("role", &role)] {
+            for k in ["TMUX", "TMUX_PANE", "PSMUX_SESSION", "PSMUX_TARGET_SESSION", "psmux_other"] {
+                assert!(spec.env_remove.iter().any(|r| r == k), "{kind} pane inherits {k}: {:?}", spec.env_remove);
+            }
+            for k in ["PATH", "CLAUDE_CODE_GIT_BASH_PATH", "TMUXINATOR_CONFIG", "MY_PSMUX_NOTE"] {
+                assert!(!spec.env_remove.iter().any(|r| r == k), "{kind} pane loses {k}: {:?}", spec.env_remove);
+            }
+        }
     }
 
     #[test]
@@ -1455,6 +1549,35 @@ mod tests {
         }
         for ok in ["api", "my-project", "한글"] {
             assert!(check_dir_name(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn check_dir_name_rejects_windows_reserved_and_invalid() {
+        for bad in [
+            "CON", "con.txt", "NUL", "COM1", "LPT9", "a?b", "a*b", "a<b", "a|b", "a\"b", "a:b", "foo.", "foo ",
+            " foo", "a\u{7}b", ".agentboard", ".git", ".GIT", "com¹", "LPT³.log", "COM0", "lpt0", "aux.tar.gz",
+        ] {
+            assert!(check_dir_name(bad).is_err(), "{bad:?} should be rejected");
+        }
+        assert!(check_dir_name(&"a".repeat(256)).is_err(), "longer than 255 characters");
+    }
+
+    #[test]
+    fn check_dir_name_keeps_common_names() {
+        for ok in ["api", "my-project", "한글", "v1.2", "a.b", "con-fig", ".config", "COM10", "console", "nul-x"] {
+            assert!(check_dir_name(ok).is_ok(), "{ok:?} should be accepted");
+        }
+        assert!(check_dir_name(&"a".repeat(255)).is_ok());
+    }
+
+    #[test]
+    fn check_rel_dir_requires_normalized_segments() {
+        for ok in ["a/b", r"a\b", "billing", "팀/결제"] {
+            assert!(check_rel_dir(ok).is_ok(), "{ok:?}");
+        }
+        for bad in ["a/../b", "./a", "a//b", "a/CON", "billing.", "", "billing/", "/a", r"C:\x", "a/.git"] {
+            assert!(check_rel_dir(bad).is_err(), "{bad:?}");
         }
     }
 }

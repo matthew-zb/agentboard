@@ -1,6 +1,6 @@
 use crate::ring::RingBuffer;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,6 +38,196 @@ pub(crate) fn filter_dsr(carry: &mut Vec<u8>, answered: &mut bool, chunk: &[u8])
     let at = data.len() - keep;
     *carry = data.split_off(at);
     (data, false)
+}
+
+/// Reader side of [`filter_dsr`]: the reply to ConPTY's first cursor-position request goes into
+/// the pane's input queue, so the writer thread stays the only one writing to the PTY.
+pub(crate) fn filter_dsr_reply(carry: &mut Vec<u8>, answered: &mut bool, chunk: &[u8], input: &InputQueue) -> Vec<u8> {
+    let (out, reply) = filter_dsr(carry, answered, chunk);
+    if reply {
+        let _ = input.push(Op::Write(DSR_REPLY.to_vec())); // closed = the process is gone anyway
+    }
+    out
+}
+
+// ───────── input queue ─────────
+//
+// `write`/`resize` are called from the UI thread (sync Tauri commands, so IPC order is call
+// order), the bridge and the prompt timer. They only queue; each pane's writer thread applies
+// the queue in order, so a process that is slow to take its input (a large paste, a busy
+// conhost) never blocks the caller.
+
+/// Most bytes waiting in one pane's queue: a large paste fits; a process that stops reading
+/// its input makes `write` fail instead of growing memory.
+pub const INPUT_CAP: usize = 8 * 1024 * 1024;
+/// Bytes written per writer-lock hold: the waiter (dropping the writer at exit) never waits
+/// behind more than one chunk.
+const WRITE_CHUNK: usize = 16 * 1024;
+
+/// One input operation, applied by the pane's writer thread in call order.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Op {
+    Write(Vec<u8>),
+    Resize(u16, u16),
+}
+
+/// Where a writer thread applies input: the pane's PTY ([`PtyInput`]) or a recorder in tests.
+pub(crate) trait InputSink {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String>;
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String>;
+}
+
+/// Why [`InputQueue::push`] refused.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PushError {
+    /// The process has exited (the waiter closed the queue).
+    Closed,
+    /// A write failed; the queue is closed and keeps reporting this.
+    Failed(String),
+    /// More than [`INPUT_CAP`] bytes are waiting.
+    Full,
+}
+
+impl PushError {
+    /// The error text for pane `id` (shown by the frontend as "[입력 전달 실패: …]").
+    pub(crate) fn message(&self, id: &str) -> String {
+        match self {
+            PushError::Closed => format!("pane {id} has exited"),
+            PushError::Failed(e) => format!("창 {id}에 입력을 쓰지 못했습니다 — {e}"),
+            PushError::Full => {
+                format!("창 {id}의 입력 대기열이 가득 찼습니다(최대 {} MiB) — 프로세스가 입력을 읽지 않습니다", INPUT_CAP / 1024 / 1024)
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct QueueState {
+    ops: VecDeque<Op>,
+    /// Bytes of the queued (not yet taken) writes.
+    bytes: usize,
+    closed: bool,
+    failed: Option<String>,
+}
+
+/// A pane's pending input. Its lock is a leaf: `push` never waits on the process, and the
+/// writer thread releases it before touching the PTY.
+pub(crate) struct InputQueue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+}
+
+impl InputQueue {
+    pub(crate) fn new() -> Self {
+        InputQueue { state: Mutex::new(QueueState::default()), ready: Condvar::new() }
+    }
+
+    /// Queue `op` and return at once. Back-to-back resizes collapse into the last one.
+    pub(crate) fn push(&self, op: Op) -> Result<(), PushError> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(e) = &s.failed {
+            return Err(PushError::Failed(e.clone()));
+        }
+        if s.closed {
+            return Err(PushError::Closed);
+        }
+        match op {
+            Op::Write(bytes) => {
+                if bytes.is_empty() {
+                    return Ok(());
+                }
+                if s.bytes + bytes.len() > INPUT_CAP {
+                    return Err(PushError::Full);
+                }
+                s.bytes += bytes.len();
+                s.ops.push_back(Op::Write(bytes));
+            }
+            Op::Resize(cols, rows) => {
+                if matches!(s.ops.back(), Some(Op::Resize(..))) {
+                    s.ops.pop_back();
+                }
+                s.ops.push_back(Op::Resize(cols, rows));
+            }
+        }
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    /// No more input: the writer drains what is queued and ends.
+    pub(crate) fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.ready.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_bytes(&self) -> usize {
+        self.state.lock().unwrap().bytes
+    }
+
+    /// The writer loop: applies ops in order, with the queue lock released while `sink` works.
+    /// Returns once the queue is closed and drained, or at the first failed write (the queue
+    /// is then closed and later pushes report the failure — unless the process had already
+    /// exited, which stays `Closed`). A failed resize is only logged.
+    pub(crate) fn run(&self, sink: &mut dyn InputSink) {
+        loop {
+            let op = {
+                let mut s = self.state.lock().unwrap();
+                loop {
+                    if let Some(op) = s.ops.pop_front() {
+                        if let Op::Write(b) = &op {
+                            s.bytes -= b.len();
+                        }
+                        break op;
+                    }
+                    if s.closed {
+                        return;
+                    }
+                    s = self.ready.wait(s).unwrap();
+                }
+            };
+            match op {
+                Op::Write(bytes) => {
+                    if let Err(e) = sink.write(&bytes) {
+                        let mut s = self.state.lock().unwrap();
+                        if !s.closed {
+                            s.failed = Some(e);
+                        }
+                        s.closed = true;
+                        s.ops.clear();
+                        s.bytes = 0;
+                        return;
+                    }
+                }
+                Op::Resize(cols, rows) => {
+                    if let Err(e) = sink.resize(cols, rows) {
+                        eprintln!("[agentboard] resize: {e}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The PTY end of a pane's writer thread. The writer lock is held per chunk only.
+struct PtyInput {
+    entry: Arc<Entry>,
+}
+
+impl InputSink for PtyInput {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        for chunk in bytes.chunks(WRITE_CHUNK) {
+            let mut w = self.entry.writer.lock().unwrap();
+            let w = w.as_mut().ok_or_else(|| "the process has exited".to_string())?;
+            w.write_all(chunk).and_then(|_| w.flush()).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
+        let m = self.entry.master.lock().unwrap();
+        let m = m.as_ref().ok_or_else(|| "the process has exited".to_string())?;
+        m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| e.to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +276,10 @@ struct Entry {
     running: Arc<AtomicBool>,
     batch: Arc<Batch>,
     pid: Option<u32>,
+    /// Pending input; applied by this entry's writer thread (the only PTY writer).
+    input: Arc<InputQueue>,
+    /// Set when the writer thread has ended (process exited or a write failed).
+    writer_done: AtomicBool,
 }
 
 pub struct PtyManager {
@@ -227,6 +421,12 @@ impl PtyManager {
         self.entry(id).and_then(|e| e.pid)
     }
 
+    /// Test-only: the current entry's writer thread is still running.
+    #[doc(hidden)]
+    pub fn writer_alive(&self, id: &str) -> bool {
+        self.entry(id).is_some_and(|e| !e.writer_done.load(Ordering::Acquire))
+    }
+
     /// Test-only: bytes currently queued between reader and sink.
     #[doc(hidden)]
     pub fn pending_len(&self, id: &str) -> usize {
@@ -313,6 +513,8 @@ impl PtyManager {
             running: running.clone(),
             batch: batch.clone(),
             pid: child.process_id(),
+            input: Arc::new(InputQueue::new()),
+            writer_done: AtomicBool::new(false),
         });
         let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
 
@@ -328,6 +530,15 @@ impl PtyManager {
             panes.insert(id.to_string(), Slot::Live(entry.clone()));
         }
 
+        // writer thread: applies the input queue (writes, resizes, the DSR reply) in call order
+        {
+            let entry = entry.clone();
+            std::thread::spawn(move || {
+                let input = entry.input.clone();
+                input.run(&mut PtyInput { entry: entry.clone() });
+                entry.writer_done.store(true, Ordering::Release);
+            });
+        }
         // reader thread
         {
             let batch = batch.clone();
@@ -345,13 +556,7 @@ impl PtyManager {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
-                    let (out, reply) = filter_dsr(&mut carry, &mut answered, &buf[..n]);
-                    if reply {
-                        if let Some(w) = entry.writer.lock().unwrap().as_mut() {
-                            let _ = w.write_all(DSR_REPLY);
-                            let _ = w.flush();
-                        }
-                    }
+                    let out = filter_dsr_reply(&mut carry, &mut answered, &buf[..n], &entry.input);
                     if !out.is_empty() {
                         batch.push(&out);
                     }
@@ -379,7 +584,10 @@ impl PtyManager {
                     Ok(st) => st.exit_code() as i32,
                     Err(_) => -1,
                 };
-                // Close the pty so the reader reaches EOF, then wait (bounded) for it.
+                // No more input (the writer thread drains and ends), then close the pty so the
+                // reader reaches EOF, and wait (bounded) for it. The writer holds the writer lock
+                // for one chunk at most.
+                entry.input.close();
                 *entry.writer.lock().unwrap() = None;
                 *entry.master.lock().unwrap() = None;
                 let _ = reader_done_rx.recv_timeout(DRAIN_MAX);
@@ -406,18 +614,18 @@ impl PtyManager {
         self.panes.lock().unwrap().get(id).map(Slot::gen)
     }
 
+    /// Queue `bytes` for the pane's process and return at once; its writer thread writes them
+    /// in call order. `Ok` means queued, not delivered. Errors: unknown pane, exited process,
+    /// an earlier failed write, or more than [`INPUT_CAP`] bytes waiting.
     pub fn write(&self, id: &str, bytes: &[u8]) -> Result<(), String> {
         let e = self.entry(id).ok_or_else(|| format!("unknown pane {id}"))?;
-        let mut w = e.writer.lock().unwrap();
-        let w = w.as_mut().ok_or_else(|| format!("pane {id} has exited"))?;
-        w.write_all(bytes).and_then(|_| w.flush()).map_err(|e| e.to_string())
+        e.input.push(Op::Write(bytes.to_vec())).map_err(|err| err.message(id))
     }
 
+    /// Queue a PTY resize behind the pane's pending input (back-to-back resizes collapse).
     pub fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), String> {
         let e = self.entry(id).ok_or_else(|| format!("unknown pane {id}"))?;
-        let m = e.master.lock().unwrap();
-        let m = m.as_ref().ok_or_else(|| format!("pane {id} has exited"))?;
-        m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| e.to_string())
+        e.input.push(Op::Resize(cols, rows)).map_err(|err| err.message(id))
     }
 
     pub fn kill(&self, id: &str) {
@@ -489,6 +697,7 @@ impl PtyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn dsr_whole_is_stripped_and_answered_once() {
@@ -523,5 +732,119 @@ mod tests {
         let (o2, r2) = filter_dsr(&mut c, &mut a, b"31m");
         assert_eq!(o2, b"\x1b[31m");
         assert!(!r2);
+    }
+
+    // ---- input queue (writes and resizes never block the caller) ----
+
+    /// Records what the writer applied; optionally fails every write.
+    #[derive(Default)]
+    struct Recorder {
+        ops: Vec<Op>,
+        fail_writes: bool,
+    }
+
+    impl InputSink for Recorder {
+        fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+            if self.fail_writes {
+                return Err("pipe broken".into());
+            }
+            self.ops.push(Op::Write(bytes.to_vec()));
+            Ok(())
+        }
+        fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
+            self.ops.push(Op::Resize(cols, rows));
+            Ok(())
+        }
+    }
+
+    fn drain(q: &InputQueue) -> Vec<Op> {
+        q.close();
+        let mut r = Recorder::default();
+        q.run(&mut r);
+        r.ops
+    }
+
+    #[test]
+    fn input_queue_keeps_order_of_writes_and_resizes() {
+        let q = InputQueue::new();
+        let w1 = vec![0x1b, b'[', b'M', 0x20, 0xA1, 0xFF]; // bytes ≥0x80 pass untouched
+        for op in [
+            Op::Write(w1.clone()),
+            Op::Resize(80, 24),
+            Op::Write(b"two".to_vec()),
+            Op::Resize(100, 30),
+            Op::Resize(120, 40),
+            Op::Write(b"three".to_vec()),
+        ] {
+            q.push(op).unwrap();
+        }
+        let want = vec![Op::Write(w1), Op::Resize(80, 24), Op::Write(b"two".to_vec()), Op::Resize(120, 40), Op::Write(b"three".to_vec())];
+        assert_eq!(drain(&q), want, "in call order; back-to-back resizes collapse into the last");
+    }
+
+    #[test]
+    fn enqueue_returns_while_writer_is_blocked() {
+        struct Stuck(mpsc::Receiver<()>);
+        impl InputSink for Stuck {
+            fn write(&mut self, _: &[u8]) -> Result<(), String> {
+                let _ = self.0.recv(); // blocks until released (or the sender is dropped)
+                Ok(())
+            }
+            fn resize(&mut self, _: u16, _: u16) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let q = Arc::new(InputQueue::new());
+        let (release, rx) = mpsc::channel();
+        let writer = {
+            let q = q.clone();
+            std::thread::spawn(move || q.run(&mut Stuck(rx)))
+        };
+        q.push(Op::Write(b"first".to_vec())).unwrap();
+        // the writer has taken "first" and is stuck inside the sink
+        let end = Instant::now() + Duration::from_secs(5);
+        while q.pending_bytes() > 0 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(q.pending_bytes(), 0, "writer never took the first write");
+        let t = Instant::now();
+        q.push(Op::Write(vec![b'x'; 1 << 20])).unwrap();
+        q.push(Op::Resize(100, 30)).unwrap();
+        let took = t.elapsed();
+        assert!(took < Duration::from_millis(50), "enqueue blocked for {took:?}");
+        assert_eq!(q.pending_bytes(), 1 << 20);
+        q.close();
+        drop(release); // unblock: the writer drains and ends
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn input_queue_rejects_over_cap_and_after_write_failure() {
+        let q = InputQueue::new();
+        q.push(Op::Write(vec![0; INPUT_CAP])).unwrap();
+        assert_eq!(q.push(Op::Write(vec![0])), Err(PushError::Full));
+        q.push(Op::Resize(80, 24)).unwrap(); // a resize carries no bytes
+        // a failed write closes the queue; later pushes report that failure
+        let q = InputQueue::new();
+        q.push(Op::Write(b"a".to_vec())).unwrap();
+        q.push(Op::Write(b"b".to_vec())).unwrap();
+        let mut r = Recorder { fail_writes: true, ..Default::default() };
+        q.run(&mut r); // returns on the failure, though nobody closed the queue
+        assert_eq!(q.push(Op::Write(b"c".to_vec())), Err(PushError::Failed("pipe broken".into())));
+        assert_eq!(q.push(Op::Resize(1, 1)), Err(PushError::Failed("pipe broken".into())));
+        // a closed queue refuses new input
+        let q = InputQueue::new();
+        q.close();
+        assert_eq!(q.push(Op::Write(b"x".to_vec())), Err(PushError::Closed));
+        assert_eq!(PushError::Closed.message("p1"), "pane p1 has exited");
+    }
+
+    #[test]
+    fn dsr_reply_goes_through_the_queue() {
+        let q = InputQueue::new();
+        let (mut c, mut a) = (Vec::new(), false);
+        assert_eq!(filter_dsr_reply(&mut c, &mut a, b"a\x1b[6nb", &q), b"ab");
+        assert_eq!(filter_dsr_reply(&mut c, &mut a, b"\x1b[6n", &q), b"\x1b[6n", "only the first request is answered");
+        assert_eq!(drain(&q), vec![Op::Write(DSR_REPLY.to_vec())]);
     }
 }

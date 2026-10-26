@@ -197,6 +197,57 @@ pub fn list_md_budget(root: &Path, query: Option<&str>, cap: usize, budget: usiz
     out
 }
 
+/// First argument of the `agentboard.exe --open-url <url>` mode (see [`open_external`]).
+pub const OPEN_URL_FLAG: &str = "--open-url";
+
+/// `Some(url)` when the process was started as `<exe> --open-url <url>` (`Some("")` without
+/// a url): open it and exit, no Tauri/WebView.
+pub fn open_url_arg(args: &[String]) -> Option<String> {
+    match args.get(1).map(String::as_str) {
+        Some(OPEN_URL_FLAG) => Some(args.get(2).cloned().unwrap_or_default()),
+        _ => None,
+    }
+}
+
+/// The `--open-url` process: checks the url again (a separate entry point of the exe), opens it
+/// with `open`. Exit code: 0 opened, 1 the opener failed, 2 refused.
+pub fn run_open_url_with(url: &str, open: impl FnOnce(&str) -> Result<(), String>) -> i32 {
+    let url = match check_external_url(url) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("[agentboard] --open-url: {e}");
+            return 2;
+        }
+    };
+    match open(&url) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("[agentboard] --open-url: {e}");
+            1
+        }
+    }
+}
+
+/// `doc_open_url`: a checked http(s) link goes to the system browser. The browser must
+/// outlive the app, but whatever the app starts is in its kill-on-close job (winjob.rs), so the
+/// opener runs in a process started outside that job (`spawn`: `<exe> --open-url <url>` with
+/// CREATE_BREAKAWAY_FROM_JOB). If that start is refused (an outer job forbids breakaway), the
+/// link is opened `direct`ly as before.
+pub fn open_external(
+    url: &str,
+    spawn: impl FnOnce(&str) -> std::io::Result<()>,
+    direct: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let url = check_external_url(url)?;
+    match spawn(&url) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("[agentboard] opening outside the job failed ({e}); opening directly");
+            direct(&url)
+        }
+    }
+}
+
 /// An http(s) URL for the system browser, or a Korean error (everything else is refused).
 pub fn check_external_url(url: &str) -> Result<String, String> {
     let bad = || Err("http/https 주소만 브라우저로 열 수 있습니다".to_string());
@@ -682,6 +733,61 @@ mod tests {
             assert!(check_external_url(bad).is_err(), "{bad}");
         }
         assert!(check_external_url(&format!("https://e.com/{}", "a".repeat(3000))).is_err());
+    }
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn open_url_mode_is_detected_from_args() {
+        assert_eq!(open_url_arg(&args(&["agentboard.exe", "--open-url", "https://e.com"])).as_deref(), Some("https://e.com"));
+        assert_eq!(open_url_arg(&args(&["agentboard.exe", "--open-url"])).as_deref(), Some(""));
+        assert_eq!(open_url_arg(&args(&["agentboard.exe"])), None);
+        assert_eq!(open_url_arg(&args(&["agentboard.exe", "--hook", "Stop"])), None);
+        assert_eq!(open_url_arg(&args(&["agentboard.exe", "x", "--open-url", "https://e.com"])), None, "only as the first argument");
+    }
+
+    /// The `--open-url` process validates again: it is a separate entry point of the exe.
+    #[test]
+    fn open_url_mode_refuses_non_http_before_opening() {
+        for bad in ["file:///C:/Windows/notepad.exe", "ms-settings:privacy", ""] {
+            let mut opened = Vec::new();
+            assert_ne!(run_open_url_with(bad, |u| { opened.push(u.to_string()); Ok(()) }), 0, "{bad}");
+            assert!(opened.is_empty(), "{bad} must not reach the opener");
+        }
+        let mut opened = Vec::new();
+        assert_eq!(run_open_url_with("https://e.com/a?b=1", |u| { opened.push(u.to_string()); Ok(()) }), 0);
+        assert_eq!(opened, ["https://e.com/a?b=1"]);
+        assert_ne!(run_open_url_with("https://e.com", |_| Err("no handler".into())), 0);
+    }
+
+    /// A document link starts the browser outside the app's job object (it must outlive the
+    /// app); when that start is refused (an outer job forbids breakaway), it opens directly.
+    #[test]
+    fn doc_open_url_falls_back_when_breakaway_is_refused() {
+        let (mut spawned, mut direct) = (Vec::new(), Vec::new());
+        open_external(
+            "https://e.com",
+            |u| { spawned.push(u.to_string()); Ok(()) },
+            |u| { direct.push(u.to_string()); Ok(()) },
+        )
+        .unwrap();
+        assert_eq!((spawned.as_slice(), direct.len()), (["https://e.com".to_string()].as_slice(), 0));
+
+        let mut direct = Vec::new();
+        open_external(
+            "https://e.com",
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            |u| { direct.push(u.to_string()); Ok(()) },
+        )
+        .unwrap();
+        assert_eq!(direct, ["https://e.com"]);
+
+        let err = open_external("javascript:alert(1)", |_| panic!("spawned"), |_| panic!("opened")).unwrap_err();
+        assert!(err.contains("http"), "{err}");
+        let err = open_external("https://e.com", |_| Err(std::io::ErrorKind::PermissionDenied.into()), |_| Err("x".into())).unwrap_err();
+        assert!(err.contains("x"), "{err}");
     }
 
     #[test]

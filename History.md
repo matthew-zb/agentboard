@@ -1,5 +1,20 @@
 # AgentBoard Release History
 
+## 미출시
+
+### Fixes
+- 터미널이 스스로 보내는 응답(포커스 in/out·마우스 보고·커서 위치 등)은 새 명령 `pty_write_raw`로 보내고 사용자 입력으로 기록하지 않는다. ConPTY와 Claude Code가 켜는 포커스·마우스 보고 때문에 입력이 없어도 야간 정리가 미뤄지던 문제를 고쳤다.
+- `onBinary` 데이터(X10 마우스 보고 등)를 바이트 그대로 보낸다(0x80 이상 바이트가 UTF-8로 바뀌던 문제).
+- 창 입력·크기 변경이 창별 대기열과 writer 스레드를 거쳐, 큰 붙여넣기나 입력을 읽지 않는 프로세스 때문에 화면이 멈추지 않는다. 앱 종료(저장·프로세스 정리)도 화면 스레드 밖에서 돈다.
+- 문서 탭의 http(s) 링크를 앱의 Job Object 밖에서 연다. 그 링크로 처음 띄운 브라우저가 AgentBoard 종료 때 함께 꺼지지 않는다.
+- 새 업무 탭의 폴더 이름에서 Windows 금지 문자·장치 이름(CON, NUL, COM1 …)·끝의 점/공백·`.agentboard`·`.git`을 거부한다(`billing.`이 기존 `billing` 폴더를 가리키던 문제). 이미 config.json에 있는 탭은 그대로 읽는다.
+- 창이 `TMUX`·`TMUX_PANE`·`PSMUX_*` 환경 변수를 물려받지 않는다(psmux 셸에서 띄웠을 때 Claude Code가 tmux로 오인하던 문제).
+- katex 0.19.0(0.18.11은 upstream에서 폐기 표시됨).
+
+### Notes
+- push·PR마다 JS·Rust 테스트를 도는 CI(`.github/workflows/ci.yml`)를 추가했다. 릴리스 빌드는 산출물이 빠지면 실패하고, 태그 없이 수동 실행할 수 있다.
+- `docs/spikes.md`의 1단계 체크리스트 중 현재 키·마법사와 어긋난 곳을 고쳤다.
+
 ## V0.2.0
 
 2단계 — 상시업무 조직 운영. dispatcher 창 하나에 머물며 여러 상시업무를 Claude Code 에이전트들에게 맡긴다.

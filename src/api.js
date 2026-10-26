@@ -21,8 +21,18 @@ export async function attach(paneId, onBytes) {
   return toBytes(snap);
 }
 
+/** User input (keys, paste, IME): `pty_write`, counted as the user's typing (R4). */
 export function write(paneId, str) {
   return tauri().core.invoke('pty_write', { pane: paneId, data: str });
+}
+
+/**
+ * Terminal replies and xterm binary data: raw bytes (0–255) through `pty_write_raw`, not counted
+ * as user input. Sent as a plain number array (a Uint8Array inside the args object would be
+ * JSON-serialized as an object, not an array).
+ */
+export function writeRaw(paneId, bytes) {
+  return tauri().core.invoke('pty_write_raw', { pane: paneId, bytes: Array.from(bytes) });
 }
 
 export function resize(paneId, cols, rows) {

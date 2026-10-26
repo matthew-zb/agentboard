@@ -77,3 +77,16 @@ impl JobGuard {
         }
     }
 }
+
+/// Creation flag: the child is not part of the caller's job. Allowed because the job sets
+/// JOB_OBJECT_LIMIT_BREAKAWAY_OK (see [`JobGuard::new`]).
+pub const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Start `cmd` outside the app's job object, so it outlives the app (the browser a document
+/// link opens). Fails — e.g. ERROR_ACCESS_DENIED — when an outer job (a launcher's, an IDE's)
+/// forbids breakaway; callers then fall back to an ordinary start.
+pub fn spawn_outside_job(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW).spawn()
+}
