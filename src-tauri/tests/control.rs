@@ -210,7 +210,7 @@ fn tools_list_is_filtered_by_role() {
             "inbox_post", "inbox_propose_close", "issue_create", "list_team", "need_user"
         ]
     );
-    assert_eq!(tool_names(&fx, &d), ["create_manager_tab", "env_set_source", "env_skip", "env_status", "handoff_done", "inbox_list", "need_user"]);
+    assert_eq!(tool_names(&fx, &d), ["config_reload", "create_manager_tab", "env_set_source", "env_skip", "env_status", "handoff_done", "inbox_list", "need_user"]);
     assert_eq!(tool_names(&fx, &l), ["dismiss", "dismiss_team", "env_status", "hire_member", "inbox_list", "list_team", "need_user"]);
     assert_eq!(tool_names(&fx, &mb), ["env_status", "inbox_list", "need_user"]);
 

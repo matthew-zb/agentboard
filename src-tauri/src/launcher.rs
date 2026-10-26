@@ -111,6 +111,10 @@
 //!   the inbox owner names under the inbox lock alone; then the model; rollback on failure. So
 //!   no code may call `execute` with one of those commands while holding `CONFIG_WRITE`
 //!   (nothing does: `create_manager_tab` only executes `CreateTab` under it).
+//! * Config reload (`reload_config_from`): `CONFIG_WRITE` → `load_all` with no app lock →
+//!   `ws` → `loaded(read)` (released) → `loaded(write)` while `ws` is still held (the allowed
+//!   `ws -> loaded` direction; nothing takes `ws` while holding `loaded`) → both released, then
+//!   `submit` / `publish` / Ui emits.
 //! * Environment check (envcheck.rs, Task 12): `AppState::env` (probe results) and its
 //!   refresh lock are leaves; the probe processes run holding only the refresh lock. Reading
 //!   items takes `ws` (clone, released), `loaded(read)`, and `trust` → PtyManager `panes`
@@ -530,6 +534,51 @@ fn execute_with_config(state: &AppState, cmd: WsCommand, name: &str, dir: &str, 
         state.inbox.touch(); // its items lost their owner: the applet re-reads
     }
     res
+}
+
+/// Config reload without restarting anything (`config_reload`, palette and dispatcher MCP):
+/// `load_all` again (settings, config.json, templates, agent profiles, keybindings, role
+/// settings). Any validation error — or a moved workspaceRoot, or a config role tab that cannot
+/// be opened — returns the messages (`file:line:col: …` like the status bar) and changes
+/// nothing. Otherwise the model is updated (`Workspace::reload_roles`: missing role tabs added,
+/// standing prompts refreshed, tabs gone from config only reported) and `loaded` replaced
+/// together; the added tabs' panes start; the frontend is told (`config-reloaded`: re-read
+/// keybindings / errors; `env-changed`: folder-trust items follow the tabs).
+/// Lock order: CONFIG_WRITE (no config edit in between) → `ws` → `loaded(write)` (the existing
+/// `ws -> loaded` nesting), both released before effects / publish.
+/// [`reload_config_from`] for the running app (Tauri command and MCP `config_reload`): the
+/// appdata folder is the parent of `AppState::run_dir` (`<appdata>/run`,
+/// `agentcfg::default_run_dir`; test states are built the same way).
+pub fn reload_config(state: &AppState) -> Result<crate::workspace::ReloadReport, Vec<String>> {
+    let appdata = state.run_dir.parent().map(std::path::Path::to_path_buf).unwrap_or_else(crate::appdata_dir);
+    reload_config_from(state, &appdata)
+}
+
+pub fn reload_config_from(state: &AppState, appdata: &std::path::Path) -> Result<crate::workspace::ReloadReport, Vec<String>> {
+    let _cfg = config::CONFIG_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    let new = config::load_all(appdata); // file IO, no app lock held
+    if !new.errors.is_empty() {
+        return Err(new.errors.iter().map(|e| e.to_string()).collect());
+    }
+    let (fx, report) = {
+        let mut ws = state.ws.lock().unwrap();
+        let root = state.loaded.read().unwrap().settings.workspace_root.clone();
+        if new.settings.workspace_root != root {
+            return Err(vec![format!(
+                "settings.json의 workspaceRoot가 바뀌었습니다({} → {}) — 앱을 다시 시작해야 반영됩니다",
+                root.display(),
+                new.settings.workspace_root.display()
+            )]);
+        }
+        let out = ws.reload_roles(&new)?;
+        *state.loaded.write().unwrap() = new; // under `ws`: no command sees the new model with the old config
+        out
+    };
+    submit(state, fx);
+    publish(state);
+    state.ui.env_changed();
+    state.ui.config_reloaded();
+    Ok(report)
 }
 
 fn execute_model(state: &AppState, cmd: WsCommand) -> Result<Snapshot, String> {
@@ -1582,5 +1631,225 @@ mod tests {
         for bad in ["a/../b", "./a", "a//b", "a/CON", "billing.", "", "billing/", "/a", r"C:\x", "a/.git"] {
             assert!(check_rel_dir(bad).is_err(), "{bad:?}");
         }
+    }
+
+    // ---- config reload (no restart): validate, swap, add missing role tabs ----
+
+    #[derive(Default)]
+    struct ReloadUi {
+        reloaded: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::Ui for ReloadUi {
+        fn workspace_changed(&self, _: &Snapshot) {}
+        fn drop_channel(&self, _: &str) {}
+        fn config_reloaded(&self) {
+            self.reloaded.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ReloadFx {
+        state: AppState,
+        rx: mpsc::Receiver<Effects>,
+        ui: std::sync::Arc<ReloadUi>,
+        root: PathBuf,
+        appdata: PathBuf,
+        _keep: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    impl Drop for ReloadFx {
+        fn drop(&mut self) {
+            // a failed assertion may have poisoned `ws`: a second panic here would abort the run
+            let ids: Vec<String> = self.state.ws.lock().unwrap_or_else(|e| e.into_inner()).panes.keys().cloned().collect();
+            for id in ids {
+                self.state.pty.remove(&id);
+            }
+        }
+    }
+
+    impl ReloadFx {
+        fn write(&self, rel: &str, text: &str) {
+            std::fs::write(self.root.join(".agentboard").join(rel), text).unwrap();
+        }
+        fn reload(&self) -> Result<crate::workspace::ReloadReport, Vec<String>> {
+            reload_config_from(&self.state, &self.appdata)
+        }
+        fn tab(&self, name: &str) -> Option<crate::workspace::Tab> {
+            self.state.ws.lock().unwrap().tabs.values().find(|t| t.name == name).cloned()
+        }
+        fn standing(&self, name: &str) -> crate::workspace::Pane {
+            let ws = self.state.ws.lock().unwrap();
+            let t = ws.tabs.values().find(|t| t.name == name).unwrap();
+            ws.panes[&ws.standing_pane(&t.id).unwrap()].clone()
+        }
+        /// Start the pane's process (an idle cmd.exe): a real generation to compare later.
+        fn run(&self, pane: &str) -> u64 {
+            let spec = SpawnSpec {
+                cmd: "cmd.exe".into(),
+                args: vec!["/q".into(), "/k".into()],
+                env: vec![],
+                env_remove: vec![],
+                cwd: std::env::temp_dir(),
+                cols: 80,
+                rows: 24,
+            };
+            self.state.pty.spawn(pane, spec).unwrap()
+        }
+    }
+
+    const RELOAD_CONFIG: &str = r#"{"defaultAgent": "cmd",
+  "tabs": [{"name": "billing", "role": "manager", "dir": "billing", "template": "manager"}, {"name": "api", "dir": "api"}],
+  "defaultGroup": "work",
+  "groups": {"split": "horizontal", "children": [
+    {"group": {"name": "control", "tabs": ["dispatcher"]}},
+    {"group": {"name": "work", "tabs": ["billing", "api"]}}]}}
+"#;
+
+    fn reload_fx() -> ReloadFx {
+        let root = tempfile::tempdir().unwrap();
+        let appdata = tempfile::tempdir().unwrap();
+        let s = serde_json::json!({ "workspaceRoot": root.path().to_string_lossy() });
+        std::fs::write(appdata.path().join("settings.json"), s.to_string()).unwrap();
+        ensure_dotdir(root.path()).unwrap();
+        std::fs::write(root.path().join(".agentboard/config.json"), RELOAD_CONFIG).unwrap();
+        let loaded = load_all(appdata.path());
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        let ws = Workspace::from_config(&loaded);
+        let (tx, rx) = mpsc::channel();
+        let ui = std::sync::Arc::new(ReloadUi::default());
+        let pty = crate::pty::PtyManager::new_per_child_job(std::sync::Arc::new(NullSink));
+        let state = AppState::new(ws, loaded, pty, ui.clone(), tx, crate::persist::Saver::disabled(), Vec::new(), appdata.path().join("run"));
+        ReloadFx { state, rx, ui, root: root.path().to_path_buf(), appdata: appdata.path().to_path_buf(), _keep: (root, appdata) }
+    }
+
+    #[test]
+    fn reload_with_errors_changes_nothing() {
+        let f = reload_fx();
+        let (ws, cfg) = (f.state.ws.lock().unwrap().clone(), f.state.loaded.read().unwrap().config.clone());
+        let unchanged = |f: &ReloadFx| {
+            assert_eq!(*f.state.ws.lock().unwrap(), ws);
+            assert_eq!(f.state.loaded.read().unwrap().config, cfg);
+            assert!(f.rx.try_recv().is_err(), "nothing spawned or killed");
+            assert_eq!(f.ui.reloaded.load(Ordering::SeqCst), 0);
+        };
+        // a syntax error: located like the status bar's error list
+        f.write("config.json", "{\n  \"tabs\": [\n    {\"name\": \"x\" \"dir\": \"x\"}\n  ]\n}\n");
+        let errs = f.reload().unwrap_err();
+        assert!(errs.len() == 1 && errs[0].contains("config.json") && errs[0].contains(":3:"), "{errs:?}");
+        unchanged(&f);
+        // a validation error (a valid file is not enough)
+        f.write("config.json", &RELOAD_CONFIG.replace("\"defaultAgent\": \"cmd\",", "\"defaultAgent\": \"cmd\", \"nightlyRefresh\": \"25:00\","));
+        assert!(f.reload().unwrap_err().iter().any(|e| e.contains("nightlyRefresh")));
+        unchanged(&f);
+        // a config role tab that cannot be opened: the whole reload is refused
+        f.write("config.json", &RELOAD_CONFIG.replace(r#"{"name": "api", "dir": "api"}"#, r#"{"name": "api", "role": "manager", "dir": "api2"}"#));
+        let errs = f.reload().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("'api'") && e.contains("같은 이름의 다른 탭")), "{errs:?}");
+        unchanged(&f);
+        // the workspace root itself cannot move under a running app
+        f.write("config.json", RELOAD_CONFIG);
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(f.appdata.join("settings.json"), serde_json::json!({"workspaceRoot": other.path().to_string_lossy()}).to_string()).unwrap();
+        assert!(f.reload().unwrap_err().iter().any(|e| e.contains("workspaceRoot")));
+        unchanged(&f);
+    }
+
+    #[test]
+    fn reload_adds_missing_role_tabs_without_restarting_others() {
+        let f = reload_fx();
+        let billing = f.standing("billing").id;
+        let gen = f.run(&billing);
+        let before: std::collections::BTreeSet<String> = f.state.ws.lock().unwrap().panes.keys().cloned().collect();
+        f.write(
+            "config.json",
+            &RELOAD_CONFIG.replace(
+                r#"{"name": "api", "dir": "api"}"#,
+                r#"{"name": "api", "dir": "api"}, {"name": "handover", "role": "handover", "dir": ""}, {"name": "ops", "role": "manager", "dir": "ops", "template": "manager"}"#,
+            ),
+        );
+        let r = f.reload().unwrap();
+        assert_eq!(r.added, ["handover", "ops"]);
+        assert!(r.kept_missing.is_empty() && r.prompts_updated == 0, "{r:?}");
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v, serde_json::json!({"added": ["handover", "ops"], "keptMissing": [], "promptsUpdated": 0}));
+        let (h, o) = (f.tab("handover").unwrap(), f.tab("ops").unwrap());
+        assert_eq!((h.role, o.role), (Some(Role::Handover), Some(Role::Manager)));
+        assert_eq!(f.standing("handover").session_name.as_deref(), Some("handover"));
+        // only the new tabs' panes start (with their start prompts); nothing else is touched
+        let fx = f.rx.try_recv().expect("effects of the new tabs");
+        assert!(fx.kill.is_empty());
+        let new: std::collections::BTreeSet<String> =
+            f.state.ws.lock().unwrap().panes.keys().filter(|p| !before.contains(*p)).cloned().collect();
+        let spawned: std::collections::BTreeSet<String> = fx.spawn.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(spawned, new);
+        assert!(fx.spawn.iter().all(|(_, inject)| *inject));
+        assert!(f.rx.try_recv().is_err());
+        assert_eq!((f.state.pty.current_gen(&billing), f.state.pty.is_running(&billing)), (Some(gen), true), "billing was not restarted");
+        // the loaded config is the new one; the frontend is told to re-read keys etc.
+        assert!(f.state.loaded.read().unwrap().config.tabs.iter().any(|t| t.name == "handover"));
+        assert_eq!(f.ui.reloaded.load(Ordering::SeqCst), 1);
+        let mut ws = f.state.ws.lock().unwrap().clone();
+        assert_eq!(ws.normalize_and_validate(), Ok(()));
+        // a second reload with the same files changes nothing
+        let r = f.reload().unwrap();
+        assert!(r.added.is_empty() && r.kept_missing.is_empty() && r.prompts_updated == 0);
+        assert!(f.rx.try_recv().map_or(true, |fx| fx.spawn.is_empty() && fx.kill.is_empty()));
+    }
+
+    #[test]
+    fn reload_updates_stored_start_prompt_without_restart() {
+        let f = reload_fx();
+        let billing = f.standing("billing");
+        let gen = f.run(&billing.id);
+        let tpl = std::fs::read_to_string(f.root.join(".agentboard/templates/manager.json")).unwrap();
+        let old = billing.prompt.clone().unwrap();
+        f.write("templates/manager.json", &tpl.replace(&old, "새 시작 리뷰"));
+        let r = f.reload().unwrap();
+        assert_eq!(r.prompts_updated, 1, "{r:?}");
+        assert_eq!(f.standing("billing").prompt.as_deref(), Some("새 시작 리뷰"), "used at the next restart / nightly refresh");
+        assert!(f.rx.try_recv().map_or(true, |fx| fx.spawn.is_empty() && fx.kill.is_empty()), "no restart");
+        assert_eq!(f.state.pty.current_gen(&billing.id), Some(gen));
+        // the shell pane of the same tab (not a standing agent) is not a target
+        let shell = {
+            let ws = f.state.ws.lock().unwrap();
+            ws.panes.values().find(|p| p.tab == billing.tab && p.name == "shell").cloned().unwrap()
+        };
+        assert_eq!(shell.role, None);
+    }
+
+    #[test]
+    fn reload_reports_but_keeps_tabs_missing_from_config() {
+        let f = reload_fx();
+        let billing = f.standing("billing").id;
+        f.write("config.json", &RELOAD_CONFIG.replace(r#"{"name": "billing", "role": "manager", "dir": "billing", "template": "manager"}, "#, "").replace(r#""tabs": ["billing", "api"]"#, r#""tabs": ["api"]"#));
+        let r = f.reload().unwrap();
+        assert_eq!(r.kept_missing, ["billing"]);
+        assert!(r.added.is_empty());
+        let t = f.tab("billing").expect("not closed");
+        assert_eq!(t.role, Some(Role::Manager), "keeps its role until the user closes it");
+        assert!(f.state.ws.lock().unwrap().panes.contains_key(&billing));
+        assert!(f.rx.try_recv().map_or(true, |fx| fx.kill.is_empty()), "nothing killed");
+    }
+
+    /// R12: a tab added by a reload goes to the end of defaultGroup in the background.
+    #[test]
+    fn reload_keeps_focus_and_active_tab() {
+        let f = reload_fx();
+        let (focus, last, actives) = {
+            let ws = f.state.ws.lock().unwrap();
+            let actives: Vec<_> = ws.groups.values().map(|g| (g.id.clone(), g.active_tab_id.clone())).collect();
+            (ws.focus.clone(), ws.last_location.clone(), actives)
+        };
+        f.write(
+            "config.json",
+            &RELOAD_CONFIG.replace(r#"{"name": "api", "dir": "api"}"#, r#"{"name": "api", "dir": "api"}, {"name": "ops", "role": "manager", "dir": "ops"}"#),
+        );
+        f.reload().unwrap();
+        let ws = f.state.ws.lock().unwrap();
+        assert_eq!(ws.focus, focus);
+        assert_eq!(ws.last_location, last);
+        let now: Vec<_> = ws.groups.values().map(|g| (g.id.clone(), g.active_tab_id.clone())).collect();
+        assert_eq!(now, actives);
+        let work = ws.groups.values().find(|g| g.name == "work").unwrap();
+        assert_eq!(work.tab_ids.last().map(|t| ws.tabs[t].name.as_str()), Some("ops"));
     }
 }
