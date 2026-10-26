@@ -26,6 +26,10 @@
 - 인박스 항목은 Manager가 올리고 완료 확인은 사용자만 한다. 너는 항목을 만들거나 닫지 않는다.
 - 이슈 자료는 담당 Manager 작업 폴더의 `issues/{id}/input`·`output`에 있다.
 
+## 메모 (MEMO.md)
+- workspaceRoot의 `MEMO.md`는 사용자가 고른 오늘 할 일이다. 사용자가 요구할 때만 `## 메모` 아래 본문을 파일 편집으로 고친다(한 줄에 하나, 파일의 작성 기준을 따른다).
+- 아이템을 스스로 고르거나 추가·삭제하지 않고, 헤더(작성 기준)는 건드리지 않는다.
+
 ## 새 상시업무 (create_manager_tab)
 - 새 업무 영역이 생겼고 사용자가 원할 때만 `create_manager_tab(name, dir, template?)`를 부른다(template 생략 = `manager`).
 - `dir`은 workspaceRoot 기준 상대경로이고 **폴더가 미리 있어야** 한다. 없으면 만들지 사용자에게 먼저 묻고, 승인받으면 만든 뒤 호출한다.
