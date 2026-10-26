@@ -40,6 +40,7 @@ pub const PERMISSIONS: &[(&str, &[Role])] = &[
     ("env_status", &[D, H, M, L, Mb]),
     ("env_skip", &[D]),
     ("env_set_source", &[D]),
+    ("config_reload", &[D]),
 ];
 
 /// Whether `role` may call `tool` (per [`PERMISSIONS`]; unknown tools: no).
@@ -243,6 +244,11 @@ fn implemented() -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
         },
+        ToolDef {
+            name: "config_reload",
+            description: "config.json·templates·agents·keybindings를 다시 읽습니다. 앱과 다른 창은 재시작되지 않습니다. config에 있는데 열려 있지 않은 역할 탭(Manager·handover)을 새 세션으로 열고, 상시 창의 시작 프롬프트는 템플릿 값으로 바꿔 두며(다음 새 시작 때 적용), config에서 빠진 역할 탭은 닫지 않고 알려 줍니다. 결과: {added, keptMissing, promptsUpdated}. 설정 오류가 있으면 아무것도 바꾸지 않고 오류 줄(파일:줄:열)을 돌려줍니다 — 고친 뒤 다시 부르세요.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
     ]
 }
 
@@ -297,6 +303,7 @@ pub fn call(state: &AppState, caller: &Caller, name: &str, args: Value) -> Resul
         "env_status" => Ok(json!({ "items": crate::envcheck::status(state) })),
         "env_skip" => env_skip(state, &args),
         "env_set_source" => env_set_source(state, &args),
+        "config_reload" => config_reload(state),
         _ => Err(format!("알 수 없는 도구입니다: {name}")),
     }
 }
@@ -788,6 +795,16 @@ fn create_manager_tab_with(state: &AppState, name: String, dir: String, template
     Ok(reply(&id, &group_name, false))
 }
 
+// ───────────────────────── config reload ─────────────────────────
+
+/// `config_reload` (dispatcher): the palette's "설정 다시 읽기" (`launcher::reload_config`).
+fn config_reload(state: &AppState) -> Result<Value, String> {
+    match launcher::reload_config(state) {
+        Ok(report) => serde_json::to_value(report).map_err(|e| e.to_string()),
+        Err(lines) => Err(format!("설정을 다시 읽지 않았습니다(바뀐 것 없음):\n{}", lines.join("\n"))),
+    }
+}
+
 // ───────────────────────── environment (Task 12) ─────────────────────────
 
 /// Every id `env_skip` accepts right now (built-ins, folder-trust items, custom items).
@@ -886,7 +903,7 @@ mod tests {
         );
         assert_eq!(
             names(Role::Dispatcher),
-            ["inbox_list", "handoff_done", "create_manager_tab", "need_user", "env_status", "env_skip", "env_set_source"]
+            ["inbox_list", "handoff_done", "create_manager_tab", "need_user", "env_status", "env_skip", "env_set_source", "config_reload"]
         );
         assert_eq!(names(Role::Lead), ["inbox_list", "hire_member", "dismiss", "dismiss_team", "list_team", "need_user", "env_status"]);
         assert_eq!(names(Role::Handover), ["inbox_list", "handoff_done", "need_user", "env_status"]);
@@ -1458,6 +1475,38 @@ mod tests {
     }
 
     // ── R27: config-backed role tabs ──
+
+    // ---- config_reload (dispatcher) ----
+
+    #[test]
+    fn config_reload_is_dispatcher_only() {
+        assert!(allowed("config_reload", Role::Dispatcher));
+        for r in [Role::Handover, Role::Manager, Role::Lead, Role::Member] {
+            assert!(!allowed("config_reload", r), "{}", r.as_str());
+        }
+        let f = fx(TWO_MANAGERS);
+        let e = f.call("billing", "config_reload", json!({})).unwrap_err();
+        assert!(e.contains("config_reload"), "{e}");
+    }
+
+    /// The dispatcher edits config.json (e.g. adds the handover tab) and calls config_reload:
+    /// the reply is the same report as the palette's, as JSON text; errors are a tool error.
+    #[test]
+    fn config_reload_over_mcp_returns_report() {
+        let f = fx(TWO_MANAGERS);
+        let path = f.root.join(".agentboard/config.json");
+        let with_handover = TWO_MANAGERS.replace(r#"]}"#, r#",{"name":"handover","role":"handover","dir":""}]}"#);
+        std::fs::write(&path, &with_handover).unwrap();
+        let r = f.call("dispatcher", "config_reload", json!({})).unwrap();
+        assert_eq!(r, json!({"added": ["handover"], "keptMissing": [], "promptsUpdated": 0}));
+        assert!(f.has("handover"), "the handover session is there now");
+        assert!(f._rx.try_recv().is_ok_and(|fx| fx.kill.is_empty() && !fx.spawn.is_empty()), "only the new tab starts");
+        // a broken file: nothing changes, the lines come back as the tool error
+        std::fs::write(&path, "{\n  \"tabs\": [\n").unwrap();
+        let e = f.call("dispatcher", "config_reload", json!({})).unwrap_err();
+        assert!(e.contains("설정을 다시 읽지 않았습니다") && e.contains("config.json"), "{e}");
+        assert!(f.has("handover") && f.has("billing"));
+    }
 
     const R27_CONFIG: &str = r#"{
   "tabs": [

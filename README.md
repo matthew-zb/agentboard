@@ -210,7 +210,12 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
 | `dispatcher`·`solo`·`team-3` | 1단계 그대로 | — |
 
 - 팀 리드는 팀 영역 오른쪽에 팀마다 한 열로, 팀원은 그 리드 아래로 붙습니다. 템플릿에 `slot: "team"` 분할이 없으면 첫 채용 때 Manager 창 오른쪽에 팀 영역이 생기고, 마지막 팀이 해산되면 사라집니다.
-- 시작 프롬프트는 앱을 시작할 때 템플릿에서 다시 읽습니다. 템플릿을 고치면 다음 앱 시작부터 적용됩니다(야간 정리 재시작은 그때 읽은 프롬프트를 다시 넣습니다).
+- 시작 프롬프트는 앱을 시작할 때, 또는 **설정 다시 읽기** 때 템플릿에서 다시 읽습니다. 떠 있는 창은 재시작하지 않으므로 바뀐 프롬프트는 그 창의 다음 재시작·야간 정리 때부터 들어갑니다.
+- **설정 다시 읽기**(팔레트 "설정 다시 읽기", dispatcher의 MCP `config_reload`): 앱을 재시작하지 않고 `config.json`·템플릿·에이전트 프로필·키 설정을 다시 읽습니다. 다른 창은 재시작하지 않습니다.
+  - 검증 오류가 하나라도 있으면 아무것도 바꾸지 않고 오류를 보여 줍니다.
+  - `tabs[]`에는 있는데 화면에 없는 역할 탭(handover 포함)은 `defaultGroup` 끝에 새 세션으로 띄웁니다. 포커스는 옮기지 않습니다.
+  - config에서 빠진 역할 탭은 닫지 않고 알려 주기만 합니다.
+  - `settings.json`의 `workspaceRoot`가 바뀌었거나, 띄울 수 없는 역할 탭(같은 이름의 다른 탭, 없는 템플릿, handover 둘)이 있으면 거부합니다.
 - config.json이 없으면(새로 설치, 또는 `.agentboard`만 있고 config.json이 없을 때) 시작용 config.json이 `dispatcher-inbox`를 쓰도록 만들어집니다. 있는 config.json은 덮어쓰지 않습니다. **이미 쓰던 설치**에서 인박스를 붙이려면 `"dispatcher": { "template": "dispatcher-inbox" }`로 바꾼 뒤, 앱을 끈 상태에서 `%APPDATA%/agentboard/workspace.json`을 지우세요(저장된 배치가 dispatcher 탭을 예전 모양으로 복원하기 때문입니다. 배치는 config 기준으로 초기화됩니다). 인박스 항목의 담당은 탭 이름으로 기록되므로 이렇게 초기화해도 그대로 유지됩니다.
 
 ### 앱 내장 MCP 도구
@@ -232,6 +237,7 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
 | `need_user(reason)` | 모두 | 그 창의 탭에 ⚠ + 사유 |
 | `env_status()` | 모두 | 환경 점검 결과 |
 | `env_skip(item)` · `env_set_source(item, url)` | dispatcher | 점검 건너뛰기 기록 · 설치 저장소 주소 기록 |
+| `config_reload()` | dispatcher | 설정 다시 읽기(재시작 없음, 아래 "기본 템플릿" 절) — 추가된 탭·닫지 않은 탭·갱신한 시작 프롬프트 수 |
 
 팀 문서: Manager는 리드를 채용하기 전에 `<작업 폴더>/teams/<팀id>/brief.md`(첫 줄 `상태: 진행 중`)와 `roster.md`(팀원 구성)를 씁니다. 끝난 팀은 brief에 `상태: 완료`를 적어 재채용 대상에서 뺍니다.
 
@@ -284,7 +290,7 @@ dispatcher 오른쪽 열의 인박스 아래 창(`{"applet":{"name":"memo","kind
 ### 시작·복원·자동 실행
 
 - 시작할 때는 상시 에이전트(dispatcher·handover·Manager)만 **새 세션 + 시작 프롬프트**로 띄웁니다. 팀 창과 팀 영역은 복원하지 않고, 각 Manager가 시작 리뷰에서 `teams/*/brief.md`가 `상태: 완료`가 아닌 팀을 **자동으로 다시 채용**하며, 리드는 `roster.md`대로 팀원을 다시 채용해 이어서 일합니다.
-- **역할 탭의 기준은 config.json입니다.** 이름·dir이 같은 `tabs[]` 항목이 있는 탭만 역할 탭으로 복원되고, config에만 있는 역할 탭은 `defaultGroup`에 포커스를 뺏지 않고 추가됩니다. Manager·handover 탭의 이름을 바꾸거나 닫으면 config.json 항목도 함께 바뀌거나 빠집니다. 역할 없는 탭은 1단계처럼 `workspace.json`에서 복원합니다.
+- **역할 탭의 기준은 config.json입니다.** 이름·dir이 같은 `tabs[]` 항목이 있는 탭만 역할 탭으로 복원되고, config에만 있는 역할 탭은 `defaultGroup`에 포커스를 뺏지 않고 추가됩니다(앱 시작 때, 그리고 "설정 다시 읽기" 때). Manager·handover 탭의 이름을 바꾸거나 닫으면 config.json 항목도 함께 바뀌거나 빠집니다. 역할 없는 탭은 1단계처럼 `workspace.json`에서 복원합니다.
 - 역할 탭 안의 다른 창(예: `manager` 템플릿의 셸, 직접 띄운 Claude 창)은 역할 없는 창으로 시작 프롬프트 없이 다시 실행됩니다.
 - **한 번에 하나만 실행**: 이미 실행 중일 때 다시 실행하면(자동 실행 뒤 바로 가기 클릭, 설치 후 재실행 등) 새 프로세스는 바로 끝나고 기존 창이 앞으로 옵니다. 역할 세션의 hook(`agentboard.exe --hook …`)은 이 제한과 무관하게 동작합니다.
 - **인박스 담당**: 항목은 담당 탭의 **이름**으로 기록됩니다. Manager 탭 이름을 바꾸면 그 항목들도 함께 옮겨 가고, 탭을 닫으면 항목은 "담당 없음(이름)"으로 표시되며 지시·이슈 요청을 보낼 수 없습니다(같은 이름의 Manager 탭을 다시 만들면 다시 연결됩니다).
