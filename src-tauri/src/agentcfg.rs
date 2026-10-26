@@ -203,6 +203,30 @@ pub fn inherited_claude_vars(vars: impl IntoIterator<Item = String>) -> Vec<Stri
     v
 }
 
+/// Variables that tell a program it runs inside tmux; psmux (tmux for Windows) sets them too,
+/// plus its own `PSMUX_*` ([`MULTIPLEXER_PREFIX`]). AgentBoard panes are ConPTY terminals, not
+/// tmux panes: when AgentBoard is started from a psmux shell, no pane (plain or role) inherits
+/// them — otherwise Claude Code warns "tmux focus-events off" and switches its keyboard
+/// protocol. Exact names: `TMUXINATOR_*` and the like stay.
+pub const MULTIPLEXER_VARS: [&str; 2] = ["TMUX", "TMUX_PANE"];
+/// Prefix of psmux's own variables (`PSMUX_SESSION`, `PSMUX_TARGET_SESSION`, …).
+pub const MULTIPLEXER_PREFIX: &str = "PSMUX_";
+
+/// The names in `vars` (the app's environment) that are tmux/psmux markers
+/// ([`MULTIPLEXER_VARS`], `PSMUX_*`; case-insensitive), sorted, deduplicated.
+pub fn inherited_multiplexer_vars(vars: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut v: Vec<String> = vars
+        .into_iter()
+        .filter(|k| {
+            MULTIPLEXER_VARS.iter().any(|m| m.eq_ignore_ascii_case(k))
+                || k.get(..MULTIPLEXER_PREFIX.len()).is_some_and(|p| p.eq_ignore_ascii_case(MULTIPLEXER_PREFIX))
+        })
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// Write `contents` next to `path` and rename over it (readers never see a partial file).
 fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
