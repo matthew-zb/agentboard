@@ -41,7 +41,7 @@ test('only the --only sessions are imported; dispatcher and handover never becom
   assert.deepEqual(r.config.tabs.map((t) => t.name), ['RTCmod']);
   assert.deepEqual(r.config.dispatcher, { agent: 'claude', template: 'dispatcher-inbox' });
   assert.ok(r.warnings.some((w) => w.includes('workspace-07') && w.includes('디스패처')));
-  assert.ok(r.warnings.some((w) => w.includes("'handover'") && w.includes('psmux 하나만')));
+  assert.ok(r.warnings.some((w) => w.includes("'handover'") && w.includes('AgentBoard 밖') && !w.includes('psmux')));
   assert.ok(!r.config.tabs.some((t) => t.role === 'handover'));
   // nothing chosen → no tabs, a warning, a config with the dispatcher only
   const none = run([]);
@@ -134,6 +134,7 @@ test('CLI is a dry run: prints the planned files and writes nothing', () => {
     const out = execFileSync(process.execPath, [SCRIPT, reg, '--only', 'RTCmod,ha', '--root', root], { cwd: root, encoding: 'utf8' });
     assert.deepEqual(files(root).sort(), before, 'no file or folder created');
     assert.ok(out.includes('dry-run'));
+    assert.ok(!/psmux/i.test(out), 'AgentBoard does not use psmux: no file or message mentions it');
     assert.ok(out.includes(join(root, '.agentboard', 'config.json')));
     assert.ok(out.includes('"nightlyRefresh": null'));
     assert.ok(out.includes(join(root, '.agentboard', 'templates', 'ha-start.json')));

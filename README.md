@@ -280,9 +280,9 @@ dispatcher 탭 오른쪽 창(`{"applet":{"name":"inbox","kind":"inbox"}}`)입니
 - **인박스 담당**: 항목은 담당 탭의 **이름**으로 기록됩니다. Manager 탭 이름을 바꾸면 그 항목들도 함께 옮겨 가고, 탭을 닫으면 항목은 "담당 없음(이름)"으로 표시되며 지시·이슈 요청을 보낼 수 없습니다(같은 이름의 Manager 탭을 다시 만들면 다시 연결됩니다).
 - **로그인 시 자동 실행**: 커맨드 팔레트의 "로그인 시 자동 실행 켜기/끄기"(HKCU `Run` 키에 현재 exe 경로를 등록). 개발 빌드에서 켜면 개발용 exe가 등록되니 주의하세요.
 
-### psmux 세션 등록부에서 옮겨 오기
+### 세션 등록부(registry.json)에서 옮겨 오기
 
-- `node scripts/import-registry.mjs <registry.json> --only <세션,…> [--root <workspaceRoot>]` — psmux 세션 등록부(session-board `registry.json`)에서 고른 `regular[]` 세션을 Manager 탭 설정으로 바꿔 **화면에만 출력합니다(dry-run, 파일을 하나도 쓰지 않음)**. `--root`를 생략하면 등록부 디스패처 항목의 dir을 씁니다.
+- `node scripts/import-registry.mjs <registry.json> --only <세션,…> [--root <workspaceRoot>]` — 기존 세션 등록부(session-board `registry.json`)에서 고른 `regular[]` 세션을 Manager 탭 설정으로 바꿔 **화면에만 출력합니다(dry-run, 파일을 하나도 쓰지 않음)**. `--root`를 생략하면 등록부 디스패처 항목의 dir을 씁니다.
 - 출력: `config.json`(dispatcher `dispatcher-inbox`, control | work 그룹, `nightlyRefresh: null`, holla 전체 경로 점검), `startupPrompt`가 있는 세션의 탭별 템플릿(`<세션>-start`), 공존 기간 안내를 붙인 `roles/dispatcher.md`·`roles/manager.md`.
 - 이미 있는 파일은 `*.imported.*` 이름으로 표시할 뿐 **덮어쓰지 않습니다** — 내용을 확인한 뒤 직접 반영하세요. 디스패처(`workspace-07`)·handover·workspaceRoot 밖 폴더는 탭으로 만들지 않고 경고합니다.
 

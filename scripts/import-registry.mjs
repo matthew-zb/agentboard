@@ -1,13 +1,14 @@
-// Move sessions of the psmux session board (C:\workspace\claude\session-board\registry.json) into
-// an AgentBoard config — DRY RUN ONLY: prints the files it would create and their content, writes
+// Move sessions of the existing session registry (session-board registry.json,
+// C:\workspace\claude\session-board\registry.json) into an AgentBoard config — DRY RUN ONLY: prints the files it would create and their content, writes
 // nothing (user decision 10-26: operating files and an existing config are never changed).
 //
 //   node scripts/import-registry.mjs <registry.json> --only RTCmod[,ha…] [--root C:/workspace]
 //
 // Coexistence period (docs/superpowers/specs/2026-10-26-현재운영_재사용_매핑.md §3): only the chosen
-// regular[] sessions become Manager tabs, under the same names (the psmux copy is closed when one
-// moves); the dispatcher (workspace-07) and handover stay in psmux — AgentBoard gets
-// config.dispatcher, no handover tab; nightly refresh off; holla checked by its full path.
+// regular[] sessions become Manager tabs, under the same names (the copy in the existing operation
+// outside AgentBoard is closed when one moves); the dispatcher (workspace-07) and handover keep
+// running outside AgentBoard — AgentBoard gets config.dispatcher, no handover tab; nightly refresh
+// off; holla checked by its full path.
 // `--root` defaults to the dispatcher entry's dir in the registry.
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -29,11 +30,11 @@ export const HOLLA_REQUIRE = {
 };
 
 export const DISPATCHER_NOTICE =
-  '이 AgentBoard dispatcher 는 공존 기간용이다. 기존 psmux 운영의 형님 대화창 세션은 workspace-07 이며 지금도 그대로 있다. ' +
+  '이 AgentBoard dispatcher 는 공존 기간용이다. AgentBoard 밖에서 도는 형님 대화창 세션 workspace-07 은 지금도 그대로 있다. ' +
   'Handover.md·메모리·각 세션 지시문의 workspace-07 은 그 세션을 가리킨다. 완전 전환 뒤에는 workspace-07 이 너를 가리킨다.';
 
 export const MANAGER_NOTICE =
-  '진행 보고는 지금처럼 progress.md·C:\\workspace\\claude\\handover-inbox 보고 파일 + psmux 의 handover 세션에 SendMessage ' +
+  '진행 보고는 지금처럼 progress.md·C:\\workspace\\claude\\handover-inbox 보고 파일 + handover 세션(AgentBoard 밖)에 SendMessage ' +
   '(규격 C:\\workspace\\claude\\session-board\\docs\\design\\handover-single-writer.md §3). ' +
   '인박스(inbox_post)는 형님의 결정·확인이 필요한 건에만 쓴다. 슬랙은 C:\\workspace\\CLAUDE.md 「holla CLI」 절을 따른다.';
 
@@ -92,11 +93,11 @@ export function importRegistry(registry, { only = [], workspaceRoot, defaultsDir
       continue;
     }
     if (isDispatcher(e)) {
-      warnings.push(`'${name}': 디스패처는 탭으로 옮기지 않습니다 — 공존 기간에는 psmux의 형님 대화창 그대로이고, AgentBoard dispatcher는 config.dispatcher가 맡습니다`);
+      warnings.push(`'${name}': 디스패처는 탭으로 옮기지 않습니다 — 공존 기간에는 기존 운영(AgentBoard 밖)의 형님 대화창 그대로이고, AgentBoard dispatcher는 config.dispatcher가 맡습니다`);
       continue;
     }
     if (isHandover(e)) {
-      warnings.push(`'${name}': handover는 공존 기간에 psmux 하나만 둡니다 — 탭으로 만들지 않습니다`);
+      warnings.push(`'${name}': handover는 공존 기간에 기존 운영(AgentBoard 밖) 하나만 둡니다 — 탭으로 만들지 않습니다`);
       continue;
     }
     if (RESERVED_NAMES.includes(name.toLowerCase()) || taken.has(name.toLowerCase())) {
@@ -139,7 +140,7 @@ export function importRegistry(registry, { only = [], workspaceRoot, defaultsDir
         }
       : { group: { name: 'control', tabs: ['dispatcher'] } },
     tabs,
-    nightlyRefresh: null, // coexistence: off (no handover tab; psmux keeps the daily rhythm)
+    nightlyRefresh: null, // coexistence: off (no handover tab; the existing operation keeps the daily rhythm)
     envRequire: [{ ...HOLLA_REQUIRE }],
   };
   const roles = {
@@ -167,7 +168,7 @@ export function renderPlan(result, root, exists = existsSync) {
   ];
   if (result.warnings.length) out.push('경고:', ...result.warnings.map((w) => `- ${w}`));
   out.push(
-    '옮길 때: 그 세션의 등록부 항목을 regular[]에서 agentboard[]로 옮기고(start-all이 다시 띄우지 않게), psmux 쪽 세션은 닫는다 — 형님 승인 뒤.',
+    '옮길 때: 그 세션의 등록부 항목을 regular[]에서 agentboard[]로 옮기고(start-all이 다시 띄우지 않게), 기존 운영 쪽 그 세션은 닫는다 — 형님 승인 뒤.',
   );
   for (const [p, body] of files) {
     const target = exists(p) ? imported(p) : p;
