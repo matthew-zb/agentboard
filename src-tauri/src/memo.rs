@@ -139,6 +139,9 @@ mod tests {
         assert!(DEFAULT_MEMO.ends_with("\n## 메모\n\n"), "{DEFAULT_MEMO:?}");
         assert_eq!(DEFAULT_MEMO.lines().filter(|l| l.trim() == "## 메모").count(), 1);
         assert!(!DEFAULT_MEMO.contains("형님") && !DEFAULT_MEMO.contains('\r'));
+        // product wording, not a quote of one user's instruction
+        assert!(DEFAULT_MEMO.contains("\n- 제목은 20자 미만으로 쓴다. 상세 내용은 쓰지 않는다.\n"), "{DEFAULT_MEMO}");
+        assert!(!DEFAULT_MEMO.contains("원문"));
     }
 
     #[test]
