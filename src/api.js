@@ -95,6 +95,16 @@ export function configErrors() {
   return invoke('config_errors');
 }
 
+/**
+ * Re-read config.json, templates, profiles and keybindings without restarting any pane; role tabs
+ * that are in config but not on screen are started. Resolves `{added, keptMissing,
+ * promptsUpdated}`; rejects with the validation error lines (nothing changed). The backend then
+ * emits `config-reloaded` (also after the dispatcher's MCP `config_reload`).
+ */
+export function configReload() {
+  return invoke('config_reload');
+}
+
 /** Action → key string map from keybindings.json (defaults merged). */
 export function keybindings() {
   return invoke('get_keybindings');
