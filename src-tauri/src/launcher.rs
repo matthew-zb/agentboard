@@ -319,16 +319,71 @@ pub fn missing_dirs(ws: &Workspace) -> Vec<(TabId, String)> {
     ws.tabs.values().filter(|t| !t.workspace.is_dir()).map(|t| (t.id.clone(), t.dir.clone())).collect()
 }
 
-/// Validation for `create_workspace_dir`.
+/// Longest folder name (characters), the usual Windows component limit.
+pub const DIR_NAME_MAX: usize = 255;
+/// Characters Windows does not allow in a file or folder name.
+const DIR_NAME_FORBIDDEN: &str = "<>:\"/\\|?*";
+/// Folders the app (`.agentboard`) and git keep for themselves (case-insensitive like NTFS).
+const DIR_NAME_RESERVED: [&str; 2] = [".agentboard", ".git"];
+
+/// True for a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`,
+/// `COM¹²³`, `LPT¹²³`), case-insensitive, with or without an extension (`con.txt`, `aux.tar.gz`).
+fn is_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    if ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str()) {
+        return true;
+    }
+    let digit = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT"));
+    let mut chars = digit.unwrap_or_default().chars();
+    matches!((chars.next(), chars.next()), (Some(c), None) if c.is_ascii_digit() || "¹²³".contains(c))
+}
+
+/// Validation of one folder name the app creates or records for a new tab
+/// (`create_workspace_dir`, and each part of [`check_rel_dir`]). Besides `/ \ :` and `.`/`..`,
+/// refuses what Windows would reject or silently change: forbidden and control characters,
+/// leading/trailing spaces and a trailing dot (Win32 strips them, so `billing.` would name the
+/// existing `billing`), device names, over-long names, and `.agentboard` / `.git`.
+/// Not applied to folders already in config.json (they load as before).
 pub fn check_dir_name(name: &str) -> Result<(), String> {
     if name.trim().is_empty() {
         return Err("폴더 이름이 비어 있습니다".into());
     }
-    if name.contains(['/', '\\', ':']) {
-        return Err("폴더 이름에 / \\ : 는 쓸 수 없습니다".into());
+    if name.chars().count() > DIR_NAME_MAX {
+        return Err(format!("폴더 이름이 너무 깁니다(최대 {DIR_NAME_MAX}자)"));
+    }
+    if name.chars().any(char::is_control) {
+        return Err("폴더 이름에 제어 문자(줄바꿈·탭 등)는 쓸 수 없습니다".into());
+    }
+    if let Some(c) = name.chars().find(|c| DIR_NAME_FORBIDDEN.contains(*c)) {
+        return Err(format!("폴더 이름에 {c} 는 쓸 수 없습니다 (< > : \" / \\ | ? * 불가)"));
     }
     if name == "." || name == ".." {
         return Err("폴더 이름으로 . 이나 .. 은 쓸 수 없습니다".into());
+    }
+    if name != name.trim() || name.ends_with('.') {
+        return Err("폴더 이름의 앞뒤 공백과 끝의 점(.)은 쓸 수 없습니다 — Windows가 지워 다른 폴더를 가리키게 됩니다".into());
+    }
+    if is_device_name(name) {
+        return Err(format!("'{name}'은(는) Windows 장치 이름이라 폴더 이름으로 쓸 수 없습니다"));
+    }
+    if DIR_NAME_RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+        return Err(format!("'{name}'은(는) 앱·git이 쓰는 폴더라 쓸 수 없습니다"));
+    }
+    Ok(())
+}
+
+/// Validation of a new work tab's folder, relative to workspaceRoot (MCP `create_manager_tab`
+/// and the wizard's Manager choice): `/`- or `\`-separated parts, each a valid
+/// [`check_dir_name`] — so no `.`/`..`, no empty part, nothing absolute.
+pub fn check_rel_dir(dir: &str) -> Result<(), String> {
+    if dir.is_empty() {
+        return Err("폴더 경로가 비어 있습니다".into());
+    }
+    for part in dir.split(['/', '\\']) {
+        if part.is_empty() {
+            return Err("경로에 빈 부분이 있습니다(// 또는 앞뒤의 /)".into());
+        }
+        check_dir_name(part).map_err(|e| if part == dir { e } else { format!("'{part}': {e}") })?;
     }
     Ok(())
 }
@@ -1455,6 +1510,35 @@ mod tests {
         }
         for ok in ["api", "my-project", "한글"] {
             assert!(check_dir_name(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn check_dir_name_rejects_windows_reserved_and_invalid() {
+        for bad in [
+            "CON", "con.txt", "NUL", "COM1", "LPT9", "a?b", "a*b", "a<b", "a|b", "a\"b", "a:b", "foo.", "foo ",
+            " foo", "a\u{7}b", ".agentboard", ".git", ".GIT", "com¹", "LPT³.log", "COM0", "lpt0", "aux.tar.gz",
+        ] {
+            assert!(check_dir_name(bad).is_err(), "{bad:?} should be rejected");
+        }
+        assert!(check_dir_name(&"a".repeat(256)).is_err(), "longer than 255 characters");
+    }
+
+    #[test]
+    fn check_dir_name_keeps_common_names() {
+        for ok in ["api", "my-project", "한글", "v1.2", "a.b", "con-fig", ".config", "COM10", "console", "nul-x"] {
+            assert!(check_dir_name(ok).is_ok(), "{ok:?} should be accepted");
+        }
+        assert!(check_dir_name(&"a".repeat(255)).is_ok());
+    }
+
+    #[test]
+    fn check_rel_dir_requires_normalized_segments() {
+        for ok in ["a/b", r"a\b", "billing", "팀/결제"] {
+            assert!(check_rel_dir(ok).is_ok(), "{ok:?}");
+        }
+        for bad in ["a/../b", "./a", "a//b", "a/CON", "billing.", "", "billing/", "/a", r"C:\x", "a/.git"] {
+            assert!(check_rel_dir(bad).is_err(), "{bad:?}");
         }
     }
 }

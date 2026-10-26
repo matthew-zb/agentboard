@@ -688,7 +688,9 @@ fn create_manager_tab_with(state: &AppState, name: String, dir: String, template
     if dir.trim().is_empty() {
         return Err("상시업무 탭에는 전용 작업 폴더(dir)가 필요합니다".into());
     }
-    if let Some(m) = config::check_relative(&dir) {
+    // normalized parts only: an alias like `billing.` (Win32 strips the dot) or `a/../billing`
+    // would record a second dir string for an existing folder
+    if let Err(m) = crate::launcher::check_rel_dir(&dir) {
         return Err(format!("디렉토리 '{dir}': {m}"));
     }
     let (root, tpl, spec_template, default_group) = {
@@ -1160,6 +1162,23 @@ mod tests {
         assert_eq!(f.sessions().iter().filter(|s| s.ends_with("-lead")).count(), 2);
         // bad team ids are refused before anything else
         assert!(f.call("billing", "hire_lead", json!({"team":"Bad Id","brief_path":"teams/a/brief.md"})).is_err());
+        f.valid();
+    }
+
+    /// Win32 strips a trailing dot/space, so `billing.` would alias the existing `billing` folder
+    /// under a second dir string; device names and non-normalized paths are refused as well.
+    #[test]
+    fn create_manager_tab_rejects_alias_and_reserved_dirs() {
+        let cfg = r#"{"tabs": [{"name": "billing", "role": "manager", "dir": "billing"}]}
+"#;
+        let f = fx(cfg);
+        std::fs::create_dir_all(f.root.join("billing")).unwrap();
+        for dir in ["billing.", "billing ", "CON", "a/../billing", "./billing", "billing/"] {
+            let err = f.call("dispatcher", "create_manager_tab", json!({"name": "ops", "dir": dir})).unwrap_err();
+            assert!(err.contains(&format!("디렉토리 '{dir}'")), "{dir:?}: {err}");
+            assert_eq!(f.config_text(), cfg, "{dir:?}");
+        }
+        assert!(!f.state.ws.lock().unwrap().tabs.values().any(|t| t.name == "ops"));
         f.valid();
     }
 
