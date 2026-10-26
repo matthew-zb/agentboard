@@ -1,6 +1,7 @@
 pub mod agentcfg;
 pub mod attention;
 pub mod autostart;
+pub mod board;
 pub mod bridge;
 pub mod config;
 pub mod control;
@@ -88,6 +89,8 @@ pub struct AppState {
     pub exiting: AtomicBool,
     /// The memo's last known content (`memo.rs`; leaf lock).
     pub memo: memo::MemoState,
+    /// Per-pane session status for the dashboard (`board.rs`; leaf lock).
+    pub board: board::Board,
     /// Per-pane bearer tokens of role panes (leaf lock inside).
     pub tokens: agentcfg::Tokens,
     /// Control server base URL (`http://127.0.0.1:<port>`), set by the control server (Task 5)
@@ -134,6 +137,7 @@ impl AppState {
         let hooks = control::HookRouter::new();
         bridge::register_hooks(&hooks);
         attention::register_hooks(&hooks); // after the bridge: wraps its SessionStart
+        board::register_hooks(&hooks); // last: wraps SessionStart/UserPromptSubmit/Stop (dashboard)
         AppState {
             ws: Mutex::new(ws),
             loaded: RwLock::new(loaded),
@@ -147,6 +151,7 @@ impl AppState {
             startup_errors,
             exiting: AtomicBool::new(false),
             memo: memo::MemoState::default(),
+            board: board::Board::default(),
             tokens: agentcfg::Tokens::new(),
             ctrl_url: Mutex::new(None),
             run_dir,
