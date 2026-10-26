@@ -55,7 +55,8 @@ import {
   pickDoc,
 } from './overlays.js';
 import { mountInbox, configureInbox } from './inbox.js';
-import { mountDoc, configureDocView } from './docview.js';
+import { mountDoc, configureDocView, renderMarkdown, loadImages } from './docview.js';
+import { mountMemo, configureMemo } from './memo.js';
 import { configureCopyMode, toggleCopyMode, copyActive, pruneCopySessions } from './copy-ui.js';
 import { pickCommands, paletteItems, missingDirsFlow, closeFlow, envStatusFlag } from './overlay-logic.js';
 import { hiddenAttentionTabs, statusEntryText } from './attention-logic.js';
@@ -548,11 +549,14 @@ configurePanes({
   onBell,
   // Applet panes (Task 10): the inbox view replaces the xterm. Its keys are handled on the
   // applet element (bubble phase), so the router's app chords always win.
-  // Document tabs (Task 14) mount the markdown viewer the same way.
-  mountApplet: (kind, paneId, model) => (kind === 'inbox' ? mountInbox() : kind === 'doc' ? mountDoc(paneId, model) : null),
+  // Document tabs (Task 14) mount the markdown viewer the same way; the memo (below the inbox)
+  // renders MEMO.md's body with the same pipeline.
+  mountApplet: (kind, paneId, model) =>
+    kind === 'inbox' ? mountInbox() : kind === 'doc' ? mountDoc(paneId, model) : kind === 'memo' ? mountMemo(paneId) : null,
 });
 configureInbox({ toast, confirm, promptText, choose, onOpenFile: openDoc });
 configureDocView({ toast, prompt, choose });
+configureMemo({ render: renderMarkdown, loadImages, confirm, toast });
 // Tab drag & drop (spec 6.6). Errors from MoveTab/SplitGroupWith are toasted by sendCmd.
 installDnd($('groups'), {
   getWs: () => (current ? current.workspace : null),
