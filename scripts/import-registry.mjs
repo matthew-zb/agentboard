@@ -30,8 +30,8 @@ export const HOLLA_REQUIRE = {
 };
 
 export const DISPATCHER_NOTICE =
-  '이 AgentBoard dispatcher 는 공존 기간용이다. AgentBoard 밖에서 도는 형님 대화창 세션 workspace-07 은 지금도 그대로 있다. ' +
-  'Handover.md·메모리·각 세션 지시문의 workspace-07 은 그 세션을 가리킨다. 완전 전환 뒤에는 workspace-07 이 너를 가리킨다.';
+  'AgentBoard 밖의 형님 대화창 세션 workspace-07 이 지금도 돈다. ' +
+  'Handover.md·메모리·각 세션 지시문의 workspace-07 은 그 세션이다(완전 전환 뒤에는 너).';
 
 export const MANAGER_NOTICE =
   '진행 보고는 지금처럼 progress.md·C:\\workspace\\claude\\handover-inbox 보고 파일 + handover 세션(AgentBoard 밖)에 SendMessage ' +
