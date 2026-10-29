@@ -48,11 +48,26 @@ pub struct BoardEntry {
     /// The session's transcript (`transcript_path` of its hooks).
     #[serde(skip)]
     pub transcript: Option<PathBuf>,
+    /// The session's id (`session_id` of SessionStart; D3a — kept in the app, not on the wire).
+    #[serde(skip)]
+    pub session_id: Option<String>,
+    /// Model of the session: SessionStart's `model`, then the transcript's last assistant model.
+    pub model: Option<String>,
 }
 
 impl BoardEntry {
     fn fresh(gen: u64) -> Self {
-        BoardEntry { idle: false, last_prompt: None, last_reply: None, context_tokens: None, updated_at: 0, gen, transcript: None }
+        BoardEntry {
+            idle: false,
+            last_prompt: None,
+            last_reply: None,
+            context_tokens: None,
+            updated_at: 0,
+            gen,
+            transcript: None,
+            session_id: None,
+            model: None,
+        }
     }
 }
 
@@ -94,8 +109,16 @@ impl Board {
         if let Some(t) = text("transcript_path").filter(|t| !t.is_empty()) {
             e.transcript = Some(PathBuf::from(t));
         }
+        if let Some(id) = text("session_id").filter(|t| !t.is_empty()) {
+            e.session_id = Some(id.to_string());
+        }
         match kind {
-            HookKind::SessionStart => e.idle = false,
+            HookKind::SessionStart => {
+                e.idle = false;
+                if let Some(m) = text("model").filter(|t| !t.is_empty()) {
+                    e.model = Some(m.to_string());
+                }
+            }
             HookKind::Prompt => {
                 e.idle = false;
                 e.last_prompt = text("prompt").map(summarize_prompt);
@@ -148,8 +171,8 @@ fn note(state: &AppState, caller: &Caller, body: &Value, kind: HookKind) {
     // the turn ended: its context size, from the transcript tail (no board lock held while reading)
     if kind == HookKind::Stop {
         if let Some(t) = state.board.get(&caller.pane).and_then(|e| e.transcript) {
-            let tokens = state.board.context_for(&t);
-            state.board.set_context(&caller.pane, gen, tokens);
+            let info = state.board.transcript_for(&t);
+            state.board.set_transcript_fields(&caller.pane, gen, info);
         }
     }
     state.ui.board_changed();
@@ -187,7 +210,25 @@ const CTX_CACHE_MAX: usize = 64;
 /// The session's context size from its transcript (`path`): the `usage` of the last assistant
 /// message in the tail — input + cache-read + cache-creation tokens, i.e. what the next turn
 /// sends. `None` without a readable file or usage in the tail.
-pub(crate) fn context_tokens_of(path: &Path) -> Option<u64> {
+/// What the dashboard reads from a transcript's tail (session-board's reading, see
+/// [`transcript_info_of`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct TranscriptInfo {
+    /// The last assistant `usage`: input + cache-read + cache-creation tokens.
+    pub context_tokens: Option<u64>,
+    /// `message.model` of that same assistant record.
+    pub model: Option<String>,
+    /// The last `last-prompt` record's `lastPrompt`, else the last user message with plain
+    /// text content (tool results are not prompts); summarized like hook prompts.
+    pub last_prompt: Option<String>,
+    /// The last assistant text block (trimmed, first [`SNIPPET_MAX`] characters).
+    pub last_reply: Option<String>,
+}
+
+/// Read the last [`TAIL_BYTES`] of a transcript (`None` if unreadable) and pick, walking back
+/// from the end, the fields of [`TranscriptInfo`]. Unparsable lines are skipped; the first line
+/// of a cut tail is dropped.
+pub(crate) fn transcript_info_of(path: &Path) -> Option<TranscriptInfo> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
     let start = f.metadata().ok()?.len().saturating_sub(TAIL_BYTES);
@@ -196,47 +237,97 @@ pub(crate) fn context_tokens_of(path: &Path) -> Option<u64> {
     f.read_to_end(&mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf);
     let skip = usize::from(start > 0); // the first line of a tail is cut
+    let mut info = TranscriptInfo::default();
+    let (mut usage_seen, mut prompt_from_record) = (false, false);
     for line in text.lines().skip(skip).collect::<Vec<_>>().into_iter().rev() {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
-        if v.get("type").and_then(Value::as_str) != Some("assistant") {
-            continue;
+        match v.get("type").and_then(Value::as_str) {
+            Some("assistant") => {
+                let m = v.get("message");
+                if !usage_seen {
+                    if let Some(u) = m.and_then(|m| m.get("usage")) {
+                        let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+                        info.context_tokens = Some(n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens"));
+                        info.model = m.and_then(|m| m.get("model")).and_then(Value::as_str).map(str::to_string);
+                        usage_seen = true;
+                    }
+                }
+                if info.last_reply.is_none() {
+                    let blocks = m.and_then(|m| m.get("content")).and_then(Value::as_array);
+                    let text = blocks.into_iter().flatten().find_map(|b| {
+                        (b.get("type").and_then(Value::as_str) == Some("text"))
+                            .then(|| b.get("text").and_then(Value::as_str))
+                            .flatten()
+                            .filter(|t| !t.trim().is_empty())
+                    });
+                    info.last_reply = text.map(snippet);
+                }
+            }
+            Some("last-prompt") if !prompt_from_record => {
+                if let Some(p) = v.get("lastPrompt").and_then(Value::as_str) {
+                    info.last_prompt = Some(summarize_prompt(p));
+                    prompt_from_record = true;
+                }
+            }
+            Some("user") if info.last_prompt.is_none() => {
+                if let Some(p) = v.pointer("/message/content").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
+                    info.last_prompt = Some(summarize_prompt(p));
+                }
+            }
+            _ => {}
         }
-        let Some(u) = v.pointer("/message/usage") else { continue };
-        let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
-        return Some(n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens"));
+        if usage_seen && info.last_reply.is_some() && prompt_from_record {
+            break;
+        }
     }
-    None
+    Some(info)
+}
+
+/// Context size only (see [`transcript_info_of`]).
+#[cfg(test)]
+pub(crate) fn context_tokens_of(path: &Path) -> Option<u64> {
+    transcript_info_of(path)?.context_tokens
 }
 
 /// A transcript's context size as of its (mtime, size).
 struct CtxCached {
     mtime: SystemTime,
     size: u64,
-    tokens: Option<u64>,
+    info: Option<TranscriptInfo>,
 }
 
 impl Board {
-    /// [`context_tokens_of`], cached by (path, mtime, size): an unchanged transcript is not read
+    /// [`transcript_info_of`], cached by (path, mtime, size): an unchanged transcript is not read
     /// again. The cache lock is a leaf held across the tail read.
-    pub fn context_for(&self, path: &Path) -> Option<u64> {
+    pub(crate) fn transcript_for(&self, path: &Path) -> Option<TranscriptInfo> {
         let meta = std::fs::metadata(path).ok()?;
         let (mtime, size) = (meta.modified().ok()?, meta.len());
         let mut cache = self.ctx.lock().unwrap();
         if let Some(c) = cache.get(path).filter(|c| c.mtime == mtime && c.size == size) {
-            return c.tokens;
+            return c.info.clone();
         }
-        let tokens = context_tokens_of(path);
+        let info = transcript_info_of(path);
         if cache.len() >= CTX_CACHE_MAX {
             cache.clear();
         }
-        cache.insert(path.to_path_buf(), CtxCached { mtime, size, tokens });
-        tokens
+        cache.insert(path.to_path_buf(), CtxCached { mtime, size, info: info.clone() });
+        info
     }
 
-    /// Set the pane's context size if its entry is still generation `gen`.
-    fn set_context(&self, pane: &str, gen: u64, tokens: Option<u64>) {
+    /// The cached context size ([`Board::transcript_for`]).
+    pub fn context_for(&self, path: &Path) -> Option<u64> {
+        self.transcript_for(path)?.context_tokens
+    }
+
+    /// Set the pane's context size and model from its transcript, if its entry is still
+    /// generation `gen` (a missing model keeps the one SessionStart reported).
+    fn set_transcript_fields(&self, pane: &str, gen: u64, info: Option<TranscriptInfo>) {
         if let Some(e) = self.inner.lock().unwrap().get_mut(pane).filter(|e| e.gen == gen) {
-            e.context_tokens = tokens;
+            let info = info.unwrap_or_default();
+            e.context_tokens = info.context_tokens;
+            if info.model.is_some() {
+                e.model = info.model;
+            }
         }
     }
 }
@@ -415,7 +506,7 @@ mod tests {
         let v = serde_json::to_value(&e).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort();
-        assert_eq!(keys, ["contextTokens", "idle", "lastPrompt", "lastReply", "updatedAt"]);
+        assert_eq!(keys, ["contextTokens", "idle", "lastPrompt", "lastReply", "model", "updatedAt"]);
     }
 
     #[test]
@@ -568,5 +659,64 @@ mod tests {
         assert_eq!(f.board_events(), n + 2);
         let s = serde_json::to_value(status(&f.state)).unwrap();
         assert_eq!(s["panes"][&f.pane]["lastReply"], "b");
+    }
+
+    // ---- ③ D3a: session id / transcript / model per pane ----
+
+    /// One transcript tail gives what the dashboard shows: context size and model from the last
+    /// assistant usage, the last reply from the last assistant text, the last prompt from the
+    /// last `last-prompt` record (else the last plain user message) — session-board's reading.
+    #[test]
+    fn transcript_tail_gives_context_model_last_prompt_and_reply() {
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join("s.jsonl");
+        let lines = [
+            json!({"type": "user", "message": {"role": "user", "content": "첫 지시"}}).to_string(),
+            json!({"type": "assistant", "message": {"role": "assistant", "model": "claude-a",
+                "content": [{"type": "text", "text": "  답 하나  "}],
+                "usage": {"input_tokens": 1, "cache_read_input_tokens": 2, "cache_creation_input_tokens": 3}}}).to_string(),
+            json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "content": "x"}]}}).to_string(),
+            json!({"type": "assistant", "message": {"role": "assistant", "model": "claude-b",
+                "content": [{"type": "tool_use", "name": "Read"}],
+                "usage": {"input_tokens": 10, "cache_read_input_tokens": 20, "cache_creation_input_tokens": 30}}}).to_string(),
+        ];
+        std::fs::write(&t, lines.join("\n") + "\n").unwrap();
+        let i = transcript_info_of(&t).unwrap();
+        assert_eq!(i.context_tokens, Some(60), "the last usage, even without text");
+        assert_eq!(i.model.as_deref(), Some("claude-b"));
+        assert_eq!(i.last_reply.as_deref(), Some("답 하나"), "the last assistant text");
+        assert_eq!(i.last_prompt.as_deref(), Some("첫 지시"), "tool results are not prompts");
+        // a last-prompt record wins over earlier user messages; peer messages are summarized
+        let mut more = lines.join("\n") + "\n";
+        more.push_str(&json!({"type": "last-prompt", "lastPrompt": "<cross-session-message from-name=\"agentboard\">\n본문\n</cross-session-message>"}).to_string());
+        more.push('\n');
+        std::fs::write(&t, more).unwrap();
+        assert_eq!(transcript_info_of(&t).unwrap().last_prompt.as_deref(), Some("메시지: agentboard"));
+        assert_eq!(transcript_info_of(&d.path().join("missing.jsonl")), None);
+    }
+
+    #[test]
+    fn session_start_stores_session_id_transcript_and_model() {
+        let f = fixture();
+        f.spawn();
+        f.hook(
+            "SessionStart",
+            json!({"session_id": "9887ea82-aaaa", "transcript_path": r"C:\t\9887ea82-aaaa.jsonl", "model": "claude-haiku-5-5", "source": "startup"}),
+        );
+        let e = f.entry();
+        assert_eq!(e.session_id.as_deref(), Some("9887ea82-aaaa"));
+        assert_eq!(e.transcript.as_deref(), Some(std::path::Path::new(r"C:\t\9887ea82-aaaa.jsonl")));
+        assert_eq!(e.model.as_deref(), Some("claude-haiku-5-5"));
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["model"], "claude-haiku-5-5", "model is on the wire");
+        assert!(v.get("sessionId").is_none() && v.get("transcript").is_none(), "ids and paths stay in the app");
+        // Stop: the transcript's model (and size) replace it
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join("s.jsonl");
+        std::fs::write(&t, assistant(5, 0, 0) + "\n").unwrap();
+        f.hook("Stop", json!({"last_assistant_message": "끝", "transcript_path": t.to_string_lossy()}));
+        let e = f.entry();
+        assert_eq!((e.context_tokens, e.model.as_deref()), (Some(5), Some("m")));
+        assert_eq!(e.session_id.as_deref(), Some("9887ea82-aaaa"), "kept through the turn");
     }
 }
