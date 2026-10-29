@@ -199,7 +199,8 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
   - npm으로 설치한 `claude.cmd`에서는 cmd.exe 제약 때문에 역할 지시가 한 줄로 합쳐지고(줄바꿈 → ` ⏎ `) `" % ^ & | < >`가 비슷한 모양의 다른 문자로 바뀝니다. 지시 파일은 짧게(수천 자 이내) 유지하세요.
 - `envRequire`: 사용자 정의 점검 항목. `check` 명령(cmd.exe로 실행, 10초 제한)이 종료 코드 0이면 정상. `required: true`는 건너뛸 수 없습니다. 키가 없으면 위의 holla 항목이 기본이고, `[]`이면 없음. `source`(설치할 GitHub 저장소 주소)가 비어 있으면 dispatcher가 사용자에게 주소를 물어 기록한 뒤, 승인을 받아 그 저장소 README대로 설치합니다. 저장소가 비공개일 수 있어 앱은 주소를 기본값으로 넣지 않습니다.
 - `envSkip`: 사용자가 "필요 없다"고 한 점검 항목 id(`claude-version`, `git-bash`, `folder-trust:<탭>`, 사용자 정의 id). dispatcher가 `env_skip`으로 기록하며, 그 기능만 빠지고 다시 묻지 않습니다.
-- 앱이 config.json을 고치는 경우: dispatcher의 `create_manager_tab`·`env_skip`·`env_set_source`, 새 탭 마법사의 Manager 생성, Manager·handover 탭의 이름 바꾸기·닫기. 다른 키와 순서는 유지하지만 파일 서식은 다시 써집니다.
+- 앱이 config.json을 고치는 경우: dispatcher의 `create_manager_tab`·`close_manager_tab`·`env_skip`·`env_set_source`, 새 탭 마법사의 Manager 생성, Manager·handover 탭의 이름 바꾸기·닫기. 다른 키와 순서는 유지하지만 파일 서식은 다시 써집니다.
+- **탭 닫기**(팔레트 "현재 탭 닫기", dispatcher의 `close_manager_tab`): 팔레트는 Y/N으로 확인한 뒤(Enter는 무시) 닫고, 역할 탭이면 config.json에서도 뺍니다. Manager 탭은 끝나지 않은 인박스 항목(새·진행 중·종료 제안됨)이나 진행 중인 팀(팀 창, 또는 `teams/<id>/brief.md` 첫 줄이 `상태: 완료`가 아님)이 있으면 거부되고 이유와 정리 방법이 오류 보기에 나옵니다. handover 탭은 팔레트로만 닫습니다. 폴더·이슈·완료 항목은 남습니다. Manager·handover 창에서 `Alt+x`를 누르면 이 방법을 안내합니다.
 
 ### 기본 템플릿
 
@@ -234,6 +235,7 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
 | `dismiss(agent)` · `dismiss_team(team)` | manager, lead | 팀원 해고 · 팀 해산(리드는 자기 팀원만) |
 | `list_team(team?)` | manager, lead | 팀 구성·상태 |
 | `create_manager_tab(name, dir, template?)` | dispatcher | 새 상시업무 탭 + config.json `tabs` 추가(폴더가 미리 있어야 함, 포커스 안 바뀜) |
+| `close_manager_tab(name)` | dispatcher | 상시업무(Manager) 탭 닫기 + config.json `tabs`에서 빼기. 끝나지 않은 인박스 항목·진행 중인 팀이 있으면 거부(이유와 정리 방법). handover·일반·dispatcher 탭은 안 됨 |
 | `handoff_done()` | dispatcher, handover, manager | 야간 정리 완료 신호 |
 | `need_user(reason)` | 모두 | 그 창의 탭에 ⚠ + 사유 |
 | `env_status()` | 모두 | 환경 점검 결과 |
@@ -405,4 +407,4 @@ AgentBoard 창들의 상태를 한 화면에 모은 탭입니다(하나만 열�
 
 ## 로드맵
 
-1단계는 사람이 직접 조작하는 터미널 보드, 2단계(V0.2.0)는 위의 상시업무 운영(역할 에이전트·인박스·야간 정리)입니다. dispatcher 옆 메모·작업 상태 탭·집중근무 다음은 상시업무 제거 도구입니다. Claude 외 에이전트(Codex·Gemini 등) 프로필과 창을 다른 탭에 붙이기(join)는 보류합니다.
+1단계는 사람이 직접 조작하는 터미널 보드, 2단계(V0.2.0)는 위의 상시업무 운영(역할 에이전트·인박스·야간 정리)입니다. 그 뒤로 dispatcher 옆 메모·작업 상태 탭·집중근무·상시업무 닫기가 들어갔습니다. Claude 외 에이전트(Codex·Gemini 등) 프로필과 창을 다른 탭에 붙이기(join)는 보류합니다.

@@ -211,6 +211,8 @@ export function paletteItems(ws, { bindings = {}, has = () => true, autostart = 
 
   if (c && !c.tab.isDispatcher) out.push({ label: '탭 이름 바꾸기', action: { type: 'rename', tab: c.tab.id } });
   if (c && c.pane) out.push({ label: '현재 창을 새 탭으로 떼어내기', action: { type: 'ws', cmds: [{ type: 'breakPaneToTab', pane: c.pane }] } });
+  // ④ RF1: closing a tab (Y/N). Manager / handover tabs too (R3 a: this is handover's only way out)
+  if (c && !c.tab.isDispatcher) out.push({ label: '현재 탭 닫기', hint: 'Y/N 확인', action: { type: 'closeTab', tab: c.tab.id } });
   out.push({ label: '설정 오류 보기', action: { type: 'errors' } });
   out.push({ label: '설정 다시 읽기', hint: '재시작 없이', action: { type: 'reloadConfig' } });
   out.push({ label: '문서 열기', hint: 'md 파일', action: { type: 'openDoc' } });
@@ -383,6 +385,51 @@ export async function closeFlow(st, deps) {
   } finally {
     st.busy = false;
   }
+}
+
+// ---------------------------------------------------------------- closing a tab (④ RF1)
+
+/** `{tab, name, role ('manager' | 'handover' | null), running}` for the close question; null
+ * for the Dispatcher tab (never closed) or an unknown tab. */
+export function closeTabInfo(ws, tabId) {
+  const t = ws && ws.tabs && ws.tabs[tabId];
+  if (!t || t.isDispatcher) return null;
+  const running = leafIds(t.layout).filter((id) => {
+    const p = ws.panes && ws.panes[id];
+    return p && p.status && p.status.state === 'running';
+  }).length;
+  const role = t.role === 'manager' || t.role === 'handover' ? t.role : null;
+  return { tab: t.id, name: t.name, role, running };
+}
+
+function closeQuestion({ name, role, running }) {
+  const lines = [role === 'manager' ? `'${name}' 상시업무(Manager) 탭을 닫을까요?` : `'${name}' 탭을 닫을까요?`];
+  const parts = [];
+  if (running > 0) parts.push(`실행 중인 창 ${running}개가 종료됩니다`);
+  if (role) parts.push('config.json에서도 빠집니다');
+  if (parts.length) lines.push(`${parts.join('. ')}.`);
+  if (role === 'manager') {
+    lines.push('작업 폴더·이슈·팀 문서는 남습니다. 끝나지 않은 인박스 항목이나 진행 중인 팀이 있으면 닫지 않습니다.');
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Palette "현재 탭 닫기": Y/N (Enter does not answer — the same rule as the exit dialog) →
+ * CloseTab. A refusal (open inbox items, running teams — decided by the backend, decision c) is
+ * shown in the error panel, not as a toast: it is long and says what to do. Resolves true when
+ * the tab was closed. deps: { confirm(msg, opts), close(tabId), showErrors(lines) }
+ */
+export async function closeTabFlow(info, deps) {
+  if (!info) return false;
+  if (!(await deps.confirm(closeQuestion(info), { enterYes: false }))) return false;
+  try {
+    await deps.close(info.tab);
+  } catch (err) {
+    deps.showErrors([err && err.message ? err.message : String(err)]);
+    return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------- settings reload

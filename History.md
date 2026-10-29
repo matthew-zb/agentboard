@@ -7,6 +7,7 @@
 - 집중근무(전달 멈춤·집중근무): 팔레트나 dispatcher MCP `focus_set`으로 켜고 끄며 재시작 뒤에도 유지된다. dispatcher는 다른 세션의 보고를 `DISPATCHER.md` 「## 보류(집중근무)」에 쌓아 두고 해제 때 결정 요청 → 알림 순으로 요약한다. 모드 중 에이전트의 `need_user` ⚠는 해제될 때 표시된다(권한 확인·폴더 신뢰 ⚠는 바로 표시).
 - dispatcher 오른쪽 열의 인박스 아래에 메모(`MEMO.md`의 `## 메모` 아래 본문)를 둔다. 읽기·바로 편집, 외부 변경 알림, `.agentboard/memo.bak` 1단계 백업. dispatcher는 사용자가 요구할 때만 파일을 고친다.
 - 메모 vi 편집(`config.json` `"memo": {"vi": true}`, 기본 꺼짐): 보통·입력 모드, 이동·편집·검색·`:w`/`:wq`/`:q!`. 이전 키트의 config 초안은 켠다.
+- 상시업무 닫기(팔레트 "현재 탭 닫기" Y/N, dispatcher MCP `close_manager_tab`): 탭을 닫고 config.json에서 뺀다. 끝나지 않은 인박스 항목이나 진행 중인 팀이 있는 Manager 탭은 거부한다(전에는 팀 창이 경고 없이 꺼졌다). handover 탭은 팔레트로만 닫는다.
 - 작업 상태 탭(팔레트 "작업 상태", `Ctrl+Alt+d`): 탭·창별 역할·작업 중/쉬는 중·문맥 크기·마지막 지시와 응답·인박스 미결 수·야간 정리 단계. 역할 창은 hook, 역할 없는 claude 창은 자기 세션 파일로 갱신한다.
 
 ### Fixes

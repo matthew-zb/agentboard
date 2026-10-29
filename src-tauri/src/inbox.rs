@@ -180,6 +180,21 @@ struct Inner {
     version: u64,
 }
 
+/// [`Inbox::open_count_by_owner`]: unfinished items by state (a closing proposal is unfinished
+/// until the user confirms it).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpenCounts {
+    pub new: usize,
+    pub in_progress: usize,
+    pub close_proposed: usize,
+}
+
+impl OpenCounts {
+    pub fn total(&self) -> usize {
+        self.new + self.in_progress + self.close_proposed
+    }
+}
+
 pub struct Inbox {
     dir: PathBuf,
     inner: Mutex<Inner>,
@@ -882,6 +897,21 @@ impl Inbox {
     }
 
     /// Every item (done ones only with `show_done`), newest first, plus the current version.
+    /// Unfinished items (state ≠ done) owned by the tab named `owner`, by state.
+    pub fn open_count_by_owner(&self, owner: &str) -> OpenCounts {
+        let g = self.inner.lock().unwrap();
+        let mut c = OpenCounts::default();
+        for i in g.items.values().filter(|i| i.owner_name == owner) {
+            match i.state {
+                ItemState::New => c.new += 1,
+                ItemState::InProgress => c.in_progress += 1,
+                ItemState::CloseProposed => c.close_proposed += 1,
+                ItemState::Done => {}
+            }
+        }
+        c
+    }
+
     pub fn list(&self, show_done: bool) -> InboxList {
         let g = self.inner.lock().unwrap();
         let items = g.items.values().rev().filter(|i| show_done || i.state != ItemState::Done).cloned().collect();

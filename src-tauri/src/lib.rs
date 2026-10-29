@@ -20,6 +20,7 @@ pub mod persist;
 pub mod proctree;
 pub mod profiles;
 pub mod roles;
+pub mod teams;
 pub mod workspace;
 pub mod pty;
 pub mod ring;
