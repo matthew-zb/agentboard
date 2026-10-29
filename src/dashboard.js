@@ -19,7 +19,7 @@ const ROLE_LABELS = { dispatcher: 'dispatcher', handover: 'handover', manager: '
 
 // ---------------------------------------------------------------- shared store
 
-const store = { snap: null, inbox: [], board: null, views: new Set(), unlisten: [], inboxSeq: 0, boardSeq: 0 };
+const store = { snap: null, inbox: [], board: null, focus: null, views: new Set(), unlisten: [], inboxSeq: 0, boardSeq: 0 };
 
 const redrawAll = () => {
   for (const v of store.views) v.changed();
@@ -28,6 +28,13 @@ const redrawAll = () => {
 /** app.js render → every mounted view (drawn now if on screen, else when next shown). */
 export function updateDashboard(snap) {
   store.snap = snap;
+  redrawAll();
+}
+
+/** 집중근무 / 전달 멈춤 state from app.js (focus-logic.js shape; null = unknown): the inbox counts
+ * follow the inbox list's rule. Kept while no view is mounted. */
+export function setDashboardFocus(focus) {
+  store.focus = focus || null;
   redrawAll();
 }
 
@@ -186,7 +193,7 @@ export function mountDashboard(paneId) {
 
   function draw() {
     if (st.disposed || !onScreen()) return; // drawn on the next update once shown
-    const groups = visibleGroups(dashboardRows(store.snap, { inbox: store.inbox, board: store.board }), st.hideIdle);
+    const groups = visibleGroups(dashboardRows(store.snap, { inbox: store.inbox, board: store.board, focus: store.focus }), st.hideIdle);
     const rows = flatRows(groups).map((r) => ({ ...r, id: r.pane }));
     st.sel = keepSelection(rows, st.sel, st.selIndex);
     st.selIndex = Math.max(0, rows.findIndex((r) => r.id === st.sel));

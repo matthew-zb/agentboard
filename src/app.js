@@ -57,7 +57,7 @@ import {
 import { mountInbox, configureInbox, setInboxFocus } from './inbox.js';
 import { mountDoc, configureDocView, renderMarkdown, loadImages } from './docview.js';
 import { mountMemo, configureMemo } from './memo.js';
-import { mountDashboard, configureDashboard, updateDashboard } from './dashboard.js';
+import { mountDashboard, configureDashboard, updateDashboard, setDashboardFocus } from './dashboard.js';
 import { configureCopyMode, toggleCopyMode, copyActive, pruneCopySessions } from './copy-ui.js';
 import { pickCommands, paletteItems, missingDirsFlow, closeFlow, envStatusFlag, reloadFlow } from './overlay-logic.js';
 import { hiddenAttentionTabs, statusEntryText } from './attention-logic.js';
@@ -472,11 +472,12 @@ function renderStatus(snap) {
 }
 
 // 집중근무 / 전달 멈춤 (focus-mode spec): the backend owns the mode; the status bar flag, the
-// palette entries and the inbox (hidden / held / released items) follow it.
+// palette entries, the inbox (hidden / held / released items) and the 작업 상태 counts follow it.
 const focusSync = makeFocusSync({
   get: () => api.focusGet(),
   apply: (state) => {
     setInboxFocus(state);
+    setDashboardFocus(state);
     if (current) renderStatus(current);
   },
 });

@@ -3,6 +3,7 @@
 // from hooks, nightly refresh) as rows — whatever the layout decision (D1) turns out to be.
 // No DOM, no Tauri: unit-tested in Node. The view (not built yet) draws these rows.
 import { leafIds } from './layout.js';
+import { inboxFocusView } from './focus-logic.js';
 
 /** Context size above this is shown as too large (the cap the psmux session board used). */
 export const CONTEXT_CAP = 400000;
@@ -26,11 +27,18 @@ const boardEntry = (board, paneId) => {
   return e && typeof e === 'object' ? e : null;
 };
 
-/** Open (state ≠ done) inbox items per owner tab name (R29: ownership is the tab name). */
-export function inboxOpenCounts(items) {
+/**
+ * Open (state ≠ done) inbox items per owner tab name (R29: ownership is the tab name). Under
+ * 집중근무 / 전달 멈춤 (`focus`, focus-logic.js state) only what the inbox list shows is counted —
+ * the same rule (inboxFocusView): items that came in during the mode are left out, and after the
+ * release they count again.
+ */
+export function inboxOpenCounts(items, focus = null) {
   const by = new Map();
-  for (const it of Array.isArray(items) ? items : []) {
-    if (!it || it.state === 'done' || !it.ownerName) continue;
+  const all = (Array.isArray(items) ? items : []).filter((it) => it && typeof it === 'object');
+  const v = inboxFocusView(all, focus, { hideDone: true });
+  for (const it of [...v.released, ...v.rest]) {
+    if (it.state === 'done' || !it.ownerName) continue;
     if (!by.has(it.ownerName)) by.set(it.ownerName, zeroCounts());
     const c = by.get(it.ownerName);
     if (it.state === 'new') {
@@ -101,10 +109,10 @@ function orderedPanes(ws, t, board) {
  * 2 member), status, attention, reason, idle, lastPrompt, lastReply, context, model, updatedAt}`.
  * Plain tabs (role 'plain') come last and only when a pane of theirs has a board entry (D3b).
  */
-export function dashboardRows(snapshot, { inbox = [], board = null } = {}) {
+export function dashboardRows(snapshot, { inbox = [], board = null, focus = null } = {}) {
   const ws = snapshot && (snapshot.workspace || snapshot);
   if (!ws || !ws.groups || !ws.groupLayout || !ws.tabs || !ws.panes) return [];
-  const counts = inboxOpenCounts(inbox);
+  const counts = inboxOpenCounts(inbox, focus);
   const out = [];
   for (const gid of leafIds(ws.groupLayout)) {
     const g = ws.groups[gid];
