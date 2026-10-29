@@ -79,7 +79,7 @@ export function isApplet(pane) {
   return !!(pane && pane.kind && pane.kind.type === 'applet');
 }
 
-const APPLET_LABELS = { inbox: '인박스 (준비 중)', doc: '문서 (준비 중)' };
+const APPLET_LABELS = { inbox: '인박스 (준비 중)', doc: '문서 (준비 중)', memo: '메모 (준비 중)', dashboard: '작업 상태 (준비 중)' };
 
 /** Document tab pane (`kind: {type: 'applet', kind: 'doc'}`, Task 14). */
 export function isDoc(pane) {

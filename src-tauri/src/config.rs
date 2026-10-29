@@ -163,8 +163,9 @@ struct RawApplet {
     focus: bool,
 }
 
-/// Applet kinds the frontend knows: the inbox and the memo (`MEMO.md`, below the inbox).
-pub const APPLET_KINDS: [&str; 2] = ["inbox", "memo"];
+/// Applet kinds the frontend knows: the inbox, the memo (`MEMO.md`, below the inbox) and the
+/// work-status dashboard (normally its own "상태" tab, `OpenDashboard`).
+pub const APPLET_KINDS: [&str; 3] = ["inbox", "memo", "dashboard"];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -78,6 +78,16 @@
 //!   Inbox relay (Task 10, `bridge::relay_*` from Tauri commands): `ws` (released), then the
 //!   inbox, then `inner`/`wake` via `send` — one at a time, never nested.
 //! * Attention (attention.rs, Task 9): `AppState::trust` (folder-trust timers) is a leaf.
+//! * Board session poll (board.rs, D3b, its own thread every 3 s): `ws` (released), then the
+//!   PtyManager `panes` map per pane (released), then process snapshots / session-file and
+//!   transcript reads with no app lock (the context cache lock alone around a read), then the
+//!   board lock alone to store; `board-changed` after, with no lock held.
+//! * Board (board.rs): `AppState::board` (entries) and its context cache are leaves. Hook
+//!   handlers take the PtyManager `panes` map (`current_gen`, released), then the board lock
+//!   (released), then on Stop the cache lock alone around the transcript tail read, then the
+//!   board lock again; `board::status` takes the nightly machine lock, the board lock and
+//!   `panes` one at a time. `nightly::tick` reads the machine's view before and after `step`
+//!   under the machine lock and emits `board-changed` after `perform`, with no lock held.
 //! * Memo (memo.rs): `AppState::memo` (`MemoState.last`) is a leaf, held across the MEMO.md /
 //!   memo.bak IO (reads and saves are serialized); `memo_read`/`memo_save` read workspaceRoot
 //!   from `loaded` (released) first and run on a blocking thread.
@@ -661,6 +671,7 @@ pub fn run_effects(state: &AppState, fx: Effects) {
             crate::agentcfg::remove_run_files(&state.run_dir, id);
             state.nightly.forget(id); // its spawn time (R24)
             state.docs.unwatch(id); // a closed document pane stops being polled
+            state.board.forget(id); // its dashboard status
         } else {
             state.pty.kill(id);
         }

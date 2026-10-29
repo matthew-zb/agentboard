@@ -1,6 +1,7 @@
 pub mod agentcfg;
 pub mod attention;
 pub mod autostart;
+pub mod board;
 pub mod bridge;
 pub mod config;
 pub mod control;
@@ -15,6 +16,7 @@ pub mod mcp_tools;
 pub mod memo;
 pub mod nightly;
 pub mod persist;
+pub mod proctree;
 pub mod profiles;
 pub mod roles;
 pub mod workspace;
@@ -65,6 +67,9 @@ pub trait Ui: Send + Sync {
     /// Emit `config-reloaded` (no payload): settings were read again at runtime; the frontend
     /// re-reads keybindings and the error list.
     fn config_reloaded(&self) {}
+    /// Emit `board-changed` (no payload): a hook updated the dashboard board, or the nightly
+    /// state changed (the dashboard re-reads `board_status`).
+    fn board_changed(&self) {}
 }
 
 /// Lock order: see the module docs of `launcher`.
@@ -88,6 +93,8 @@ pub struct AppState {
     pub exiting: AtomicBool,
     /// The memo's last known content (`memo.rs`; leaf lock).
     pub memo: memo::MemoState,
+    /// Per-pane session status for the dashboard (`board.rs`; leaf lock).
+    pub board: board::Board,
     /// Per-pane bearer tokens of role panes (leaf lock inside).
     pub tokens: agentcfg::Tokens,
     /// Control server base URL (`http://127.0.0.1:<port>`), set by the control server (Task 5)
@@ -134,6 +141,7 @@ impl AppState {
         let hooks = control::HookRouter::new();
         bridge::register_hooks(&hooks);
         attention::register_hooks(&hooks); // after the bridge: wraps its SessionStart
+        board::register_hooks(&hooks); // last: wraps SessionStart/UserPromptSubmit/Stop (dashboard)
         AppState {
             ws: Mutex::new(ws),
             loaded: RwLock::new(loaded),
@@ -147,6 +155,7 @@ impl AppState {
             startup_errors,
             exiting: AtomicBool::new(false),
             memo: memo::MemoState::default(),
+            board: board::Board::default(),
             tokens: agentcfg::Tokens::new(),
             ctrl_url: Mutex::new(None),
             run_dir,
@@ -260,6 +269,10 @@ impl Ui for AppSink {
 
     fn config_reloaded(&self) {
         let _ = self.app.emit(CONFIG_RELOADED, ());
+    }
+
+    fn board_changed(&self) {
+        let _ = self.app.emit(board::BOARD_CHANGED, ());
     }
 }
 
@@ -577,6 +590,13 @@ fn workspace_root(state: &AppState) -> std::path::PathBuf {
     state.loaded.read().unwrap().settings.workspace_root.clone()
 }
 
+/// Dashboard status: per role pane (current generation) idle, last prompt/reply, context size,
+/// and the nightly machine's phase. In memory only; `board-changed` says when to re-read.
+#[tauri::command]
+fn board_status(state: State<'_, AppState>) -> board::BoardStatus {
+    board::status(&state)
+}
+
 /// `memo_read` reply: the file relative to workspaceRoot (for `doc_watch`) and its whole text.
 #[derive(Serialize)]
 struct MemoText {
@@ -887,6 +907,7 @@ pub fn run() {
             doc_image,
             memo_read,
             memo_save,
+            board_status,
             env_status,
             autostart_get,
             autostart_set,
@@ -970,6 +991,7 @@ pub fn run() {
             start_doc_watcher(app.handle().clone());
             // nightly refresh scheduler (Task 11); last run date in %APPDATA%/agentboard/nightly.json
             nightly::start(app.handle().clone(), appdata.join(nightly::FILE_NAME));
+            board::start_session_poll(app.handle().clone()); // plain claude panes (dashboard D3b)
             // spawning happens on the launcher thread: window creation is not blocked
             launcher::start(app.handle(), rx, initial);
             // environment check (Task 12): probes run off the UI thread; `env-changed` when done

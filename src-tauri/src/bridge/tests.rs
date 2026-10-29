@@ -371,11 +371,13 @@ fn pane_leaving_the_model_fails_its_queue() {
 fn hooks_are_registered_on_the_router() {
     let fx = fixture();
     for (ev, f) in [
-        // Task 9 wraps SessionStart (it calls `on_session_start` first, then the trust timer)
-        ("SessionStart", crate::attention::on_session_start as crate::control::HookHandler),
+        // Task 9 wraps SessionStart (it calls `on_session_start` first, then the trust timer);
+        // the dashboard board wraps SessionStart/Stop/UserPromptSubmit last (each calls the
+        // handler it replaces first: attention → bridge, bridge)
+        ("SessionStart", crate::board::on_session_start as crate::control::HookHandler),
         ("Notification", crate::attention::on_notification),
-        ("Stop", on_stop),
-        ("UserPromptSubmit", on_prompt_submit),
+        ("Stop", crate::board::on_stop),
+        ("UserPromptSubmit", crate::board::on_prompt_submit),
     ] {
         assert_eq!(fx.state.hooks.get(ev).map(|h| h as usize), Some(f as usize), "{ev}");
     }

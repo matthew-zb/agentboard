@@ -216,6 +216,36 @@ body.dragging-v, body.dragging-v * { cursor: row-resize !important; user-select:
 .inbox-file.sel { background: #094771; color: #fff; }
 .inbox-issue .inbox-hint { display: block; margin: 4px 0 0; color: var(--muted); }
 
+/* ---- 작업 상태 (dashboard.js): role tabs' agent panes, one row each ---- */
+.applet-host > .dashboard { align-self: stretch; flex: 1; }
+.dashboard { display: flex; flex-direction: column; min-width: 0; min-height: 0; outline: none; font-size: 12px; }
+.dash-bar { display: flex; gap: 10px; align-items: center; padding: 2px 8px; background: var(--chrome); border-bottom: 1px solid var(--line); font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; }
+.dash-title { color: var(--text); }
+.dash-hint { margin-left: auto; font-family: Consolas, monospace; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.dash-body { flex: 1; min-height: 0; overflow: auto; }
+.dash-nightly { padding: 4px 8px; color: var(--muted); border-bottom: 1px solid var(--line); }
+.dash-empty { padding: 12px; color: var(--muted); }
+.dash-tab { display: flex; gap: 10px; align-items: baseline; padding: 6px 8px 2px; color: var(--text); border-top: 1px solid var(--line); }
+.dash-tname { font-weight: bold; }
+.dash-trole, .dash-hidden { color: var(--muted); font-size: 11px; }
+.dash-inbox { color: var(--accent); font-size: 11px; }
+.dash-row { display: grid; grid-template-columns: minmax(160px, 1.4fr) 56px 48px minmax(0, 2fr) minmax(0, 2fr); gap: 8px; align-items: baseline; padding: 1px 8px; cursor: default; white-space: nowrap; }
+.dash-row > span { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.dash-row.depth-1 .dash-name { padding-left: 14px; }
+.dash-row.depth-2 .dash-name { padding-left: 28px; }
+.dash-row.sel { background: var(--chrome-2); outline: 1px solid var(--accent); outline-offset: -1px; }
+.dash-name { display: flex; gap: 6px; align-items: baseline; }
+.dash-status.running { color: var(--ok); }
+.dash-status.exited { color: var(--muted); }
+.dash-status.failed { color: var(--bad); }
+.dash-role { color: var(--muted); font-size: 11px; }
+.dash-warn { color: var(--warn); overflow: hidden; text-overflow: ellipsis; }
+.dash-idle.busy { color: var(--ok); }
+.dash-idle.idle, .dash-idle.unknown { color: var(--muted); }
+.dash-ctx { text-align: right; font-family: Consolas, monospace; }
+.dash-row.ctx-over .dash-ctx { color: var(--bad); font-weight: bold; }
+.dash-prompt, .dash-reply { color: var(--muted); }
+
 /* ---- memo below the inbox (memo.js): MEMO.md body, read view + inline edit ---- */
 .applet-host > .memo { align-self: stretch; flex: 1; }
 .memo { display: flex; flex-direction: column; min-width: 0; min-height: 0; outline: none; font-size: 12px; }

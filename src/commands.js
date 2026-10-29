@@ -24,6 +24,7 @@ export const PENDING_IDS = [
   'tab.moveTo',
   'group.mergeInto',
   'app.palette',
+  'app.dashboard',
 ];
 
 const nine = (prefix) => Array.from({ length: 9 }, (_, i) => `${prefix}${i + 1}`);

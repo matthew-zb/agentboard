@@ -5,6 +5,11 @@
 
 use crate::config::{check_relative, GroupSpec, Loaded, PaneSpec, Template};
 use crate::docs::{self, DOC_APPLET};
+
+/// `PaneKind::Applet { kind }` of the work-status dashboard (③ D1a).
+pub const DASHBOARD_APPLET: &str = "dashboard";
+/// Name of the dashboard tab (phase-1 dedupe when a tab already has it).
+pub const DASHBOARD_TAB: &str = "상태";
 use crate::layout::{Dir, LayoutNode, Side};
 use crate::profiles::resolve_cwd;
 use crate::roles::{session_name, Role};
@@ -324,6 +329,10 @@ pub enum WsCommand {
     /// after the file (phase-1 dedupe) in `group` (default: the focused group), which takes the
     /// focus either way.
     OpenDoc { path: String, group: Option<GroupId> },
+    /// User action (palette, `app.dashboard` key). The work-status dashboard, at most one: an
+    /// open one takes the focus (wherever it was moved); else a one-pane tab "상태" (dashboard
+    /// applet, no process) at the end of `group` (default: the focused group), focused.
+    OpenDashboard { group: Option<GroupId> },
     // state
     SetFocus { group: GroupId, tab: Option<TabId>, pane: Option<PaneId> },
     SetMaximized { tab: TabId, pane: Option<PaneId> },
@@ -457,6 +466,7 @@ impl Workspace {
                 | WsCommand::RemoveTeam { .. }
                 | WsCommand::ClosePane { .. }
                 | WsCommand::OpenDoc { .. }
+                | WsCommand::OpenDashboard { .. }
         );
         let fx = next.apply_inner(cmd, loaded)?;
         if recheck {
@@ -1114,6 +1124,7 @@ impl Workspace {
             }
             RemoveTeam { tab, team } => fx.kill = self.remove_team(&tab, &team)?,
             OpenDoc { path, group } => fx = self.open_doc(&path, group, loaded)?,
+            OpenDashboard { group } => fx = self.open_dashboard(group, loaded)?,
             SetFocus { group, tab, pane } => {
                 let g = self.group(&group)?;
                 let tid = match (&tab, &pane) {
@@ -1466,6 +1477,73 @@ impl Workspace {
 
     /// `OpenDoc`: validate, then focus the pane already showing that document, or make a new
     /// document tab. Either way focus moves (user action).
+    /// `OpenDashboard` (see there).
+    fn open_dashboard(&mut self, group: Option<GroupId>, loaded: &Loaded) -> Result<Effects, String> {
+        if let Some(g) = &group {
+            self.group(g)?;
+        }
+        let existing = self.panes.values().find(|p| p.kind == PaneKind::Applet { kind: DASHBOARD_APPLET.into() });
+        if let Some(p) = existing {
+            let (pid, tid) = (p.id.clone(), p.tab.clone());
+            let gid = self.group_of_tab(&tid).cloned().ok_or_else(|| no_tab(&tid))?;
+            if self.tabs[&tid].maximized_pane_id.as_ref().is_some_and(|m| *m != pid) {
+                self.tabs.get_mut(&tid).unwrap().maximized_pane_id = None;
+            }
+            self.apply_inner(WsCommand::SetFocus { group: gid, tab: Some(tid), pane: Some(pid) }, loaded)?;
+            return Ok(Effects::default());
+        }
+        let root = loaded.settings.workspace_root.clone();
+        let gid = group.unwrap_or_else(|| self.focus.group_id.clone());
+        let name = self.unique_tab_name(DASHBOARD_TAB);
+        self.check_tab_name(&name, None)?;
+        let tid = self.new_tab_id();
+        let pid = self.new_pane_id();
+        self.panes.insert(
+            pid.clone(),
+            Pane {
+                id: pid.clone(),
+                name: DASHBOARD_TAB.into(),
+                tab: tid.clone(),
+                agent: String::new(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                cwd: root.clone(),
+                prompt: None,
+                status: PaneStatus::Starting,
+                attention: false,
+                prompt_warning: false,
+                attention_reason: None,
+                kind: PaneKind::Applet { kind: DASHBOARD_APPLET.into() },
+                role: None,
+                team: None,
+                session_name: None,
+                doc_path: None,
+            },
+        );
+        self.tabs.insert(
+            tid.clone(),
+            Tab {
+                id: tid.clone(),
+                name,
+                dir: String::new(),
+                template: String::new(),
+                is_dispatcher: false,
+                workspace: root,
+                layout: LayoutNode::Leaf(pid.clone()),
+                last_focused_pane_id: pid.clone(),
+                maximized_pane_id: None,
+                sync_input: false,
+                role: None,
+                team_seq: BTreeMap::new(),
+            },
+        );
+        self.groups.get_mut(&gid).unwrap().tab_ids.push(tid.clone());
+        let prev = self.focus_location();
+        self.move_focus(prev, &gid, &tid);
+        // the launcher marks the applet Running (no process)
+        Ok(Effects { spawn: vec![(pid, false)], kill: Vec::new() })
+    }
+
     fn open_doc(&mut self, path: &str, group: Option<GroupId>, loaded: &Loaded) -> Result<Effects, String> {
         if let Some(g) = &group {
             self.group(g)?;
@@ -3610,5 +3688,79 @@ mod tests {
         let mut w: Workspace = serde_json::from_value(raw).unwrap();
         assert_eq!(w.panes[&some_terminal].doc_path, None);
         w.normalize_and_validate().unwrap();
+    }
+
+    // ---- ③ D1a: the dashboard tab ("상태"), one at most ----
+
+    fn dashboard_panes(ws: &Workspace) -> Vec<&Pane> {
+        ws.panes.values().filter(|p| p.kind == PaneKind::Applet { kind: DASHBOARD_APPLET.into() }).collect()
+    }
+
+    #[test]
+    fn open_dashboard_opens_one_status_tab_and_reuses_it() {
+        let (_tmp, l, mut ws) = doc_ws();
+        let work = gid_named(&ws, "work");
+        let control = gid_named(&ws, "control");
+        let api = tab(&ws, "api").id.clone();
+        ws.apply(WsCommand::SetFocus { group: work.clone(), tab: Some(api.clone()), pane: None }, &l).unwrap();
+        let fx = ws.apply(WsCommand::OpenDashboard { group: None }, &l).unwrap();
+        let t = tab(&ws, "상태").clone();
+        assert_eq!(ws.groups[&work].tab_ids.last(), Some(&t.id), "at the end of the focused group");
+        assert_eq!(ws.focus_location(), Some(Location { group_id: work.clone(), tab_id: t.id.clone() }), "a user action: focused");
+        assert_eq!(ws.last_location, Some(Location { group_id: work.clone(), tab_id: api.clone() }));
+        let p = ws.panes[&t.layout.leaves()[0]].clone();
+        assert_eq!(p.kind, PaneKind::Applet { kind: DASHBOARD_APPLET.into() });
+        assert_eq!((p.role, p.team.clone(), p.session_name.clone(), p.doc_path.clone()), (None, None, None, None));
+        assert_eq!(fx.spawn, vec![(p.id.clone(), false)], "the launcher marks the applet Running");
+        assert!(fx.kill.is_empty());
+        // again, from another group: the same tab takes the focus, nothing is added
+        let d = tab(&ws, "dispatcher").id.clone();
+        ws.apply(WsCommand::SetFocus { group: control.clone(), tab: Some(d), pane: None }, &l).unwrap();
+        let n = ws.tabs.len();
+        let fx = ws.apply(WsCommand::OpenDashboard { group: None }, &l).unwrap();
+        assert!(fx.spawn.is_empty() && fx.kill.is_empty());
+        assert_eq!((ws.tabs.len(), dashboard_panes(&ws).len()), (n, 1));
+        assert_eq!(ws.focus_location(), Some(Location { group_id: work.clone(), tab_id: t.id.clone() }));
+        assert_eq!(ws.clone().normalize_and_validate(), Ok(()));
+    }
+
+    #[test]
+    fn open_dashboard_names_around_a_plain_status_tab_and_takes_a_group() {
+        let (_tmp, l, mut ws) = doc_ws();
+        let control = gid_named(&ws, "control");
+        ws.apply(WsCommand::CreateTab { name: "상태".into(), dir: "api".into(), template: None, group: None, role: None }, &l).unwrap();
+        ws.apply(WsCommand::OpenDashboard { group: Some(control.clone()) }, &l).unwrap();
+        let t = tab(&ws, "상태-2").clone();
+        assert_eq!(ws.groups[&control].tab_ids.last(), Some(&t.id), "in the given group");
+        assert_eq!(dashboard_panes(&ws).len(), 1);
+        assert!(ws.apply(WsCommand::OpenDashboard { group: Some("g99".into()) }, &l).is_err(), "unknown group");
+    }
+
+    #[test]
+    fn dashboard_tab_persists_and_restores() {
+        let (tmp, l, mut ws) = doc_ws();
+        ws.apply(WsCommand::OpenDashboard { group: None }, &l).unwrap();
+        let pid = dashboard_panes(&ws)[0].id.clone();
+        let file = tmp.path().join("ws.json");
+        crate::persist::save_atomic(&file, &ws).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(v["panes"][&pid]["kind"], serde_json::json!({"type": "applet", "kind": "dashboard"}));
+        let mut back = crate::persist::load(&file).unwrap().unwrap();
+        let fx = crate::persist::prepare_restored(&mut back, &l);
+        assert_eq!(back.clone().normalize_and_validate(), Ok(()));
+        assert!(fx.spawn.contains(&(pid.clone(), false)));
+        // reopening after the restore goes to the restored tab
+        let n = back.tabs.len();
+        back.apply(WsCommand::OpenDashboard { group: None }, &l).unwrap();
+        assert_eq!((back.tabs.len(), dashboard_panes(&back).len()), (n, 1));
+        assert_eq!(back.focus_location().map(|f| f.tab_id), Some(back.panes[&pid].tab.clone()));
+    }
+
+    #[test]
+    fn open_dashboard_wire_shape() {
+        let c: WsCommand = serde_json::from_str(r#"{"type":"openDashboard"}"#).unwrap();
+        assert_eq!(c, WsCommand::OpenDashboard { group: None });
+        let c: WsCommand = serde_json::from_str(r#"{"type":"openDashboard","group":"g2"}"#).unwrap();
+        assert_eq!(c, WsCommand::OpenDashboard { group: Some("g2".into()) });
     }
 }
