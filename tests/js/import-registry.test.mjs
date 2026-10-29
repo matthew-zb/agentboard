@@ -98,6 +98,11 @@ test('config: control | work groups, nightlyRefresh null, holla envRequire with 
   assert.equal(config.roles, undefined, 'no roles key needed: the files go to .agentboard/roles/');
 });
 
+test('config: memo vi on (memo spec §8 V3 b — this environment edits the memo vi-style), with or without tabs', () => {
+  assert.deepEqual(run(['RTCmod']).config.memo, { vi: true });
+  assert.deepEqual(run([]).config.memo, { vi: true });
+});
+
 test('role files: the defaults plus the coexistence notice, within the cmd line limit', () => {
   const { roles } = run(['RTCmod']);
   const base = (n) => readFileSync(join(DEFAULTS, 'roles', `${n}.md`), 'utf8');
