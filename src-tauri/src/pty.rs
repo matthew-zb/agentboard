@@ -415,8 +415,7 @@ impl PtyManager {
         self.job_error.lock().unwrap().clone()
     }
 
-    /// Test-only: OS pid of the pane's process.
-    #[doc(hidden)]
+    /// OS pid of the pane's current process (the dashboard's session-file lookup, tests).
     pub fn pid(&self, id: &str) -> Option<u32> {
         self.entry(id).and_then(|e| e.pid)
     }

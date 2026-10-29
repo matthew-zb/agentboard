@@ -347,6 +347,16 @@ impl Nightly {
         self.last_run
     }
 
+    /// Panes whose restart waits for the user to stop typing (R25), in pane order.
+    pub fn held(&self) -> Vec<PaneId> {
+        self.run.as_ref().map(|r| r.held.keys().cloned().collect()).unwrap_or_default()
+    }
+
+    /// What the dashboard shows of the machine: last run date, phase, held panes.
+    pub fn view(&self) -> (Option<NaiveDate>, Phase, Vec<PaneId>) {
+        (self.last_run, self.phase.clone(), self.held())
+    }
+
     /// Replace the last run date (the scheduler thread loads the file after `new`). Ignored
     /// while a run is in progress.
     pub fn set_last_run(&mut self, d: Option<NaiveDate>) {
@@ -619,6 +629,11 @@ impl Runtime {
         self.machine.lock().unwrap().phase().clone()
     }
 
+    /// [`Nightly::view`] (machine lock, released).
+    pub fn view(&self) -> (Option<NaiveDate>, Phase, Vec<PaneId>) {
+        self.machine.lock().unwrap().view()
+    }
+
     /// `handoff_done` from `pane` running generation `gen`: record (machine lock, released),
     /// then wake the scheduler.
     pub fn handoff(&self, pane: &str, gen: Option<u64>) -> Handoff {
@@ -679,7 +694,11 @@ impl Runtime {
 /// and Manager only). Always `Ok` — outside a run it is a harmless no-op with a message.
 pub fn handoff_done(state: &AppState, caller: &Caller) -> Result<Value, String> {
     let gen = state.pty.current_gen(&caller.pane); // the caller's token belongs to the latest spawn
-    Ok(json!(state.nightly.handoff(&caller.pane, gen).message()))
+    let r = state.nightly.handoff(&caller.pane, gen);
+    if matches!(r, Handoff::Accepted { .. }) {
+        state.ui.board_changed(); // the dashboard's pending list shrank
+    }
+    Ok(json!(r.message()))
 }
 
 /// Everything `step` needs, read from the app (locks one at a time, all released).
@@ -746,8 +765,16 @@ fn post_item(state: &AppState, tab_name: &str, title: &str, reason: String) {
 /// One scheduler round at (`local`, `mono`).
 pub fn tick(state: &AppState, file: Option<&Path>, local: NaiveDateTime, mono: Instant) {
     let world = observe(state, local, mono);
-    let actions = state.nightly.machine.lock().unwrap().step(&world); // released here
+    let (before, actions, after) = {
+        let mut m = state.nightly.machine.lock().unwrap(); // released at the end of the block
+        let before = m.view();
+        let actions = m.step(&world);
+        (before, actions, m.view())
+    };
     perform(state, file, actions);
+    if before != after {
+        state.ui.board_changed(); // phase, pending, held or last run changed (dashboard)
+    }
 }
 
 /// Start the scheduler thread: loads `file`'s last run date, then ticks every [`TICK`] (and on
