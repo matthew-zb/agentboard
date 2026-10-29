@@ -238,6 +238,7 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
 | `env_status()` | 모두 | 환경 점검 결과 |
 | `env_skip(item)` · `env_set_source(item, url)` | dispatcher | 점검 건너뛰기 기록 · 설치 저장소 주소 기록 |
 | `config_reload()` | dispatcher | 설정 다시 읽기(재시작 없음, 아래 "기본 템플릿" 절) — 추가된 탭·닫지 않은 탭·갱신한 시작 프롬프트 수 |
+| `focus_status()` · `focus_set(mode)` | dispatcher | 집중근무 모드 조회 · 변경(`normal`·`hold`(전달 멈춤)·`focus`(집중근무), 사용자가 말로 요청할 때만) — `{mode, since}` |
 
 팀 문서: Manager는 리드를 채용하기 전에 `<작업 폴더>/teams/<팀id>/brief.md`(첫 줄 `상태: 진행 중`)와 `roster.md`(팀원 구성)를 씁니다. 끝난 팀은 brief에 `상태: 완료`를 적어 재채용 대상에서 뺍니다.
 

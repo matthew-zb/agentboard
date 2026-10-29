@@ -4,6 +4,7 @@
 
 ### Features
 - 설정 다시 읽기(팔레트, dispatcher MCP `config_reload`): 앱을 재시작하지 않고 config.json·템플릿·프로필·키 설정을 다시 읽고, config에만 있는 역할 탭(handover 포함)을 띄운다. 다른 창은 재시작하지 않고, 오류가 있으면 아무것도 바꾸지 않는다.
+- 집중근무(전달 멈춤·집중근무): 팔레트나 dispatcher MCP `focus_set`으로 켜고 끄며 재시작 뒤에도 유지된다. dispatcher는 다른 세션의 보고를 `DISPATCHER.md` 「## 보류(집중근무)」에 쌓아 두고 해제 때 결정 요청 → 알림 순으로 요약한다. 모드 중 에이전트의 `need_user` ⚠는 해제될 때 표시된다(권한 확인·폴더 신뢰 ⚠는 바로 표시).
 - dispatcher 오른쪽 열의 인박스 아래에 메모(`MEMO.md`의 `## 메모` 아래 본문)를 둔다. 읽기·바로 편집, 외부 변경 알림, `.agentboard/memo.bak` 1단계 백업. dispatcher는 사용자가 요구할 때만 파일을 고친다.
 
 ### Fixes
