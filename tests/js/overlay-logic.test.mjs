@@ -611,3 +611,84 @@ test('reloadFlow: errors go to the error panel and nothing else happens', async 
   assert.equal(await reloadFlow(d), false);
   assert.deepEqual(d.log, [['reload'], ['showErrors', ['설정에 오류가 있어 다시 읽지 않았습니다 — 아무것도 바뀌지 않았습니다', 'config.json:2:1 — 잘못된 값']]]);
 });
+
+// ---- ④ RF1: palette "현재 탭 닫기" (remove-tab spec, R2 a · R3 a)
+import { closeTabInfo, closeTabFlow } from '../../src/overlay-logic.js';
+
+test('paletteItems: close-tab entry except on the dispatcher tab', () => {
+  const ws = fixture(); // focused: g1 → t2 (api)
+  assert.deepEqual(paletteItems(ws, {}).find((i) => i.action.type === 'closeTab'), {
+    label: '현재 탭 닫기',
+    hint: 'Y/N 확인',
+    action: { type: 'closeTab', tab: 't2' },
+  });
+  ws.groups.g1.activeTabId = 't1'; // the Dispatcher tab cannot be closed
+  assert.equal(paletteItems(ws, {}).find((i) => i.action.type === 'closeTab'), undefined);
+});
+
+test('closeTabInfo: name, role and running panes of the tab', () => {
+  const ws = fixture();
+  ws.panes.p2.status = { state: 'running' };
+  ws.panes.p3.status = { state: 'exited', code: 0 };
+  ws.panes.p4.status = { state: 'running' };
+  ws.tabs.t2.role = 'manager';
+  assert.deepEqual(closeTabInfo(ws, 't2'), { tab: 't2', name: 'api', role: 'manager', running: 2 });
+  assert.deepEqual(closeTabInfo(ws, 't3'), { tab: 't3', name: 'ha', role: null, running: 0 });
+  assert.equal(closeTabInfo(ws, 't1'), null, 'the Dispatcher tab');
+  assert.equal(closeTabInfo(ws, 'nope'), null);
+});
+
+function closeDeps({ answer = true, error = null } = {}) {
+  const log = [];
+  return {
+    log,
+    confirm: async (msg, opts) => {
+      log.push(['confirm', msg, opts]);
+      return answer;
+    },
+    close: async (tab) => {
+      log.push(['close', tab]);
+      if (error) throw error;
+    },
+    showErrors: (lines) => log.push(['showErrors', lines]),
+  };
+}
+
+test('closeTabFlow: Y/N with Enter ignored, then CloseTab', async () => {
+  const d = closeDeps();
+  assert.equal(await closeTabFlow({ tab: 't2', name: 'billing', role: 'manager', running: 3 }, d), true);
+  const [kind, msg, opts] = d.log[0];
+  assert.equal(kind, 'confirm');
+  assert.deepEqual(opts, { enterYes: false });
+  assert.ok(msg.startsWith("'billing' 상시업무(Manager) 탭을 닫을까요?"), msg);
+  for (const w of ['실행 중인 창 3개', 'config.json', '끝나지 않은 인박스 항목', '진행 중인 팀']) assert.ok(msg.includes(w), w);
+  assert.deepEqual(d.log[1], ['close', 't2']);
+  // handover (R3 a: only this path) and a plain tab: shorter questions
+  const h = closeDeps();
+  await closeTabFlow({ tab: 't9', name: 'handover', role: 'handover', running: 1 }, h);
+  assert.ok(h.log[0][1].startsWith("'handover' 탭을 닫을까요?") && h.log[0][1].includes('config.json'));
+  const p = closeDeps();
+  await closeTabFlow({ tab: 't3', name: 'ha', role: null, running: 0 }, p);
+  assert.equal(p.log[0][1], "'ha' 탭을 닫을까요?");
+  // N: nothing is sent
+  const n = closeDeps({ answer: false });
+  assert.equal(await closeTabFlow({ tab: 't2', name: 'billing', role: 'manager', running: 1 }, n), false);
+  assert.deepEqual(n.log.map((e) => e[0]), ['confirm']);
+});
+
+test('closeTabFlow: a refusal is shown in the error panel and nothing else is sent', async () => {
+  const refusal = "'billing' 상시업무를 닫지 않았습니다 — 끝나지 않은 인박스 항목 2개(새 1·진행 중 1). 항목을 완료(종료 확인)한 뒤 다시 시도하세요.";
+  const d = closeDeps({ error: refusal });
+  assert.equal(await closeTabFlow({ tab: 't2', name: 'billing', role: 'manager', running: 1 }, d), false);
+  assert.deepEqual(d.log.slice(1), [['close', 't2'], ['showErrors', [refusal]]]);
+  const e = closeDeps({ error: new Error('창을 찾을 수 없습니다') });
+  await closeTabFlow({ tab: 't2', name: 'x', role: null, running: 0 }, e);
+  assert.deepEqual(e.log.at(-1), ['showErrors', ['창을 찾을 수 없습니다']]);
+});
+
+test('app.js sends "현재 탭 닫기" without the toast path so a refusal reaches the error panel', () => {
+  const src = readFileSync(new URL('../../src/app.js', import.meta.url), 'utf8');
+  assert.match(src, /case 'closeTab':\s*return closeCurrentTab\(a\.tab\);/);
+  const fn = src.slice(src.indexOf('function closeCurrentTab('), src.indexOf('function closeCurrentTab(') + 700);
+  for (const w of ['closeTabFlow(', 'closeTabInfo(', "api.send({ type: 'closeTab'", 'showErrors']) assert.ok(fn.includes(w), w);
+});

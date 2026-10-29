@@ -59,7 +59,7 @@ import { mountDoc, configureDocView, renderMarkdown, loadImages } from './docvie
 import { mountMemo, configureMemo } from './memo.js';
 import { mountDashboard, configureDashboard, updateDashboard, setDashboardFocus } from './dashboard.js';
 import { configureCopyMode, toggleCopyMode, copyActive, pruneCopySessions } from './copy-ui.js';
-import { pickCommands, paletteItems, missingDirsFlow, closeFlow, envStatusFlag, reloadFlow } from './overlay-logic.js';
+import { pickCommands, paletteItems, missingDirsFlow, closeFlow, envStatusFlag, reloadFlow, closeTabInfo, closeTabFlow } from './overlay-logic.js';
 import { hiddenAttentionTabs, statusEntryText } from './attention-logic.js';
 import { focusFlag, makeFocusSync } from './focus-logic.js';
 
@@ -226,9 +226,28 @@ function runPaletteAction(a) {
     case 'focus':
       // the status bar and the inbox follow the focus-changed event (one state in the backend)
       return api.focusSet(a.mode).catch(showError);
+    case 'closeTab':
+      return closeCurrentTab(a.tab);
     default:
       return undefined;
   }
+}
+
+// ---------------------------------------------------------------- closing a tab (④ RF1)
+
+/** Palette "현재 탭 닫기": Y/N (Enter ignored), then CloseTab sent directly — not through
+ * sendCmd, whose error toast is too short for a refusal: the reason (open inbox items, running
+ * teams) goes to the error panel. Manager / handover tabs also leave config.json (backend). */
+function closeCurrentTab(tabId) {
+  const info = current && closeTabInfo(current.workspace, tabId);
+  return closeTabFlow(info, {
+    confirm,
+    close: (tab) =>
+      api.send({ type: 'closeTab', tab }).then((snap) => {
+        if (snap) render(snap);
+      }),
+    showErrors,
+  });
 }
 
 // ---------------------------------------------------------------- settings reload
