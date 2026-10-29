@@ -387,6 +387,13 @@ async fn config_reload(app: AppHandle) -> Result<workspace::ReloadReport, Vec<St
     .map_err(|e| vec![format!("설정을 다시 읽는 작업이 중단되었습니다 — {e}")])?
 }
 
+/// `config.json` `memo` settings for the memo applet: `{"vi": bool}` (re-read on
+/// `config-reloaded`).
+#[tauri::command]
+fn memo_settings(state: State<'_, AppState>) -> config::MemoConfig {
+    state.loaded.read().unwrap().config.memo.clone()
+}
+
 #[tauri::command]
 fn get_keybindings(state: State<'_, AppState>) -> BTreeMap<String, String> {
     state.loaded.read().unwrap().keybindings.0.clone()
@@ -854,6 +861,7 @@ pub fn run() {
             ws_snapshot,
             config_errors,
             get_keybindings,
+            memo_settings,
             config_reload,
             get_passthrough,
             list_workspace_dirs,
