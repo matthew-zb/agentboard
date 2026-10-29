@@ -41,6 +41,8 @@ pub const PERMISSIONS: &[(&str, &[Role])] = &[
     ("env_skip", &[D]),
     ("env_set_source", &[D]),
     ("config_reload", &[D]),
+    ("focus_set", &[D]),
+    ("focus_status", &[D]),
 ];
 
 /// Whether `role` may call `tool` (per [`PERMISSIONS`]; unknown tools: no).
@@ -249,6 +251,21 @@ fn implemented() -> Vec<ToolDef> {
             description: "config.json·templates·agents·keybindings를 다시 읽습니다. 앱과 다른 창은 재시작되지 않습니다. config에 있는데 열려 있지 않은 역할 탭(Manager·handover)을 새 세션으로 열고, 상시 창의 시작 프롬프트는 템플릿 값으로 바꿔 두며(다음 새 시작 때 적용), config에서 빠진 역할 탭은 닫지 않고 알려 줍니다. 결과: {added, keptMissing, promptsUpdated}. 설정 오류가 있으면 아무것도 바꾸지 않고 오류 줄(파일:줄:열)을 돌려줍니다 — 고친 뒤 다시 부르세요.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
+        ToolDef {
+            name: "focus_status",
+            description: "집중근무 모드를 돌려줍니다: {mode, since}. mode = normal(일반) | hold(전달 멈춤) | focus(집중근무), since = 모드 시작 시각(일반이면 null). 모드 중 규칙은 역할 지시의 집중근무 절을 따르세요.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "focus_set",
+            description: "사용자가 말로 요청했을 때만 집중근무 모드를 바꿉니다(팔레트와 같은 상태). mode = normal(해제) | hold(전달 멈춤) | focus(집중근무). 바뀌면 앱이 이 세션에 [AgentBoard] 알림을 보냅니다. 스스로 판단해 켜거나 끄지 마세요.",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "mode": { "type": "string", "enum": ["normal", "hold", "focus"] } },
+                "required": ["mode"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -304,6 +321,13 @@ pub fn call(state: &AppState, caller: &Caller, name: &str, args: Value) -> Resul
         "env_skip" => env_skip(state, &args),
         "env_set_source" => env_set_source(state, &args),
         "config_reload" => config_reload(state),
+        "focus_status" => serde_json::to_value(state.focus.status()).map_err(|e| e.to_string()),
+        "focus_set" => {
+            let m = req_str(&args, "mode")?;
+            let mode = crate::focus::FocusMode::parse(&m)
+                .ok_or_else(|| format!("mode는 normal(일반)·hold(전달 멈춤)·focus(집중근무) 중 하나여야 합니다: {m}"))?;
+            serde_json::to_value(crate::focus::set(state, mode)?).map_err(|e| e.to_string())
+        }
         _ => Err(format!("알 수 없는 도구입니다: {name}")),
     }
 }
@@ -903,7 +927,10 @@ mod tests {
         );
         assert_eq!(
             names(Role::Dispatcher),
-            ["inbox_list", "handoff_done", "create_manager_tab", "need_user", "env_status", "env_skip", "env_set_source", "config_reload"]
+            [
+                "inbox_list", "handoff_done", "create_manager_tab", "need_user", "env_status", "env_skip", "env_set_source", "config_reload",
+                "focus_status", "focus_set"
+            ]
         );
         assert_eq!(names(Role::Lead), ["inbox_list", "hire_member", "dismiss", "dismiss_team", "list_team", "need_user", "env_status"]);
         assert_eq!(names(Role::Handover), ["inbox_list", "handoff_done", "need_user", "env_status"]);

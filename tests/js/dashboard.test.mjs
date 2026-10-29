@@ -207,7 +207,7 @@ test('nightly summary from board_status', () => {
 });
 
 // ---------------------------------------------------------------- the "작업 상태" applet (fake DOM)
-import { buildDashboard, mountDashboard, configureDashboard, updateDashboard } from '../../src/dashboard.js';
+import { buildDashboard, mountDashboard, configureDashboard, updateDashboard, setDashboardFocus } from '../../src/dashboard.js';
 
 /** Minimal DOM: elements keep children/text/attributes; any innerHTML use throws. */
 function fakeDocument() {
@@ -313,7 +313,7 @@ const BOARD = {
 };
 const INBOX = { version: 3, items: [{ id: 'i1', ownerName: 'billing', state: 'new', read: false }, { id: 'i2', ownerName: 'billing', state: 'in_progress', read: true }], unknownOwners: [] };
 
-function setupDash() {
+function setupDash({ inbox = INBOX } = {}) {
   const t = { calls: [], listeners: {}, jumps: [], toasts: [] };
   globalThis.document = fakeDocument();
   globalThis.__TAURI__ = {
@@ -321,7 +321,7 @@ function setupDash() {
       invoke: async (cmd, args) => {
         t.calls.push([cmd, args]);
         if (cmd === 'board_status') return BOARD;
-        if (cmd === 'inbox_list') return INBOX;
+        if (cmd === 'inbox_list') return inbox;
         return null;
       },
     },
@@ -343,6 +343,7 @@ function setupDash() {
 function teardownDash(view) {
   view.dispose();
   updateDashboard(null);
+  setDashboardFocus(null);
   delete globalThis.document;
   delete globalThis.__TAURI__;
 }
@@ -509,4 +510,65 @@ test('Ctrl+Alt+d opens the 작업 상태 tab: default key, label, palette entry,
   assert.deepEqual(it, { label: '작업 상태', hint: 'Ctrl+Alt+d', action: { type: 'command', id: 'app.dashboard' } });
   const app = readFileSync(new URL('../../src/app.js', import.meta.url), 'utf8');
   assert.match(app, /registerCommand\('app\.dashboard', \(\) => enqueue\(\(\) => execute\(\[\{ type: 'openDashboard' \}\]\)\)\)/);
+});
+
+// ---------------------------------------------------------------- 집중근무: the counts follow the inbox rule
+import { inboxFocusView } from '../../src/focus-logic.js';
+
+const SINCE = '2026-10-29T10:00:00+09:00';
+const UNTIL = '2026-10-29T11:00:00+09:00';
+const FOCUS_ITEMS = [
+  { id: 'a', ownerName: 'billing', state: 'in_progress', read: true, created: '2026-10-29T09:00:00+09:00' }, // before the mode
+  { id: 'b', ownerName: 'billing', state: 'new', read: false, created: '2026-10-29T10:10:00+09:00' }, // during
+  { id: 'c', ownerName: 'billing', state: 'close_proposed', read: true, created: '2026-10-29T10:20:00+09:00' }, // during, read
+  { id: 'd', ownerName: 'api', state: 'new', read: false, created: '2026-10-29T10:30:00+09:00' }, // during
+  { id: 'e', ownerName: 'api', state: 'done', read: true, created: '2026-10-29T10:40:00+09:00' }, // during, done
+];
+
+test('집중근무 / 전달 멈춤: items the inbox hides or holds are not counted; after release they count again', () => {
+  const zero = { new: 0, unread: 0, inProgress: 0, closeProposed: 0, open: 0 };
+  const all = inboxOpenCounts(FOCUS_ITEMS);
+  assert.deepEqual(all.billing, { new: 1, unread: 1, inProgress: 1, closeProposed: 1, open: 3 });
+  assert.deepEqual(all.api, { ...zero, new: 1, unread: 1, open: 1 });
+  for (const mode of ['focus', 'hold']) {
+    const c = inboxOpenCounts(FOCUS_ITEMS, { mode, since: SINCE });
+    assert.deepEqual(c.billing, { ...zero, inProgress: 1, open: 1 }, `${mode}: only what came before the mode`);
+    assert.equal(c.api, undefined, `${mode}: api had only items of the mode`);
+    // the same items the inbox list leaves out (one rule: inboxFocusView)
+    const v = inboxFocusView(FOCUS_ITEMS, { mode, since: SINCE });
+    assert.equal(c.billing.open + (c.api ? c.api.open : 0), v.rest.length + v.released.length);
+  }
+  // released: the group (unread) and the rest (read ones of the window too) are all counted
+  const released = { mode: 'normal', since: null, released: { from: SINCE, to: UNTIL } };
+  assert.deepEqual(inboxOpenCounts(FOCUS_ITEMS, released), all);
+  assert.deepEqual(inboxOpenCounts(FOCUS_ITEMS, { mode: 'normal', since: null }), all);
+  assert.deepEqual(inboxOpenCounts(FOCUS_ITEMS, null), all, 'state unknown: as before');
+  // rows carry the focus-aware counts
+  const gs = dashboardRows(snapshot(), { inbox: FOCUS_ITEMS, focus: { mode: 'focus', since: SINCE } });
+  assert.deepEqual(gs.find((g) => g.name === 'billing').inbox, { ...zero, inProgress: 1, open: 1 });
+  assert.deepEqual(gs.find((g) => g.name === 'api').inbox, zero);
+});
+
+test('dashboard view: a focus change (setDashboardFocus) redraws the counts', async () => {
+  setupDash({ inbox: { version: 1, items: FOCUS_ITEMS, unknownOwners: [] } });
+  updateDashboard(snapshot());
+  const v = mountDashboard('dash');
+  await settle();
+  const head = (name) => tree(v.el).find((e) => e.classList && e.classList.contains('dash-tab') && e.textContent.includes(name)).textContent;
+  assert.ok(head('billing').includes('인박스 새 1(안 읽음 1) · 진행 중 1 · 종료 제안 1'), head('billing'));
+  assert.ok(head('api').includes('인박스 새 1'));
+  setDashboardFocus({ mode: 'focus', since: SINCE });
+  assert.ok(head('billing').includes('인박스 진행 중 1') && !head('billing').includes('새 1'), head('billing'));
+  assert.ok(!head('api').includes('인박스'), head('api'));
+  setDashboardFocus({ mode: 'normal', since: null, released: { from: SINCE, to: UNTIL } });
+  assert.ok(head('billing').includes('인박스 새 1(안 읽음 1) · 진행 중 1 · 종료 제안 1'), head('billing'));
+  teardownDash(v);
+});
+
+test('app.js hands every focus state to the dashboard too (focus-changed → focus_get → apply)', () => {
+  const src = readFileSync(new URL('../../src/app.js', import.meta.url), 'utf8');
+  const sync = src.slice(src.indexOf('const focusSync = makeFocusSync('), src.indexOf('// Environment check'));
+  assert.match(sync, /setInboxFocus\(state\)/);
+  assert.match(sync, /setDashboardFocus\(state\)/);
+  assert.match(src, /api\.on\('focus-changed', \(\) => focusSync\.refresh\(\)\)/);
 });

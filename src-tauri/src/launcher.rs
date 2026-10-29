@@ -88,6 +88,10 @@
 //!   board lock again; `board::status` takes the nightly machine lock, the board lock and
 //!   `panes` one at a time. `nightly::tick` reads the machine's view before and after `step`
 //!   under the machine lock and emits `board-changed` after `perform`, with no lock held.
+//! * Focus mode (focus.rs): `AppState::focus` is a leaf, held only around the mode / the held
+//!   `need_user` list and the focus.json write. `focus::set` releases it before telling the
+//!   dispatcher (bridge), re-showing ⚠ (`execute`) and emitting; `need_user` checks it before
+//!   `execute`, never inside.
 //! * Memo (memo.rs): `AppState::memo` (`MemoState.last`) is a leaf, held across the MEMO.md /
 //!   memo.bak IO (reads and saves are serialized); `memo_read`/`memo_save` read workspaceRoot
 //!   from `loaded` (released) first and run on a blocking thread.
