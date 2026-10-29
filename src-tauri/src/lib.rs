@@ -7,6 +7,7 @@ pub mod config;
 pub mod control;
 pub mod docs;
 pub mod envcheck;
+pub mod focus;
 pub mod hookcli;
 pub mod inbox;
 pub mod issues;
@@ -70,6 +71,10 @@ pub trait Ui: Send + Sync {
     /// Emit `board-changed` (no payload): a hook updated the dashboard board, or the nightly
     /// state changed (the dashboard re-reads `board_status`).
     fn board_changed(&self) {}
+
+    /// Emit `focus-changed` with the new `{mode, since}` (palette or the dispatcher's
+    /// `focus_set`).
+    fn focus_changed(&self, _status: &focus::FocusStatus) {}
 }
 
 /// Lock order: see the module docs of `launcher`.
@@ -91,6 +96,8 @@ pub struct AppState {
     pub startup_errors: Vec<String>,
     /// Set by the first confirmed exit (`app_exit`); later calls are ignored.
     pub exiting: AtomicBool,
+    /// 집중근무 mode (`focus.rs`; leaf lock), loaded from `focus.json` at startup.
+    pub focus: focus::FocusState,
     /// The memo's last known content (`memo.rs`; leaf lock).
     pub memo: memo::MemoState,
     /// Per-pane session status for the dashboard (`board.rs`; leaf lock).
@@ -154,6 +161,7 @@ impl AppState {
             saver,
             startup_errors,
             exiting: AtomicBool::new(false),
+            focus: focus::FocusState::default(),
             memo: memo::MemoState::default(),
             board: board::Board::default(),
             tokens: agentcfg::Tokens::new(),
@@ -274,7 +282,14 @@ impl Ui for AppSink {
     fn board_changed(&self) {
         let _ = self.app.emit(board::BOARD_CHANGED, ());
     }
+
+    fn focus_changed(&self, status: &focus::FocusStatus) {
+        let _ = self.app.emit(FOCUS_CHANGED, status);
+    }
 }
+
+/// Event: the focus mode changed; payload `{mode, since}` (`focus.rs`).
+pub const FOCUS_CHANGED: &str = "focus-changed";
 
 /// Event: config.json / templates / profiles / keybindings were read again (`config_reload`).
 pub const CONFIG_RELOADED: &str = "config-reloaded";
@@ -405,6 +420,20 @@ async fn config_reload(app: AppHandle) -> Result<workspace::ReloadReport, Vec<St
 #[tauri::command]
 fn memo_settings(state: State<'_, AppState>) -> config::MemoConfig {
     state.loaded.read().unwrap().config.memo.clone()
+}
+
+/// 집중근무 mode for the status bar / inbox: `{mode: "normal"|"hold"|"focus", since}`.
+#[tauri::command]
+fn focus_get(state: State<'_, AppState>) -> focus::FocusStatus {
+    state.focus.status()
+}
+
+/// Palette "집중근무 시작/해제", "전달 멈춤": the same switch as the dispatcher's MCP
+/// `focus_set` (`mode`: normal | hold | focus).
+#[tauri::command]
+fn focus_set(state: State<'_, AppState>, mode: String) -> Result<focus::FocusStatus, String> {
+    let m = focus::FocusMode::parse(&mode).ok_or_else(|| format!("알 수 없는 모드입니다: {mode}"))?;
+    focus::set(&state, m)
 }
 
 #[tauri::command]
@@ -882,6 +911,8 @@ pub fn run() {
             config_errors,
             get_keybindings,
             memo_settings,
+            focus_get,
+            focus_set,
             config_reload,
             get_passthrough,
             list_workspace_dirs,
@@ -970,6 +1001,7 @@ pub fn run() {
                 }
             };
             app.manage(AppState::new(ws, loaded, pty, sink, tx, saver, startup_errors, agentcfg::default_run_dir()));
+            app.state::<AppState>().focus.load(appdata.join(focus::FILE_NAME)); // the saved focus mode (F5)
             {
                 // R29: items written before name-keyed ownership carry a tab id; map it once
                 let state = app.state::<AppState>();

@@ -68,6 +68,8 @@ pub fn on_session_start(state: &AppState, caller: &Caller, body: &Value) {
     launcher::release_prompt(state, &caller.pane, gen, Instant::now());
     // a SessionStart after the warning: the trust question was answered
     clear_trust_warning(state, &caller.pane);
+    // a new dispatcher session hears the focus mode again (F5)
+    crate::focus::on_session_start(state, caller);
 }
 
 /// Turn off the pane's ⚠ if (and only if) it is still the trust warning.
@@ -102,6 +104,12 @@ pub fn need_user(state: &AppState, caller: &Caller, args: &Value) -> Result<Valu
         Some(_) => return Err("reason은(는) 문자열이어야 합니다".into()),
     };
     let reason = clean_reason(raw).ok_or("reason이 비어 있습니다 — 한 줄 사유를 쓰세요")?;
+    // focus mode (F4 a): a decision request waits; it shows when the mode ends
+    if state.focus.defer(&caller.pane, &reason) {
+        return Ok(Value::String(
+            "사용자가 집중근무(또는 전달 멈춤) 중입니다 — ⚠와 사유는 해제될 때 표시됩니다. 질문을 화면에 써 두고 기다리세요.".into(),
+        ));
+    }
     launcher::execute(state, WsCommand::SetAttention { pane: caller.pane.clone(), on: true, reason: Some(reason) })?;
     Ok(Value::String("사용자에게 알렸습니다(탭에 ⚠와 사유 표시). 질문을 화면에 써 두고 답을 기다리세요.".into()))
 }
