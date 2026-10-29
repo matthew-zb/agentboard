@@ -78,6 +78,10 @@
 //!   Inbox relay (Task 10, `bridge::relay_*` from Tauri commands): `ws` (released), then the
 //!   inbox, then `inner`/`wake` via `send` — one at a time, never nested.
 //! * Attention (attention.rs, Task 9): `AppState::trust` (folder-trust timers) is a leaf.
+//! * Focus mode (focus.rs): `AppState::focus` is a leaf, held only around the mode / the held
+//!   `need_user` list and the focus.json write. `focus::set` releases it before telling the
+//!   dispatcher (bridge), re-showing ⚠ (`execute`) and emitting; `need_user` checks it before
+//!   `execute`, never inside.
 //! * Memo (memo.rs): `AppState::memo` (`MemoState.last`) is a leaf, held across the MEMO.md /
 //!   memo.bak IO (reads and saves are serialized); `memo_read`/`memo_save` read workspaceRoot
 //!   from `loaded` (released) first and run on a blocking thread.

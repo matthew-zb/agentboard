@@ -129,6 +129,13 @@ impl Bridge {
         self.inner.lock().unwrap().regs.get(pane).cloned()
     }
 
+    /// Test-only: the texts waiting for the pane, oldest first.
+    #[cfg(test)]
+    pub(crate) fn queued_texts(&self, pane: &str) -> Vec<String> {
+        let g = self.inner.lock().unwrap();
+        g.queues.get(pane).map(|q| q.iter().map(|p| p.text.clone()).collect()).unwrap_or_default()
+    }
+
     /// Number of messages waiting for the pane.
     pub fn queued(&self, pane: &str) -> usize {
         self.inner.lock().unwrap().queues.get(pane).map_or(0, |q| q.len())
