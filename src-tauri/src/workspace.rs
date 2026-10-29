@@ -1551,12 +1551,17 @@ impl Workspace {
     }
 
     /// R16: a standing agent pane (Dispatcher/Handover/Manager) is never closed or broken off on
-    /// its own — the standing task goes away with its tab (CloseTab). Restart is allowed.
+    /// its own — the standing task goes away with its tab (CloseTab). Restart is allowed. A
+    /// Manager / handover refusal names the palette's "현재 탭 닫기" (④ RF1); the Dispatcher tab
+    /// has no such entry, so its pane keeps the plain text.
     fn check_not_standing(&self, pane: &str) -> Result<(), String> {
-        if self.pane(pane)?.role.is_some_and(|r| r.is_standing()) {
-            return Err("상시 에이전트 창은 따로 닫거나 떼어낼 수 없습니다 — 탭을 닫으세요".into());
+        match self.pane(pane)?.role {
+            Some(Role::Dispatcher) => Err("상시 에이전트 창은 따로 닫거나 떼어낼 수 없습니다 — 탭을 닫으세요".into()),
+            Some(r) if r.is_standing() => {
+                Err("상시 에이전트 창은 따로 닫거나 떼어낼 수 없습니다 — 팔레트의 '현재 탭 닫기'로 탭을 닫으세요".into())
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     fn new_group_id(&mut self) -> GroupId {
@@ -2285,6 +2290,28 @@ mod tests {
         assert!(l.errors.is_empty(), "{:?}", l.errors);
         let ws = Workspace::from_config(&l);
         (l, ws)
+    }
+
+    /// R16 wording (remove-tab spec RC1 Step 5): a Manager or handover pane points to the
+    /// palette's "현재 탭 닫기"; the Dispatcher tab cannot be closed, so its pane keeps the old
+    /// text.
+    #[test]
+    fn standing_pane_refusal_points_to_the_palette_close() {
+        let (l, mut ws) = role_ws();
+        let before = ws.clone();
+        let pane_of = |ws: &Workspace, r: Role| ws.panes.values().find(|p| p.role == Some(r) && !p.kind.is_applet()).unwrap().id.clone();
+        for r in [Role::Manager, Role::Handover] {
+            let p = pane_of(&ws, r);
+            for cmd in [WsCommand::ClosePane { pane: p.clone() }, WsCommand::BreakPaneToTab { pane: p.clone() }] {
+                let err = ws.apply(cmd, &l).unwrap_err();
+                assert_eq!(err, "상시 에이전트 창은 따로 닫거나 떼어낼 수 없습니다 — 팔레트의 '현재 탭 닫기'로 탭을 닫으세요", "{}", r.as_str());
+            }
+        }
+        let d = pane_of(&ws, Role::Dispatcher);
+        for cmd in [WsCommand::ClosePane { pane: d.clone() }, WsCommand::BreakPaneToTab { pane: d.clone() }] {
+            assert_eq!(ws.apply(cmd, &l).unwrap_err(), "상시 에이전트 창은 따로 닫거나 떼어낼 수 없습니다 — 탭을 닫으세요");
+        }
+        assert_eq!(ws, before);
     }
 
     #[test]
