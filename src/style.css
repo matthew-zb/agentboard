@@ -177,6 +177,9 @@ body.dragging-v, body.dragging-v * { cursor: row-resize !important; user-select:
 .inbox-badge.st-close_proposed { background: #6a5312; color: #ffe08a; }
 .inbox-badge.st-done { background: #2c4a35; }
 .inbox-empty { padding: 12px; color: var(--muted); }
+/* 집중근무 / 전달 멈춤 (focus-logic.js): one held line; the released group header */
+.inbox-held { padding: 4px 6px; margin-bottom: 4px; color: var(--muted); border: 1px dashed var(--line); border-radius: 3px; }
+.inbox-group { padding: 6px 6px 2px; color: var(--warn); font-weight: bold; }
 .inbox-detail { flex: 58 1 0; min-width: 0; overflow: auto; padding: 8px 10px; border-left: 2px solid transparent; user-select: text; }
 .inbox-detail.active { border-left-color: var(--accent); }
 .inbox-dhead { display: flex; align-items: baseline; gap: 6px; margin-bottom: 6px; }
