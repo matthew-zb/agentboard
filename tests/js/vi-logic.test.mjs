@@ -38,6 +38,9 @@ test('viKeyFromEvent maps KeyboardEvent.code (Hangul layout safe); app chords ar
   assert.equal(viKeyFromEvent(ev('KeyR', 'C'), 'normal'), 'C-r');
   assert.equal(viKeyFromEvent(ev('KeyD', 'C'), 'normal'), 'C-d');
   assert.equal(viKeyFromEvent(ev('Enter', 'C'), 'normal'), 'C-Enter');
+  // arrows / Home / End move like h j k l 0 $ (the read-only textarea's own caret never moves)
+  assert.deepEqual(['ArrowLeft', 'ArrowDown', 'ArrowUp', 'ArrowRight', 'Home', 'End'].map((c) => viKeyFromEvent(ev(c), 'normal')), ['h', 'j', 'k', 'l', '0', '$']);
+  assert.equal(viKeyFromEvent(ev('ArrowLeft'), 'insert'), null, 'insert mode: the textarea moves its caret');
   assert.equal(viKeyFromEvent(ev('KeyH', 'A'), 'normal'), null, 'Alt+h is an app chord');
   assert.equal(viKeyFromEvent(ev('KeyX', 'C'), 'normal'), null);
   // insert mode: only leaving and saving; typing (and an IME composition) is the textarea's

@@ -17,6 +17,8 @@ export const VI_KEYS = [
 ];
 
 const CTRL = { KeyR: 'C-r', KeyD: 'C-d', KeyU: 'C-u', BracketLeft: 'C-[', Enter: 'C-Enter', NumpadEnter: 'C-Enter' };
+// normal mode: the read-only textarea's own caret must not move behind the state's back
+const MOVES = { ArrowLeft: 'h', ArrowDown: 'j', ArrowUp: 'k', ArrowRight: 'l', Home: '0', End: '$' };
 
 /**
  * Token for a keydown in `mode` ('normal' | 'insert'), or null. Normal mode: letters (Shift =
@@ -33,6 +35,7 @@ export function viKeyFromEvent(e, mode) {
   }
   if (e.ctrlKey) return e.shiftKey ? null : CTRL[e.code] || null;
   if (e.code === 'Escape') return 'Esc';
+  if (MOVES[e.code] && !e.shiftKey) return MOVES[e.code];
   const m = /^Key([A-Z])$/.exec(e.code || '');
   if (m) return e.shiftKey ? m[1] : m[1].toLowerCase();
   if (e.code === 'Digit0' && !e.shiftKey) return '0';

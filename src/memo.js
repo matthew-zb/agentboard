@@ -11,9 +11,16 @@
 // backup in .agentboard/memo.bak).
 // Keys come from the applet element (bubble phase): app shortcuts (Alt+…) are taken by the key
 // router first and keep working while editing (the draft stays in the textarea).
+// vi editing (spec §8, V3 b — only when `deps.vi()`, i.e. config.json "memo": {"vi": true}):
+// e opens the editor in normal mode — the textarea read-only, the character under the cursor
+// selected as a block cursor, keys run vi-logic.js; i a A o O hand the textarea back for typing
+// (IME included) until Esc / Ctrl+[. ":" and "/" open a command line under the editor. Esc in
+// normal mode never leaves; :w saves and stays, :wq / ZZ / Ctrl+Enter save and leave, :q!
+// leaves (Y/N when changed, Enter ignored). The mode is shown (-- NORMAL -- / -- INSERT --).
 // No top-level DOM access (Node-importable).
 import * as api from './api.js';
 import { splitMemo, joinMemo, memoEol, normalizeEol, memoKeyAction } from './memo-logic.js';
+import { createVi, viKey, viKeyFromEvent, viLeaveInsert, viCommand, viSearch } from './vi-logic.js';
 import { isFocusTrapKey } from './inbox-logic.js';
 import { LINK_SELECTOR, resolveDocLink } from './docview-logic.js';
 
@@ -26,6 +33,7 @@ const deps = {
   loadImages: () => {}, // (rel, images, alive): docview.js loadImages
   confirm: async () => false,
   toast: (m) => console.error('[agentboard]', m),
+  vi: () => false, // spec §8 V3 b: vi editing only when configured (read when the editor opens)
 };
 
 /** `{render, loadImages, confirm(msg, opts), toast(msg, kind?)}` (app.js). */
@@ -67,7 +75,15 @@ export function mountMemo(paneId) {
   const editor = el('textarea', 'memo-edit');
   editor.spellcheck = false;
   view.appendChild(content);
-  root.append(bar, warn, notice, view);
+  // vi: mode / message line and the ":" "/" command line (shown only while vi editing)
+  const viBar = el('div', 'memo-vi hidden');
+  const viMode = el('span', 'memo-vi-mode');
+  const viPrefix = el('span', 'memo-vi-prefix');
+  const cmdline = el('input', 'memo-cmdline hidden');
+  cmdline.type = 'text';
+  cmdline.spellcheck = false;
+  viBar.append(viMode, viPrefix, cmdline);
+  root.append(bar, warn, notice, view, viBar);
 
   const st = {
     disposed: false,
@@ -86,6 +102,8 @@ export function mountMemo(paneId) {
     asking: false,
     watching: false,
     gen: 0, // render generation: an older render never overwrites a newer one
+    vi: null, // vi-logic state while vi editing (null: plain editor)
+    viCmd: null, // ':' | '/' while the command line is open
   };
 
   function show() {
@@ -93,7 +111,8 @@ export function mountMemo(paneId) {
     root.classList.toggle('editing', editing);
     warn.classList.toggle('hidden', !st.memo || st.memo.marker);
     notice.classList.toggle('hidden', !(editing && st.external));
-    hint.textContent = editing ? 'Ctrl+Enter 저장 · Esc 취소' : 'e 편집 · r 다시 읽기';
+    viBar.classList.toggle('hidden', !(editing && st.vi));
+    hint.textContent = !editing ? 'e 편집 · r 다시 읽기' : st.vi ? ':w 저장 · :wq 저장하고 닫기 · :q! 버리기' : 'Ctrl+Enter 저장 · Esc 취소';
     btns.replaceChildren(
       ...(editing
         ? [button('save', '저장', 'Ctrl+Enter'), button('cancel', '취소', 'Esc')]
@@ -188,11 +207,110 @@ export function mountMemo(paneId) {
     st.base = st.memo;
     st.external = false;
     editor.value = st.base.body;
+    st.vi = deps.vi() ? createVi(normalizeEol(st.base.body, '\n')) : null;
     show();
     editor.focus({ preventScroll: true });
+    if (st.vi) {
+      paintVi(); // normal mode at the top, read-only
+      return;
+    }
     const n = editor.value.length;
     editor.setSelectionRange(n, n); // cursor at the end
     editor.scrollTop = editor.scrollHeight;
+  }
+
+  // ---- vi (spec §8)
+
+  /** Mirror the vi state into the textarea: text, read-only outside insert mode, the cursor (a
+   * one-character selection in normal mode), and the mode / message line. */
+  function paintVi() {
+    const v = st.vi;
+    if (!v) return;
+    if (editor.value !== v.text) editor.value = v.text;
+    editor.readOnly = v.mode !== 'insert';
+    const c = v.cursor;
+    if (v.mode === 'insert') editor.setSelectionRange(c, c);
+    else {
+      const cp = v.text.codePointAt(c);
+      const w = cp === undefined || v.text[c] === '\n' ? 0 : cp > 0xffff ? 2 : 1;
+      editor.setSelectionRange(c, c + w);
+    }
+    viMode.textContent = `${v.mode === 'insert' ? '-- INSERT --' : '-- NORMAL --'}${v.pending ? ` ${v.pending}` : ''}${v.message ? `  ${v.message}` : ''}`;
+  }
+
+  const viewRows = () => Math.max(2, Math.floor((editor.clientHeight || 0) / 20)) || 10;
+
+  function openCmd(kind) {
+    st.viCmd = kind;
+    viPrefix.textContent = kind;
+    cmdline.value = '';
+    cmdline.classList.remove('hidden');
+    cmdline.focus({ preventScroll: true });
+  }
+
+  function closeCmd() {
+    st.viCmd = null;
+    viPrefix.textContent = '';
+    cmdline.classList.add('hidden');
+    if (st.mode === 'edit') editor.focus({ preventScroll: true });
+  }
+
+  function viAction(a) {
+    if (!a) return;
+    if (a.type === 'prompt') openCmd(a.kind);
+    else if (a.type === 'save') save({ stay: true });
+    else if (a.type === 'saveQuit') save();
+    else if (a.type === 'quit') a.force ? cancel() : leaveEdit();
+  }
+
+  function submitCmd() {
+    const kind = st.viCmd;
+    const line = cmdline.value;
+    closeCmd();
+    const r = kind === '/' ? viSearch(st.vi, line) : viCommand(st.vi, line);
+    st.vi = r.state;
+    paintVi();
+    viAction(r.action);
+  }
+
+  /** A keydown while vi editing (after the app router; bubble phase on the applet). */
+  function onViKey(e) {
+    if (e.target === cmdline) {
+      if (e.isComposing) return; // Enter / Esc finish a Hangul composition first
+      if (e.code === 'Enter' || e.code === 'NumpadEnter') {
+        e.preventDefault();
+        e.stopPropagation();
+        submitCmd();
+      } else if (e.code === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        closeCmd();
+      }
+      return; // typing into the command line
+    }
+    const v = st.vi;
+    const k = viKeyFromEvent(e, v.mode);
+    if (!k) {
+      // normal mode: nothing else may act on the (read-only) textarea; insert mode: typing
+      if (v.mode === 'normal' && !e.ctrlKey && !e.altKey && !e.metaKey) e.preventDefault();
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    if (k === 'C-Enter') {
+      if (v.mode === 'insert') st.vi = viLeaveInsert(v, editor.value, editor.selectionStart ?? editor.value.length);
+      save();
+      return;
+    }
+    if (v.mode === 'insert') {
+      st.vi = viLeaveInsert(v, editor.value, editor.selectionStart ?? editor.value.length); // Esc / Ctrl+[
+      paintVi();
+      return;
+    }
+    const r = viKey(v, k, { rows: viewRows() });
+    st.vi = r.state;
+    paintVi();
+    viAction(r.action);
   }
 
   const dirty = () => normalizeEol(editor.value, '\n') !== normalizeEol(st.base.body, '\n');
@@ -202,13 +320,18 @@ export function mountMemo(paneId) {
     st.mode = 'read';
     st.external = false;
     st.base = null;
+    st.vi = null;
+    st.viCmd = null;
+    editor.readOnly = false;
+    cmdline.classList.add('hidden');
     st.memo = st.latest || st.memo;
     show();
     renderRead();
     if (hadFocus) root.focus({ preventScroll: true }); // the editor left the document
   }
 
-  async function save() {
+  /** Save header + edited body. `stay` (vi :w): keep editing — the saved text becomes the base. */
+  async function save({ stay = false } = {}) {
     if (st.mode !== 'edit' || st.saving) return;
     const base = st.base;
     const text = joinMemo(base.header, normalizeEol(editor.value, memoEol(base.header + base.body)), base.marker);
@@ -225,7 +348,15 @@ export function mountMemo(paneId) {
     if (st.disposed) return;
     st.text = text;
     st.latest = splitMemo(text);
-    leaveEdit();
+    if (stay && st.mode === 'edit') {
+      st.base = st.latest;
+      st.external = false;
+      if (st.vi) st.vi = { ...st.vi, base: st.vi.text, message: '저장했습니다' };
+      show();
+      paintVi();
+    } else {
+      leaveEdit();
+    }
     readMore();
   }
 
@@ -269,6 +400,10 @@ export function mountMemo(paneId) {
     if (e.defaultPrevented) return; // the app key router / an overlay owns it
     if (isFocusTrapKey(e)) {
       e.preventDefault(); // focus never wanders into a neighbouring terminal
+      return;
+    }
+    if (st.mode === 'edit' && st.vi) {
+      onViKey(e);
       return;
     }
     const a = memoKeyAction(e, st.mode);
@@ -317,7 +452,8 @@ export function mountMemo(paneId) {
     el: root,
     focus() {
       if (st.mode === 'edit') {
-        if (document.activeElement !== editor) editor.focus({ preventScroll: true });
+        const target = st.viCmd ? cmdline : editor;
+        if (document.activeElement !== target) target.focus({ preventScroll: true });
         return;
       }
       if (!root.contains(document.activeElement)) root.focus({ preventScroll: true });
