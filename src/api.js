@@ -170,6 +170,14 @@ export function inboxList(showDone) {
   return invoke('inbox_list', { showDone: !!showDone });
 }
 
+// ---------------------------------------------------------------- 작업 상태 (dashboard)
+
+/** `{panes: {[paneId]: {idle, lastPrompt, lastReply, contextTokens, updatedAt}}, nightly:
+ * {lastRun, phase, pending, held}}` — session state from hooks; `board-changed` says when to re-read. */
+export function boardStatus() {
+  return invoke('board_status');
+}
+
 export function inboxMarkRead(id) {
   return invoke('inbox_mark_read', { id });
 }

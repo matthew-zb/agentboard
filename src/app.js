@@ -57,6 +57,7 @@ import {
 import { mountInbox, configureInbox } from './inbox.js';
 import { mountDoc, configureDocView, renderMarkdown, loadImages } from './docview.js';
 import { mountMemo, configureMemo } from './memo.js';
+import { mountDashboard, configureDashboard, updateDashboard } from './dashboard.js';
 import { configureCopyMode, toggleCopyMode, copyActive, pruneCopySessions } from './copy-ui.js';
 import { pickCommands, paletteItems, missingDirsFlow, closeFlow, envStatusFlag, reloadFlow } from './overlay-logic.js';
 import { hiddenAttentionTabs, statusEntryText } from './attention-logic.js';
@@ -427,6 +428,8 @@ export function render(snap) {
   });
   renderStatus(snap);
   renderSidebar($('sidebar'), ws, { onSelect: (g, t, p) => setFocus(g, t, p) });
+  // the "작업 상태" view gets snapshots here — never a second onWorkspaceChanged subscriber
+  updateDashboard(snap);
 
   requestAnimationFrame(() => {
     for (const id of visible) fitPane(id);
@@ -576,13 +579,21 @@ configurePanes({
   // Applet panes (Task 10): the inbox view replaces the xterm. Its keys are handled on the
   // applet element (bubble phase), so the router's app chords always win.
   // Document tabs (Task 14) mount the markdown viewer the same way; the memo (below the inbox)
-  // renders MEMO.md's body with the same pipeline.
+  // renders MEMO.md's body with the same pipeline; the "작업 상태" tab is the dashboard.
   mountApplet: (kind, paneId, model) =>
-    kind === 'inbox' ? mountInbox() : kind === 'doc' ? mountDoc(paneId, model) : kind === 'memo' ? mountMemo(paneId) : null,
+    kind === 'inbox'
+      ? mountInbox()
+      : kind === 'doc'
+        ? mountDoc(paneId, model)
+        : kind === 'memo'
+          ? mountMemo(paneId)
+          : kind === 'dashboard' ? mountDashboard(paneId) : null,
 });
 configureInbox({ toast, confirm, promptText, choose, onOpenFile: openDoc });
 configureDocView({ toast, prompt, choose });
 configureMemo({ render: renderMarkdown, loadImages, confirm, toast });
+// Enter / double-click on a dashboard row focuses that pane (a user action, queued like keys)
+configureDashboard({ jump: (cmd) => enqueue(() => execute([cmd])), toast });
 // Tab drag & drop (spec 6.6). Errors from MoveTab/SplitGroupWith are toasted by sendCmd.
 installDnd($('groups'), {
   getWs: () => (current ? current.workspace : null),

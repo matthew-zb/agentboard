@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   dashboardRows,
   inboxOpenCounts,
@@ -203,4 +204,270 @@ test('nightly summary from board_status', () => {
   assert.equal(nightlySummary({ lastRun: '2026-10-26', phase: 'waiting', pending: ['a', 'b'], held: [] }), '야간 정리: 보고 기다림(2) · 마지막 10-26');
   assert.equal(nightlySummary({ lastRun: '2026-10-26', phase: 'restarting', pending: [], held: ['x'] }), '야간 정리: 재시작 · 보류 1 · 마지막 10-26');
   assert.equal(nightlySummary({ lastRun: '2026-10-26', phase: 'notifying' }), '야간 정리: 알리는 중 · 마지막 10-26');
+});
+
+// ---------------------------------------------------------------- the "작업 상태" applet (fake DOM)
+import { buildDashboard, mountDashboard, configureDashboard, updateDashboard } from '../../src/dashboard.js';
+
+/** Minimal DOM: elements keep children/text/attributes; any innerHTML use throws. */
+function fakeDocument() {
+  const doc = { activeElement: null, parked: new Set() };
+  const textNode = (t) => ({ tagName: '#text', children: [], textContent: String(t), contains: () => false });
+  const mk = (tag) => {
+    const classes = new Set();
+    const el = {
+      tagName: String(tag).toUpperCase(),
+      children: [],
+      parent: null,
+      dataset: {},
+      attrs: {},
+      listeners: {},
+      _text: '',
+      title: '',
+      isConnected: true,
+      classList: {
+        add: (...c) => c.forEach((x) => classes.add(x)),
+        remove: (...c) => c.forEach((x) => classes.delete(x)),
+        toggle: (c, on) => ((on === undefined ? !classes.has(c) : on) ? classes.add(c) : classes.delete(c)),
+        contains: (c) => classes.has(c),
+      },
+      get className() {
+        return [...classes].join(' ');
+      },
+      set className(v) {
+        classes.clear();
+        String(v).split(/\s+/).filter(Boolean).forEach((c) => classes.add(c));
+      },
+      set textContent(v) {
+        this._text = String(v);
+        this.children = [];
+      },
+      get textContent() {
+        return this._text + this.children.map((c) => c.textContent).join('');
+      },
+      set innerHTML(_) {
+        throw new Error('innerHTML used');
+      },
+      append(...c) {
+        c.forEach((x) => this.appendChild(typeof x === 'string' ? textNode(x) : x));
+      },
+      appendChild(c) {
+        c.parent = this;
+        this.children.push(c);
+        return c;
+      },
+      replaceChildren(...c) {
+        this.children = [];
+        this.append(...c);
+      },
+      setAttribute(k, v) {
+        this.attrs[k] = String(v);
+      },
+      addEventListener(t, f) {
+        (this.listeners[t] ||= []).push(f);
+      },
+      removeEventListener(t, f) {
+        this.listeners[t] = (this.listeners[t] || []).filter((x) => x !== f);
+      },
+      contains(n) {
+        return n === this || this.children.some((c) => c.contains && c.contains(n));
+      },
+      /** `#parking` ancestor: the test parks an element by adding it to doc.parked */
+      closest(sel) {
+        if (sel === '#parking') {
+          for (let n = this; n; n = n.parent) if (doc.parked.has(n)) return n;
+          return null;
+        }
+        if (sel === '.dash-row[data-pane]') {
+          for (let n = this; n; n = n.parent) if (n.classList && n.classList.contains('dash-row') && n.dataset.pane) return n;
+        }
+        return null;
+      },
+      focus() {
+        doc.activeElement = this;
+      },
+      remove() {
+        if (this.parent) this.parent.children = this.parent.children.filter((c) => c !== this);
+      },
+      scrollIntoView() {},
+    };
+    return el;
+  };
+  doc.createElement = mk;
+  doc.createTextNode = textNode;
+  return doc;
+}
+
+const tree = (el) => [el, ...(el.children || []).flatMap(tree)];
+const rowsOf = (root) => tree(root).filter((e) => e.classList && e.classList.contains('dash-row'));
+const settle = async () => {
+  for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+};
+
+const BOARD = {
+  panes: {
+    m1: { idle: false, lastPrompt: '결제 배치 오류 확인해', lastReply: '확인 중입니다', contextTokens: 456789, updatedAt: 1 },
+    bm1: { idle: true, lastPrompt: null, lastReply: null, contextTokens: 12000, updatedAt: 1 },
+  },
+  nightly: { lastRun: '2026-10-28', phase: 'idle', pending: [], held: [] },
+};
+const INBOX = { version: 3, items: [{ id: 'i1', ownerName: 'billing', state: 'new', read: false }, { id: 'i2', ownerName: 'billing', state: 'in_progress', read: true }], unknownOwners: [] };
+
+function setupDash() {
+  const t = { calls: [], listeners: {}, jumps: [], toasts: [] };
+  globalThis.document = fakeDocument();
+  globalThis.__TAURI__ = {
+    core: {
+      invoke: async (cmd, args) => {
+        t.calls.push([cmd, args]);
+        if (cmd === 'board_status') return BOARD;
+        if (cmd === 'inbox_list') return INBOX;
+        return null;
+      },
+    },
+    event: {
+      listen: async (ev, cb) => {
+        (t.listeners[ev] ||= []).push(cb);
+        return () => {
+          t.listeners[ev] = t.listeners[ev].filter((x) => x !== cb);
+        };
+      },
+    },
+  };
+  t.emit = (ev) => (t.listeners[ev] || []).forEach((cb) => cb({ payload: null }));
+  t.count = (cmd) => t.calls.filter((c) => c[0] === cmd).length;
+  configureDashboard({ jump: (cmd) => t.jumps.push(cmd), toast: (m) => t.toasts.push(String(m)) });
+  return t;
+}
+
+function teardownDash(view) {
+  view.dispose();
+  updateDashboard(null);
+  delete globalThis.document;
+  delete globalThis.__TAURI__;
+}
+
+const press = (root, code, extra = {}) => {
+  const ev = { code, target: root, ctrlKey: false, altKey: false, shiftKey: false, metaKey: false, isComposing: false, repeat: false, defaultPrevented: false, ...extra };
+  ev.preventDefault = () => {
+    ev.defaultPrevented = true;
+  };
+  ev.stopPropagation = () => {};
+  for (const f of root.listeners.keydown || []) f(ev);
+  return ev;
+};
+
+test('buildDashboard draws text only: agent-written reasons and prompts never become markup', () => {
+  globalThis.document = fakeDocument();
+  try {
+    const evil = '<img src=x onerror="alert(1)"><script>alert(2)</script>';
+    const snap = snapshot();
+    snap.workspace.panes.m1.attentionReason = evil;
+    const board = { panes: { m1: { idle: false, lastPrompt: evil, lastReply: evil, contextTokens: 1, updatedAt: 1 } } };
+    const groups = dashboardRows(snap, { board, inbox: INBOX.items });
+    const el = buildDashboard(document, groups, { selected: 'm1', nightly: BOARD.nightly });
+    const tags = new Set(tree(el).map((e) => e.tagName));
+    assert.ok(!tags.has('IMG') && !tags.has('SCRIPT'), [...tags].join(','));
+    assert.ok(el.textContent.includes(evil.slice(0, 20)), 'shown literally (shortened)');
+    // one header per role tab, one row per agent pane, the selected row marked
+    const heads = tree(el).filter((e) => e.classList && e.classList.contains('dash-tab'));
+    assert.deepEqual(heads.map((h) => h.dataset.tab), ['t0', 't3', 't4', 't1']);
+    const rows = rowsOf(el);
+    assert.deepEqual(rows.map((r) => r.dataset.pane), ['d', 'h', 'm2', 'm1', 'bl', 'bm2', 'bm1', 'cl']);
+    assert.ok(rows.find((r) => r.dataset.pane === 'm1').classList.contains('sel'));
+    // billing header shows its open inbox items; the nightly line is in the bar
+    assert.ok(heads[3].textContent.includes('인박스 새 1') && heads[3].textContent.includes('진행 중 1'));
+    assert.ok(el.textContent.includes('야간 정리: 대기 · 마지막 10-28'));
+  } finally {
+    delete globalThis.document;
+  }
+});
+
+test('dashboard view: board fields, j/k selection, Enter jumps (SetFocus), h hides idle, r re-reads', async () => {
+  const t = setupDash();
+  updateDashboard(snapshot());
+  const v = mountDashboard('dash');
+  await settle();
+  const root = v.el;
+  const m1 = () => rowsOf(root).find((r) => r.dataset.pane === 'm1');
+  assert.ok(m1().textContent.includes('작업 중') && m1().textContent.includes('457k'), m1().textContent);
+  assert.ok(m1().classList.contains('ctx-over'), 'over 400k is marked');
+  assert.ok(m1().textContent.includes('결제 배치 오류 확인해'));
+  assert.ok(rowsOf(root).find((r) => r.dataset.pane === 'bm1').textContent.includes('쉬는 중'));
+  // first row selected; j moves down, k up (clamped)
+  const sel = () => rowsOf(root).find((r) => r.classList.contains('sel')).dataset.pane;
+  assert.equal(sel(), 'd');
+  press(root, 'KeyJ');
+  press(root, 'ArrowDown');
+  assert.equal(sel(), 'm2');
+  press(root, 'KeyK');
+  assert.equal(sel(), 'h');
+  const e = press(root, 'Enter');
+  assert.ok(e.defaultPrevented);
+  assert.deepEqual(t.jumps, [{ type: 'setFocus', group: 'g1', tab: 't3', pane: 'h' }]);
+  // h hides idle (bm1) and ended (bm2) rows; the selection stays when still listed
+  press(root, 'KeyH');
+  assert.deepEqual(rowsOf(root).map((r) => r.dataset.pane), ['d', 'h', 'm2', 'm1', 'bl', 'cl']);
+  assert.ok(root.textContent.includes('쉬는 창 2개 숨김'));
+  press(root, 'KeyH');
+  assert.equal(rowsOf(root).length, 8);
+  // r re-reads the board and the inbox
+  const [b, i] = [t.count('board_status'), t.count('inbox_list')];
+  press(root, 'KeyR');
+  await settle();
+  assert.deepEqual([t.count('board_status'), t.count('inbox_list')], [b + 1, i + 1]);
+  // app chords are not dashboard keys (the key router owns them)
+  assert.equal(press(root, 'KeyJ', { altKey: true }).defaultPrevented, false);
+  teardownDash(v);
+});
+
+test('dashboard view: mouse click selects, double-click jumps', async () => {
+  const t = setupDash();
+  updateDashboard(snapshot());
+  const v = mountDashboard('dash');
+  await settle();
+  const row = rowsOf(v.el).find((r) => r.dataset.pane === 'bl');
+  const cell = row.children[0];
+  const md = { target: cell, button: 0, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+  for (const f of v.el.listeners.mousedown || []) f(md);
+  assert.ok(rowsOf(v.el).find((r) => r.dataset.pane === 'bl').classList.contains('sel'));
+  assert.ok(md.defaultPrevented, 'keeps DOM focus on the applet');
+  for (const f of v.el.listeners.dblclick || []) f({ target: cell });
+  assert.deepEqual(t.jumps, [{ type: 'setFocus', group: 'g2', tab: 't1', pane: 'bl' }]);
+  teardownDash(v);
+});
+
+test('dashboard view: board-changed / inbox-changed / snapshots redraw; a hidden tab waits', async () => {
+  const t = setupDash();
+  updateDashboard(snapshot());
+  const v = mountDashboard('dash');
+  await settle();
+  assert.equal(t.count('board_status'), 1);
+  assert.equal(t.count('inbox_list'), 1);
+  t.emit('board-changed');
+  t.emit('inbox-changed');
+  await settle();
+  assert.deepEqual([t.count('board_status'), t.count('inbox_list')], [2, 2]);
+  // parked (its tab is not shown): a new snapshot is not drawn until the view is on screen
+  document.parked.add(v.el);
+  const s = snapshot();
+  s.workspace.panes.m2.attention = true;
+  s.workspace.panes.m2.attentionReason = 'api 결정 대기';
+  updateDashboard(s);
+  assert.ok(!v.el.textContent.includes('api 결정 대기'), 'not drawn while hidden');
+  document.parked.delete(v.el);
+  updateDashboard(s); // the tab switch publishes a snapshot
+  assert.ok(v.el.textContent.includes('api 결정 대기'));
+  // dispose stops listening
+  teardownDash(v);
+  assert.deepEqual([t.count('board_status'), t.count('inbox_list')], [2, 2]);
+});
+
+test('app.js feeds snapshots to the dashboard from render and mounts kind "dashboard"', () => {
+  const src = readFileSync(new URL('../../src/app.js', import.meta.url), 'utf8');
+  const render = src.slice(src.indexOf('export function render(snap)'), src.indexOf('function selectTab('));
+  assert.match(render, /updateDashboard\(snap\)/);
+  assert.match(src, /kind === 'dashboard' \? mountDashboard\(paneId\)/);
+  const dash = readFileSync(new URL('../../src/dashboard.js', import.meta.url), 'utf8');
+  assert.ok(!/onWorkspaceChanged\s*\(/.test(dash), 'a second subscriber would miss snapshots (shared version gate, api.js)');
 });
