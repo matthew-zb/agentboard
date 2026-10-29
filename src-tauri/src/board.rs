@@ -409,9 +409,9 @@ pub fn status(state: &AppState) -> BoardStatus {
 // (the PTY child is claude) or typed into its shell (a descendant is) — Claude Code's own
 // session file `~/.claude/sessions/<pid>.json` names the session, and its transcript gives the
 // rest. Only pids of the pane's own process tree are looked up: no other session file is ever
-// opened, and the folder is never listed (AgentBoard shows its own panes only). Fields as
-// session-board reads them (pid, sessionId, cwd, status idle|busy, procStart) 「추정」: not
-// checked against a file written while an AgentBoard pane ran.
+// opened, and the folder is never listed (AgentBoard shows its own panes only). Fields: pid,
+// sessionId, cwd, status idle|busy, procStart — checked against this PC's real session files;
+// procStart equals the process creation time (GetProcessTimes FILETIME), measured.
 
 /// Interval of [`start_session_poll`].
 pub const SESSION_POLL: std::time::Duration = std::time::Duration::from_secs(3);
@@ -464,9 +464,12 @@ pub(crate) fn read_session_file(dir: &Path, pid: u32) -> Option<SessionFile> {
     Some(SessionFile { pid, session_id, cwd, idle, proc_start })
 }
 
-/// A session's transcript: `<projects>/<cwd with ':' '\' '/' as '-'>/<id>.jsonl`.
+/// A session's transcript: `<projects>/<slug>/<id>.jsonl`, where the slug is the cwd with every
+/// char that is not an ASCII letter or digit as '-' (Hangul, '.', '_', spaces too — as the
+/// folders in ~/.claude/projects show). 「추정」 Claude Code may shorten very long slugs; that
+/// rule is not checked, such a pane just shows no transcript details.
 pub(crate) fn transcript_path(projects: &Path, cwd: &str, id: &str) -> PathBuf {
-    let slug: String = cwd.chars().map(|c| if matches!(c, ':' | '\\' | '/') { '-' } else { c }).collect();
+    let slug: String = cwd.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
     projects.join(slug).join(format!("{id}.jsonl"))
 }
 
@@ -939,8 +942,13 @@ mod tests {
         s.file(4244, session(9999, "s3", "busy"));
         assert!(read_session_file(&s.dirs.sessions, 4244).is_none());
         assert!(read_session_file(&s.dirs.sessions, 4245).is_none());
-        // Claude Code's project folder: ':', '\' and '/' become '-'
-        assert_eq!(transcript_path(&s.dirs.projects, r"C:\proj\a", "s1"), s.dirs.projects.join("C--proj-a").join("s1.jsonl"));
+        // Claude Code's project folder: every char that is not an ASCII letter or digit becomes
+        // '-' (seen in ~/.claude/projects: `C--workspace-------` for C:\workspace\회사청구자료,
+        // `C--workspace-i-mx8mp-…` for C:\workspace\i.mx8mp\…)
+        let slug = |cwd: &str| transcript_path(&s.dirs.projects, cwd, "s1");
+        assert_eq!(slug(r"C:\proj\a"), s.dirs.projects.join("C--proj-a").join("s1.jsonl"));
+        assert_eq!(slug(r"C:\workspace\회사청구자료"), s.dirs.projects.join("C--workspace-------").join("s1.jsonl"));
+        assert_eq!(slug(r"C:\workspace\i.mx8mp\my_app 2"), s.dirs.projects.join("C--workspace-i-mx8mp-my-app-2").join("s1.jsonl"));
     }
 
     /// AgentBoard only looks at its own processes: the session file of a pid outside the pane's
