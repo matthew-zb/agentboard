@@ -422,9 +422,36 @@ pub struct Config {
     /// Custom environment check items (`envRequire`, Task 12). Absent key → [`default_env_require`]
     /// (the holla item); an explicit `[]` → none.
     pub env_require: Vec<EnvRequire>,
+    /// `memo` (memo spec §8 V3): memo editing options; absent → defaults (vi off).
+    pub memo: MemoConfig,
     /// Indices (in `tabs`) that `parse_config` already reported invalid; `sanitize_config`
     /// drops them silently so later JSON paths keep the file's numbering.
     pub(crate) rejected_tabs: BTreeSet<usize>,
+}
+
+/// `config.json` `"memo": {"vi": bool}` — the frontend gets it as is (`memo_settings`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct MemoConfig {
+    /// vi-style editing in the memo applet (default false: plain typing).
+    pub vi: bool,
+}
+
+/// `memo`: an object with an optional boolean `vi`. Each problem is a located error and that
+/// part falls back to its default; the rest of the object is kept.
+fn parse_memo(v: &serde_json::Value, file: &Path, errs: &mut Vec<ConfigError>) -> MemoConfig {
+    let mut m = MemoConfig::default();
+    let Some(obj) = v.as_object() else {
+        errs.push(sem_err(file, "memo", "memo는 {\"vi\": true|false} 객체여야 함"));
+        return m;
+    };
+    for (k, val) in obj {
+        match (k.as_str(), val) {
+            ("vi", serde_json::Value::Bool(b)) => m.vi = *b,
+            ("vi", _) => errs.push(sem_err(file, "memo.vi", "vi는 true 또는 false여야 함")),
+            _ => errs.push(sem_err(file, format!("memo.{k}"), format!("알 수 없는 필드 '{k}'"))),
+        }
+    }
+    m
 }
 
 pub const DEFAULT_NIGHTLY_REFRESH: &str = "03:00";
@@ -476,6 +503,7 @@ impl Default for Config {
             handover_index: None,
             env_skip: Vec::new(),
             env_require: default_env_require(),
+            memo: MemoConfig::default(),
             rejected_tabs: BTreeSet::new(),
         }
     }
@@ -540,6 +568,8 @@ struct RawConfig {
     env_skip: Option<serde_json::Value>,
     #[serde(default)]
     env_require: Option<serde_json::Value>,
+    #[serde(default)]
+    memo: Option<serde_json::Value>,
 }
 
 /// Distinguishes an explicit `null` from an absent field (used with `#[serde(default)]`).
@@ -641,6 +671,10 @@ pub fn parse_config(text: &str, file: &Path) -> Result<(Config, Vec<ConfigError>
         None => default_env_require(),
         Some(v) => parse_env_require(v, file, &mut errs),
     };
+    let memo = match &raw.memo {
+        None => MemoConfig::default(),
+        Some(v) => parse_memo(v, file, &mut errs),
+    };
     let cfg = Config {
         dispatcher: DispatcherSpec {
             agent: disp.agent.or(d.dispatcher.agent),
@@ -658,6 +692,7 @@ pub fn parse_config(text: &str, file: &Path) -> Result<(Config, Vec<ConfigError>
         handover_index,
         env_skip,
         env_require,
+        memo,
         rejected_tabs,
     };
     Ok((cfg, errs))
@@ -2014,6 +2049,36 @@ mod tests {
         std::fs::write(&path, "{ nope").unwrap();
         assert!(append_config_tab(&path, &spec).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ nope");
+    }
+
+    /// Memo spec §8 V3: `"memo": {"vi": true}` turns on vi-style editing of the memo; absent or
+    /// `{}` is off (the product default). The frontend reads it as `{"vi": bool}`.
+    #[test]
+    fn parses_memo_vi_setting() {
+        let (c, errs) = parse_config(r#"{"memo": {"vi": true}}"#, f()).unwrap();
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(c.memo.vi);
+        for src in [r#"{"memo": {}}"#, r#"{"memo": {"vi": false}}"#, "{}"] {
+            let (c, errs) = parse_config(src, f()).unwrap();
+            assert!(errs.is_empty() && !c.memo.vi, "{src}");
+        }
+        assert!(!Config::default().memo.vi);
+        assert_eq!(serde_json::to_value(&c.memo).unwrap(), serde_json::json!({"vi": true}));
+    }
+
+    #[test]
+    fn rejects_bad_memo_settings_with_location() {
+        for (src, path, vi) in [
+            (r#"{"memo": {"vi": "yes"}}"#, "memo.vi", false),
+            (r#"{"memo": 3}"#, "memo", false),
+            (r#"{"memo": {"vi": true, "x": 1}}"#, "memo.x", true),
+        ] {
+            let (c, errs) = parse_config(src, f()).unwrap();
+            let paths: Vec<_> = errs.iter().map(|e| e.json_path.as_deref()).collect();
+            assert_eq!(paths, [Some(path)], "{src}");
+            assert!(errs[0].message.chars().any(|c| ('가'..='힣').contains(&c)), "Korean: {}", errs[0].message);
+            assert_eq!(c.memo.vi, vi, "{src}: a bad value is off, a valid one next to an unknown key stays");
+        }
     }
 
     #[test]

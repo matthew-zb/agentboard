@@ -142,6 +142,7 @@ export function importRegistry(registry, { only = [], workspaceRoot, defaultsDir
     tabs,
     nightlyRefresh: null, // coexistence: off (no handover tab; the existing operation keeps the daily rhythm)
     envRequire: [{ ...HOLLA_REQUIRE }],
+    memo: { vi: true }, // memo spec §8 V3 b: the product default is plain editing; this environment uses vi
   };
   const roles = {
     dispatcher: withNotice(read('roles', 'dispatcher.md'), DISPATCHER_NOTICE),

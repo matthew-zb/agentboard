@@ -802,3 +802,12 @@ control.rs 구현 지침: `server/discover`에는 **정확히 HTTP 200 + JSON-RP
    - 실시 결과 10-26 | 통과(자동) | `rename_of_a_manager_tab_moves_its_inbox_items`(src-tauri/src/mcp_tools.rs)(이름을 바꾸면 담당이 따라가고 지시도 그 Manager로), `inbox_items_stay_with_the_manager_after_a_fresh_start`(src-tauri/src/mcp_tools.rs)(10-26 승격: 탭 id가 새로 매겨져도 같은 Manager), `unknown owners (R29): marked from inbox_list, labelled, and not instructable`(tests/js/inbox.test.mjs), `inbox_relay_routes_by_owner_name_and_refuses_unknown_owners`(src-tauri/src/bridge/tests.rs)
 17. **정리**: 시험 뒤 자동 실행이 꺼져 있는지, 옮겨 둔 `workspace.json`·`nightly.json`·`settings.json`을 되돌렸는지.
    - 실시 결과 10-26 | 보류(사용자 실시) | 수동 시험 뒤의 정리 절차
+
+## 메모 vi 편집 수동 확인 (사용자 확인 필요, 미실시)
+
+`config.json`에 `"memo": {"vi": true}`를 넣고 「설정 다시 읽기」 뒤 메모 창에서 `e`.
+
+1. **한글 입력 상태의 보통 모드**: 한글 IME를 켠 채 `j`/`k`/`x`/`dd`가 동작하고, 조합 중인 한글(ㅓ·ㅏ 등)이 메모에 들어가지 않는지(읽기 전용 편집창이 IME 조합을 막는지 — WebView2 실측 필요).
+2. **입력 모드**: `i`/`o` 뒤 한글을 조합하다 `Esc`를 누르면 조합이 먼저 끝나고 보통 모드로 돌아오는지.
+3. **저장·닫기**: `:w` 뒤 편집이 이어지고 `MEMO.md`에 저장되는지, `:wq`·`ZZ`로 닫히는지, 바꾼 뒤 `:q!`에서 `Enter`가 무시되고 `Y`로 버려지는지.
+4. **끄기**: `"vi": false`로 바꾸고 「설정 다시 읽기」 뒤 다음 편집이 기존 편집기(`Ctrl+Enter`/`Esc`)인지.
