@@ -802,3 +802,10 @@ control.rs 구현 지침: `server/discover`에는 **정확히 HTTP 200 + JSON-RP
    - 실시 결과 10-26 | 통과(자동) | `rename_of_a_manager_tab_moves_its_inbox_items`(src-tauri/src/mcp_tools.rs)(이름을 바꾸면 담당이 따라가고 지시도 그 Manager로), `inbox_items_stay_with_the_manager_after_a_fresh_start`(src-tauri/src/mcp_tools.rs)(10-26 승격: 탭 id가 새로 매겨져도 같은 Manager), `unknown owners (R29): marked from inbox_list, labelled, and not instructable`(tests/js/inbox.test.mjs), `inbox_relay_routes_by_owner_name_and_refuses_unknown_owners`(src-tauri/src/bridge/tests.rs)
 17. **정리**: 시험 뒤 자동 실행이 꺼져 있는지, 옮겨 둔 `workspace.json`·`nightly.json`·`settings.json`을 되돌렸는지.
    - 실시 결과 10-26 | 보류(사용자 실시) | 수동 시험 뒤의 정리 절차
+
+## 작업 상태 탭 수동 확인 (사용자 확인 필요, 미실시)
+
+1. **열기**: `Ctrl+Alt+d`와 팔레트 "작업 상태"가 "상태" 탭을 하나만 열고, 이미 있으면 그 탭으로 가는지. 앱을 다시 켜도 탭이 남는지.
+2. **역할 창**: dispatcher·Manager에 말을 걸면 작업 중 → 쉬는 중, 마지막 지시·응답, 문맥 크기(모델 툴팁)가 바뀌는지. 다른 세션이 보낸 메시지는 "메시지: <보낸 이>"로 보이는지.
+3. **역할 없는 claude 창**: 일반 탭에서 claude를 띄우면(프로필 또는 셸에서 직접) 3초 안에 행이 생기고, 한글 이름 폴더에서도 문맥 크기가 나오는지. claude를 끝내면 행이 사라지는지.
+4. **조작**: `j`/`k`·`Enter`(그 창으로 이동), `h`(쉬는 창 숨김), `r`, 더블클릭. 다른 그룹으로 옮겨 dispatcher와 나란히 볼 수 있는지.
