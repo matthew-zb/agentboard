@@ -362,6 +362,7 @@ dispatcher 오른쪽 열의 인박스 아래 창(`{"applet":{"name":"memo","kind
 | 동작 | 키 | 명령 id |
 |---|---|---|
 | 커맨드 팔레트 | `Alt+;` | `app.palette` |
+| 작업 상태 탭 열기 | `Ctrl+Alt+d` | `app.dashboard` |
 
 기본 키가 없는(팔레트 전용) 명령: `pane.breakToTab`
 <!-- KEYTABLE:END -->

@@ -317,6 +317,8 @@ registerCommand('tab.new', () => {
   if (!overlayOpen()) newTabWizard().catch(showError);
 });
 registerCommand('app.palette', () => openPalette());
+// 「작업 상태」 tab (dashboard): opened or focused by the backend (OpenDashboard), a user action
+registerCommand('app.dashboard', () => enqueue(() => execute([{ type: 'openDashboard' }])));
 registerCommand('pane.breakToTab', () =>
   enqueue(() => {
     const pane = current && focusedPaneId(current.workspace);

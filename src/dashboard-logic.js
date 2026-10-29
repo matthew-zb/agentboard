@@ -10,14 +10,21 @@ export const CONTEXT_CAP = 400000;
 export const TEXT_SHOW = 60;
 
 const STANDING = new Set(['dispatcher', 'handover', 'manager']);
-const TAB_RANK = { dispatcher: 0, handover: 1, manager: 2 };
+const TAB_RANK = { dispatcher: 0, handover: 1, manager: 2, plain: 3 };
 const zeroCounts = () => ({ new: 0, unread: 0, inProgress: 0, closeProposed: 0, open: 0 });
 
-/** Role of a tab in the status view, or null for tabs it does not list (plain tabs). */
+/** Role of a tab in the status view; 'plain' tabs are listed only when one of their panes has a
+ * board entry (a claude session the backend matched, D3b). */
 function tabRole(t) {
   if (t.isDispatcher) return 'dispatcher';
-  return t.role === 'handover' || t.role === 'manager' ? t.role : null;
+  return t.role === 'handover' || t.role === 'manager' ? t.role : 'plain';
 }
+
+const boardEntry = (board, paneId) => {
+  const panes = board && typeof board === 'object' ? board.panes : null;
+  const e = panes && typeof panes === 'object' ? panes[paneId] : null;
+  return e && typeof e === 'object' ? e : null;
+};
 
 /** Open (state ≠ done) inbox items per owner tab name (R29: ownership is the tab name). */
 export function inboxOpenCounts(items) {
@@ -54,22 +61,26 @@ export function shortText(s, max = TEXT_SHOW) {
 
 /** The board_status fields of one pane; unknown (no hook yet, no board) = nulls. */
 function boardFields(board, paneId) {
-  const panes = board && typeof board === 'object' ? board.panes : null;
-  const e = panes && typeof panes === 'object' ? panes[paneId] : null;
-  if (!e || typeof e !== 'object') return { idle: null, lastPrompt: null, lastReply: null, context: null, updatedAt: null };
+  const e = boardEntry(board, paneId);
+  if (!e) return { idle: null, lastPrompt: null, lastReply: null, context: null, model: null, updatedAt: null };
   return {
     idle: typeof e.idle === 'boolean' ? e.idle : null,
     lastPrompt: shortText(e.lastPrompt),
     lastReply: shortText(e.lastReply),
     context: contextLabel(e.contextTokens),
+    model: typeof e.model === 'string' && e.model ? e.model : null,
     updatedAt: Number.isFinite(e.updatedAt) ? e.updatedAt : null,
   };
 }
 
-/** Panes of a tab in view order: standing pane(s), then per team (first seen in the layout)
- * its lead(s) and members, all in layout order. Panes without a role (shells, applets) are out. */
-function orderedPanes(ws, t) {
-  const panes = leafIds(t.layout).map((id) => ws.panes[id]).filter((p) => p && p.role);
+const isApplet = (p) => !!(p.kind && p.kind.type === 'applet');
+
+/** Panes of a tab in view order: standing pane(s), then per team (first seen in the layout) its
+ * lead(s) and members, then panes without a role that have a board entry (claude started in a
+ * shell, D3b) — all in layout order. Shells without a session and applets are out. */
+function orderedPanes(ws, t, board) {
+  const all = leafIds(t.layout).map((id) => ws.panes[id]).filter((p) => p && !isApplet(p));
+  const panes = all.filter((p) => p.role);
   const out = panes.filter((p) => STANDING.has(p.role)).map((p) => [p, 0]);
   const team = panes.filter((p) => p.role === 'lead' || p.role === 'member');
   const teamIds = [...new Set(team.map((p) => p.team ?? ''))];
@@ -78,6 +89,7 @@ function orderedPanes(ws, t) {
     for (const p of mine.filter((q) => q.role === 'lead')) out.push([p, 1]);
     for (const p of mine.filter((q) => q.role === 'member')) out.push([p, 2]);
   }
+  for (const p of all.filter((q) => !q.role && boardEntry(board, q.id))) out.push([p, 0]);
   return out;
 }
 
@@ -86,7 +98,8 @@ function orderedPanes(ws, t) {
  * `board_status()`: one entry per role tab — dispatcher, handover, then Manager tabs in reading
  * order (groups → tabs) — `{tab, group, name, role, inbox: counts, rows, hidden: 0}`; a row per
  * agent pane `{pane, tab, group, name, role, team, sessionName, depth (0 standing · 1 lead ·
- * 2 member), status, attention, reason, idle, lastPrompt, lastReply, context, updatedAt}`.
+ * 2 member), status, attention, reason, idle, lastPrompt, lastReply, context, model, updatedAt}`.
+ * Plain tabs (role 'plain') come last and only when a pane of theirs has a board entry (D3b).
  */
 export function dashboardRows(snapshot, { inbox = [], board = null } = {}) {
   const ws = snapshot && (snapshot.workspace || snapshot);
@@ -99,12 +112,12 @@ export function dashboardRows(snapshot, { inbox = [], board = null } = {}) {
       const t = ws.tabs[tid];
       const role = t && tabRole(t);
       if (!role) continue;
-      const rows = orderedPanes(ws, t).map(([p, depth]) => ({
+      const rows = orderedPanes(ws, t, board).map(([p, depth]) => ({
         pane: p.id,
         tab: tid,
         group: gid,
         name: p.name,
-        role: p.role,
+        role: p.role ?? null,
         team: p.team ?? null,
         sessionName: p.sessionName ?? null,
         depth,
@@ -113,6 +126,7 @@ export function dashboardRows(snapshot, { inbox = [], board = null } = {}) {
         reason: p.attentionReason || null,
         ...boardFields(board, p.id),
       }));
+      if (role === 'plain' && !rows.length) continue; // no claude session there
       out.push({ tab: tid, group: gid, name: t.name, role, inbox: counts[t.name] || zeroCounts(), rows, hidden: 0 });
     }
   }

@@ -471,3 +471,42 @@ test('app.js feeds snapshots to the dashboard from render and mounts kind "dashb
   const dash = readFileSync(new URL('../../src/dashboard.js', import.meta.url), 'utf8');
   assert.ok(!/onWorkspaceChanged\s*\(/.test(dash), 'a second subscriber would miss snapshots (shared version gate, api.js)');
 });
+
+// ---------------------------------------------------------------- ab-core contract (C1): D3b, model, Ctrl+Alt+d
+import { buildKeymap, matchEvent } from '../../src/keys.js';
+import { paletteItems } from '../../src/overlay-logic.js';
+import { PENDING_IDS } from '../../src/commands.js';
+
+test('D3b: panes without a role that have a board entry (claude started by hand) are listed too', () => {
+  const board = {
+    panes: {
+      n1: { idle: false, lastPrompt: '직접 띄운 claude', lastReply: null, contextTokens: 50000, model: 'claude-opus-5-5', updatedAt: 1 },
+      sh1: { idle: true, lastPrompt: null, lastReply: null, contextTokens: 1000, model: null, updatedAt: 1 },
+    },
+  };
+  const gs = dashboardRows(snapshot(), { board });
+  // role tabs as before, then plain tabs that have such panes (reading order)
+  assert.deepEqual(gs.map((g) => [g.name, g.role]), [['dispatcher', 'dispatcher'], ['handover', 'handover'], ['api', 'manager'], ['billing', 'manager'], ['notes', 'plain']]);
+  const notes = gs.at(-1);
+  assert.deepEqual(notes.rows.map((r) => [r.pane, r.role, r.depth]), [['n1', null, 0]]);
+  assert.equal(notes.rows[0].model, 'claude-opus-5-5');
+  // inside a role tab: after the standing pane and the teams
+  assert.deepEqual(gs.find((g) => g.name === 'billing').rows.map((r) => r.pane), ['m1', 'bl', 'bm2', 'bm1', 'cl', 'sh1']);
+  // without board entries plain tabs and shells stay out
+  assert.equal(dashboardRows(snapshot()).length, 4);
+  assert.equal(flatRows(dashboardRows(snapshot(), { board })).find((r) => r.pane === 'm1').model, null);
+});
+
+test('Ctrl+Alt+d opens the 작업 상태 tab: default key, label, palette entry, handler', () => {
+  const defaults = JSON.parse(readFileSync(new URL('../../src-tauri/defaults/keybindings.json', import.meta.url), 'utf8'));
+  assert.equal(defaults['app.dashboard'], 'Ctrl+Alt+d');
+  const km = buildKeymap(defaults);
+  assert.equal(matchEvent(km, { code: 'KeyD', ctrlKey: true, altKey: true, shiftKey: false, metaKey: false, key: 'ㅇ' }), 'app.dashboard');
+  assert.ok(PENDING_IDS.includes('app.dashboard'), 'handled by app.js, not planned by commands.js');
+  const ws = snapshot().workspace;
+  ws.focus = { groupId: 'g1' };
+  const it = paletteItems(ws, { bindings: defaults }).find((i) => i.action.id === 'app.dashboard');
+  assert.deepEqual(it, { label: '작업 상태', hint: 'Ctrl+Alt+d', action: { type: 'command', id: 'app.dashboard' } });
+  const app = readFileSync(new URL('../../src/app.js', import.meta.url), 'utf8');
+  assert.match(app, /registerCommand\('app\.dashboard', \(\) => enqueue\(\(\) => execute\(\[\{ type: 'openDashboard' \}\]\)\)\)/);
+});

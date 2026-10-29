@@ -15,7 +15,7 @@ import { dashboardRows, visibleGroups, flatRows, dashboardKeyAction, jumpCommand
 import { statusSymbol, warnTitle } from './pane.js';
 import { isFocusTrapKey, keepSelection, moveSelection } from './inbox-logic.js';
 
-const ROLE_LABELS = { dispatcher: 'dispatcher', handover: 'handover', manager: 'Manager', lead: '리드', member: '팀원' };
+const ROLE_LABELS = { dispatcher: 'dispatcher', handover: 'handover', manager: 'Manager', lead: '리드', member: '팀원', plain: '일반 탭' };
 
 // ---------------------------------------------------------------- shared store
 
@@ -107,7 +107,10 @@ function rowEl(doc, r, selected) {
     name.appendChild(w);
   }
   const ctx = el(doc, 'span', 'dash-ctx', r.context ? r.context.text : '—');
-  if (r.context && r.context.over) ctx.title = '문맥이 400k를 넘었습니다';
+  const tips = [];
+  if (r.context && r.context.over) tips.push('문맥이 400k를 넘었습니다');
+  if (r.model) tips.push(`모델: ${r.model}`);
+  if (tips.length) ctx.title = tips.join('\n');
   row.append(
     name,
     el(doc, 'span', `dash-idle ${r.idle === true ? 'idle' : r.idle === false ? 'busy' : 'unknown'}`, idleText(r.idle)),
