@@ -81,6 +81,7 @@ body.dragging-v, body.dragging-v * { cursor: row-resize !important; user-select:
 .status-attn.hidden { display: none; }
 .status-attn .attn-tab { cursor: pointer; }
 .status-attn .attn-tab:hover { text-decoration: underline; }
+.flag.focus-mode { color: var(--warn); font-weight: 600; cursor: help; }
 .flag.sync { color: var(--accent); font-weight: 600; }
 .flag.errors { color: var(--warn); cursor: pointer; }
 .flag.env { color: var(--muted); font-size: 11px; cursor: help; }

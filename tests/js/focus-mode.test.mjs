@@ -119,3 +119,52 @@ test('buildList: the held line and the released group, rows in view order', () =
   const plain = buildList(doc, ITEMS.slice(0, 2), { total: 2 });
   assert.ok(!tree(plain).some((e) => e.classList.contains('inbox-held') || e.classList.contains('inbox-group')));
 });
+
+// ---- the backend contract (ab-core C3): focus_get / focus-changed → {mode, since}
+import { nextFocus, makeFocusSync } from '../../src/focus-logic.js';
+
+const NOW = '2026-10-29T11:00:00.000Z';
+
+test('nextFocus: a mode keeps its since; leaving it keeps the window as released until the next mode', () => {
+  assert.deepEqual(nextFocus(null, { mode: 'normal', since: null }, NOW), { mode: 'normal', since: null }, 'start in normal: nothing released');
+  const on = nextFocus(null, { mode: 'focus', since: SINCE }, NOW);
+  assert.deepEqual(on, { mode: 'focus', since: SINCE });
+  const hold = nextFocus(on, { mode: 'hold', since: SINCE }, NOW);
+  assert.deepEqual(hold, { mode: 'hold', since: SINCE }, 'focus ↔ hold: the same period');
+  const off = nextFocus(hold, { mode: 'normal', since: null }, NOW);
+  assert.deepEqual(off, { mode: 'normal', since: null, released: { from: SINCE, to: NOW } });
+  assert.deepEqual(nextFocus(off, { mode: 'normal', since: null }, '2026-10-29T12:00:00Z'), off, 'normal again: the window stays');
+  assert.deepEqual(nextFocus(off, { mode: 'hold', since: UNTIL }, NOW), { mode: 'hold', since: UNTIL }, 'the next mode replaces it');
+  assert.equal(nextFocus(on, { mode: 'x' }, NOW), on, 'an unknown payload keeps the state');
+  assert.equal(nextFocus(null, null, NOW), null);
+  // the released window feeds the inbox view (the release time is the end of the window)
+  const v = inboxFocusView(ITEMS, nextFocus({ mode: 'focus', since: SINCE }, { mode: 'normal', since: null }, UNTIL), { hideDone: true });
+  assert.deepEqual(v.released.map((i) => i.id), ['d', 'c', 'e']);
+});
+
+test('makeFocusSync: reads focus_get on refresh, applies only the latest answer, keeps the state on failure', async () => {
+  const answers = [];
+  const get = () => new Promise((resolve, reject) => answers.push({ resolve, reject }));
+  const applied = [];
+  const sync = makeFocusSync({ get, apply: (s) => applied.push(s), now: () => NOW });
+  assert.equal(sync.state, null, 'unknown until the first answer');
+  const first = sync.refresh();
+  const second = sync.refresh(); // focus-changed events may arrive out of order: re-read, latest wins
+  await Promise.resolve();
+  answers[1].resolve({ mode: 'hold', since: SINCE });
+  answers[0].resolve({ mode: 'normal', since: null }); // older answer, late
+  await Promise.all([first, second]);
+  assert.deepEqual(applied, [{ mode: 'hold', since: SINCE }]);
+  assert.deepEqual(sync.state, { mode: 'hold', since: SINCE });
+  const third = sync.refresh();
+  await Promise.resolve();
+  answers[2].resolve({ mode: 'normal', since: null });
+  await third;
+  assert.deepEqual(sync.state, { mode: 'normal', since: null, released: { from: SINCE, to: NOW } });
+  const fourth = sync.refresh();
+  await Promise.resolve();
+  answers[3].reject(new Error('gone'));
+  await fourth;
+  assert.equal(applied.length, 2, 'a failed read applies nothing');
+  assert.deepEqual(sync.state.mode, 'normal');
+});

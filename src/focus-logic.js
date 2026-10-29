@@ -3,7 +3,8 @@
 // during the mode are hidden — kept and counted, no line at all (complete silence); while 전달
 // 멈춤 is on they collapse into one "(보류 — N건)" line; after release the items of that window
 // come first as a group, decisions (close_proposed) → new → in progress.
-// Focus state shape used here (the backend's focus_status maps onto it):
+// Focus state shape used here (nextFocus builds it from the backend's focus_get / focus-changed
+// `{mode, since}`):
 //   { mode: 'normal' | 'focus' | 'hold', since?: ISO time the current mode started,
 //     released?: { from: ISO, to: ISO } — the window of the last mode, after its release }
 // No DOM, no Tauri: unit-tested in Node.
@@ -69,4 +70,50 @@ export function inboxFocusView(items, focus, { hideDone = true } = {}) {
     return { rest, held: 0, hidden: 0, released };
   }
   return { rest: visibleItems(all, { hideDone }), held: 0, hidden: 0, released: [] };
+}
+
+const ON = (m) => m === 'focus' || m === 'hold';
+
+/**
+ * The app's focus state after the backend reports `status` (`{mode, since}` from focus_get, read
+ * again on every focus-changed), `prev` the state before it, `now` the ISO time of the report.
+ * Leaving a mode keeps its window `{from: since, to: now}` as `released` (the inbox shows that
+ * window's items first) until the next mode starts; an unknown payload keeps `prev`.
+ */
+export function nextFocus(prev, status, now) {
+  const mode = status && status.mode;
+  if (ON(mode)) return { mode, since: status.since ?? null };
+  if (mode !== 'normal') return prev ?? null;
+  const released = prev && ON(prev.mode) && prev.since ? { from: prev.since, to: now } : prev && prev.released;
+  return released ? { mode: 'normal', since: null, released } : { mode: 'normal', since: null };
+}
+
+/**
+ * Keeps the app's focus state in step with the backend: `refresh()` (at start and on every
+ * focus-changed) reads `get()` and hands the next state (nextFocus) to `apply`. Only the latest
+ * read is applied — the palette's and the dispatcher's MCP focus_set emit from different threads
+ * and the payload has no version, so an event may arrive out of order. A failed read keeps the
+ * state. `state` is null until the first answer (the palette then offers no entries).
+ */
+export function makeFocusSync({ get, apply, now = () => new Date().toISOString() }) {
+  let state = null;
+  let seq = 0;
+  return {
+    refresh() {
+      const mine = ++seq;
+      return Promise.resolve()
+        .then(get)
+        .then(
+          (status) => {
+            if (mine !== seq) return;
+            state = nextFocus(state, status, now());
+            apply(state);
+          },
+          () => {},
+        );
+    },
+    get state() {
+      return state;
+    },
+  };
 }

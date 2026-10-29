@@ -244,6 +244,20 @@ export function memoSave(text) {
   return invoke('memo_save', { text });
 }
 
+// ---------------------------------------------------------------- 집중근무 / 전달 멈춤 (focus-mode spec)
+
+/** `{mode: 'normal'|'hold'|'focus', since}` — `since` is RFC 3339 like inbox `created`, null in
+ * the normal mode. A change (palette or the dispatcher's MCP focus_set) emits `focus-changed`. */
+export function focusGet() {
+  return invoke('focus_get');
+}
+
+/** Switch the mode (the same switch as the dispatcher's MCP focus_set); resolves the new status,
+ * rejects with a Korean message. The same mode again changes nothing (no event). */
+export function focusSet(mode) {
+  return invoke('focus_set', { mode });
+}
+
 // ---------------------------------------------------------------- startup / environment (Task 12)
 
 /** Environment check items (cached; null until the first check after start finished). */

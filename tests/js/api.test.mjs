@@ -73,3 +73,14 @@ test('write keeps sending pty_write { pane, data } (user input contract)', async
   assert.deepEqual(calls, [['pty_write', { pane: 'p1', data: '한글 a\r' }]]);
   delete globalThis.__TAURI__;
 });
+
+// ---- 집중근무 (ab-core C3): focus_get / focus_set { mode }
+import { focusGet, focusSet } from '../../src/api.js';
+
+test('focusGet / focusSet invoke focus_get and focus_set { mode }', async () => {
+  const calls = fakeInvoke();
+  await focusGet();
+  await focusSet('hold');
+  assert.deepEqual(calls, [['focus_get', undefined], ['focus_set', { mode: 'hold' }]]);
+  delete globalThis.__TAURI__;
+});
