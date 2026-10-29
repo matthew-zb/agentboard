@@ -11,8 +11,8 @@ const ITEMS = [
   item('a', '2026-10-29T09:00:00+09:00', 'in_progress', true), // before the mode
   item('b', '2026-10-29T09:30:00+09:00', 'new'), // before
   item('c', '2026-10-29T10:10:00+09:00', 'new'), // during
-  item('d', '2026-10-29T10:20:00+09:00', 'close_proposed', true), // during
-  item('e', '2026-10-29T10:30:00+09:00', 'in_progress', true), // during
+  item('d', '2026-10-29T10:20:00+09:00', 'close_proposed'), // during, unread
+  item('e', '2026-10-29T10:30:00+09:00', 'in_progress'), // during, unread
   item('f', '2026-10-29T10:40:00+09:00', 'done', true), // during, done
 ];
 const SINCE = '2026-10-29T10:00:00+09:00';
@@ -60,6 +60,19 @@ test('after release: the "집중근무 중 들어온 항목" group on top — de
   assert.deepEqual(v.released.map((i) => i.id), ['d', 'c', 'e']);
   assert.deepEqual(v.rest.map((i) => i.id), ['b', 'a'], 'the rest as before; done items hidden');
   assert.equal(v.held, 0);
+  // the group is what was not seen yet: a read item of the window goes back to the usual list,
+  // and once every one is read or done the group is gone
+  const rel = { mode: 'normal', released: { from: SINCE, to: UNTIL } };
+  const g = item('g', '2026-10-29T10:50:00+09:00', 'new', true);
+  const withRead = inboxFocusView([...ITEMS, g], rel, { hideDone: true });
+  assert.deepEqual(withRead.released.map((i) => i.id), ['d', 'c', 'e']);
+  assert.ok(withRead.rest.some((i) => i.id === 'g'));
+  const seen = ITEMS.map((it) => (it.id === 'c' || it.id === 'e' ? { ...it, read: true } : it.id === 'd' ? { ...it, state: 'done' } : it));
+  const after = inboxFocusView(seen, rel, { hideDone: true });
+  assert.deepEqual(after.released, []);
+  assert.deepEqual(after.rest.map((i) => i.id), ['b', 'e', 'a', 'c'], 'back in the usual order (a read new item sorts after in progress)');
+  const doc = fakeDoc();
+  assert.ok(!tree(buildList(doc, after.rest, { total: 6, released: after.released })).some((e) => e.classList.contains('inbox-group')), 'no group line');
   // no mode, nothing released: the usual list
   const plain = inboxFocusView(ITEMS, { mode: 'normal' }, { hideDone: false });
   assert.deepEqual(plain.released, []);

@@ -2,7 +2,8 @@
 // bar flag, the palette entries and the inbox view. While 집중근무 is on, inbox items that came in
 // during the mode are hidden — kept and counted, no line at all (complete silence); while 전달
 // 멈춤 is on they collapse into one "(보류 — N건)" line; after release the items of that window
-// come first as a group, decisions (close_proposed) → new → in progress.
+// not seen yet come first as a group, decisions (close_proposed) → new → in progress — an item
+// leaves the group once it is read or done, and the group is gone when none is left.
 // Focus state shape used here (nextFocus builds it from the backend's focus_get / focus-changed
 // `{mode, since}`):
 //   { mode: 'normal' | 'focus' | 'hold', since?: ISO time the current mode started,
@@ -50,7 +51,8 @@ const RELEASE_ORDER = { close_proposed: 0, new: 1, in_progress: 2 };
 /**
  * The inbox under the focus state: `{rest, held, hidden, released}` — `rest` the usual list
  * (visibleItems), `held` the count for the "(보류 — N건)" line (전달 멈춤), `hidden` the open items
- * kept out of sight (집중근무), `released` the group shown first after a release.
+ * kept out of sight (집중근무), `released` the group shown first after a release (the window's
+ * unread, not done items).
  */
 export function inboxFocusView(items, focus, { hideDone = true } = {}) {
   const all = Array.isArray(items) ? items : [];
@@ -64,7 +66,7 @@ export function inboxFocusView(items, focus, { hideDone = true } = {}) {
   }
   const r = focus && focus.released;
   if (r && Number.isFinite(time(r.from)) && Number.isFinite(time(r.to))) {
-    const group = all.filter((it) => it.state !== 'done' && inWindow(it, time(r.from), time(r.to)));
+    const group = all.filter((it) => it.state !== 'done' && !it.read && inWindow(it, time(r.from), time(r.to)));
     const released = sortItems(group).sort((a, b) => (RELEASE_ORDER[a.state] ?? 3) - (RELEASE_ORDER[b.state] ?? 3)); // stable: newest first kept
     const rest = visibleItems(all.filter((it) => !group.includes(it)), { hideDone });
     return { rest, held: 0, hidden: 0, released };
