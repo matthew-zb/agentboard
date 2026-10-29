@@ -299,7 +299,7 @@ dispatcher 오른쪽 열의 인박스 아래 창(`{"applet":{"name":"memo","kind
 ### 세션 등록부(registry.json)에서 옮겨 오기
 
 - `node scripts/import-registry.mjs <registry.json> --only <세션,…> [--root <workspaceRoot>]` — 기존 세션 등록부(session-board `registry.json`)에서 고른 `regular[]` 세션을 Manager 탭 설정으로 바꿔 **화면에만 출력합니다(dry-run, 파일을 하나도 쓰지 않음)**. `--root`를 생략하면 등록부 디스패처 항목의 dir을 씁니다.
-- 출력: `config.json`(dispatcher `dispatcher-inbox`, control | work 그룹, `nightlyRefresh: null`, holla 전체 경로 점검), `startupPrompt`가 있는 세션의 탭별 템플릿(`<세션>-start`), 공존 기간 안내를 붙인 `roles/dispatcher.md`·`roles/manager.md`.
+- 출력: `config.json`(dispatcher `dispatcher-inbox`, control | work 그룹, `nightlyRefresh: null`, holla 전체 경로 점검, 메모 vi 편집 `"memo": {"vi": true}`), `startupPrompt`가 있는 세션의 탭별 템플릿(`<세션>-start`), 공존 기간 안내를 붙인 `roles/dispatcher.md`·`roles/manager.md`.
 - 이미 있는 파일은 `*.imported.*` 이름으로 표시할 뿐 **덮어쓰지 않습니다** — 내용을 확인한 뒤 직접 반영하세요. 디스패처(`workspace-07`)·handover·workspaceRoot 밖 폴더는 탭으로 만들지 않고 경고합니다.
 
 ## 키 배치
