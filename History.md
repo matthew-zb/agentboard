@@ -5,6 +5,7 @@
 ### Features
 - 설정 다시 읽기(팔레트, dispatcher MCP `config_reload`): 앱을 재시작하지 않고 config.json·템플릿·프로필·키 설정을 다시 읽고, config에만 있는 역할 탭(handover 포함)을 띄운다. 다른 창은 재시작하지 않고, 오류가 있으면 아무것도 바꾸지 않는다.
 - dispatcher 오른쪽 열의 인박스 아래에 메모(`MEMO.md`의 `## 메모` 아래 본문)를 둔다. 읽기·바로 편집, 외부 변경 알림, `.agentboard/memo.bak` 1단계 백업. dispatcher는 사용자가 요구할 때만 파일을 고친다.
+- 메모 vi 편집(`config.json` `"memo": {"vi": true}`, 기본 꺼짐): 보통·입력 모드, 이동·편집·검색·`:w`/`:wq`/`:q!`. 이전 키트의 config 초안은 켠다.
 - 작업 상태 탭(팔레트 "작업 상태", `Ctrl+Alt+d`): 탭·창별 역할·작업 중/쉬는 중·문맥 크기·마지막 지시와 응답·인박스 미결 수·야간 정리 단계. 역할 창은 hook, 역할 없는 claude 창은 자기 세션 파일로 갱신한다.
 
 ### Fixes

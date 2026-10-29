@@ -1841,6 +1841,18 @@ mod tests {
         assert!(f.rx.try_recv().map_or(true, |fx| fx.kill.is_empty()), "nothing killed");
     }
 
+    /// `memo.vi` follows a reload like every other setting (the frontend re-reads on
+    /// `config-reloaded`).
+    #[test]
+    fn reload_applies_the_memo_vi_setting() {
+        let f = reload_fx();
+        assert!(!f.state.loaded.read().unwrap().config.memo.vi);
+        f.write("config.json", &RELOAD_CONFIG.replace("\"defaultAgent\": \"cmd\",", "\"defaultAgent\": \"cmd\", \"memo\": {\"vi\": true},"));
+        f.reload().unwrap();
+        assert!(f.state.loaded.read().unwrap().config.memo.vi);
+        assert_eq!(f.ui.reloaded.load(Ordering::SeqCst), 1);
+    }
+
     /// R12: a tab added by a reload goes to the end of defaultGroup in the background.
     #[test]
     fn reload_keeps_focus_and_active_tab() {

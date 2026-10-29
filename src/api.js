@@ -252,6 +252,11 @@ export function memoSave(text) {
   return invoke('memo_save', { text });
 }
 
+/** `{vi}` — config.json "memo": {"vi": true} turns vi editing on (memo spec §8 V3 b; default false). */
+export function memoSettings() {
+  return invoke('memo_settings');
+}
+
 // ---------------------------------------------------------------- startup / environment (Task 12)
 
 /** Environment check items (cached; null until the first check after start finished). */

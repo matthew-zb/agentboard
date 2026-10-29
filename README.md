@@ -194,6 +194,7 @@ split 노드(`horizontal` = 좌|우, `vertical` = 위/아래, `sizes` 퍼센트)
 - **handover** 탭은 하나만, `dir: ""`(작업공간 = `workspaceRoot`)이어야 합니다. **manager** 탭은 전용 폴더(`dir`)가 필요합니다.
 - `handoverIndex`: 업무 인덱스 문서, `workspaceRoot` 기준(기본 `HANDOVER.md`). 업무마다 한 줄 — 업무 이름, 계획 파일, 진행 파일, 갱신 시각 — 포인터만 담습니다.
 - `nightlyRefresh`(`"HH:MM"`, 기본 `"03:00"`, `null`이면 끔), `nightlyTimeoutMin`(기본 20), `nightlyQuietMin`(기본 10): 아래 "야간 정리".
+- `memo`: `{"vi": true}`이면 메모를 vi 키로 편집합니다(기본 꺼짐, 아래 "메모").
 - `roles.<역할>`: `systemPromptFile`(`.agentboard/` 기준 상대경로), `agent`(팀 창 프로필, 기본 `defaultAgent`), `args`(그 역할 세션에 붙는 인자), `maxPerTeam`(member만, 팀당 팀원 상한, 기본 4). `systemPromptFile`을 생략하면 `roles/<역할>.md`를 쓰고, 그 파일도 없으면 내장 기본 지시를 씁니다. 첫 실행 때 복사된 `roles/*.md`를 직접 다듬으면 다음에 뜨는 세션부터 적용됩니다. **업그레이드해도 복사된 파일은 바뀌지 않습니다** — 새 버전의 기본 지시를 쓰려면 앱을 끈 상태에서 `.agentboard/roles/`의 해당 `.md`를 지우세요(다음 시작 때 새 기본값이 복사됩니다. 직접 고친 내용이 있으면 먼저 옮겨 두세요). 템플릿(`templates/*.json`)도 같습니다.
   - npm으로 설치한 `claude.cmd`에서는 cmd.exe 제약 때문에 역할 지시가 한 줄로 합쳐지고(줄바꿈 → ` ⏎ `) `" % ^ & | < >`가 비슷한 모양의 다른 문자로 바뀝니다. 지시 파일은 짧게(수천 자 이내) 유지하세요.
 - `envRequire`: 사용자 정의 점검 항목. `check` 명령(cmd.exe로 실행, 10초 제한)이 종료 코드 0이면 정상. `required: true`는 건너뛸 수 없습니다. 키가 없으면 위의 holla 항목이 기본이고, `[]`이면 없음. `source`(설치할 GitHub 저장소 주소)가 비어 있으면 dispatcher가 사용자에게 주소를 물어 기록한 뒤, 승인을 받아 그 저장소 README대로 설치합니다. 저장소가 비공개일 수 있어 앱은 주소를 기본값으로 넣지 않습니다.
@@ -265,6 +266,7 @@ dispatcher 오른쪽 열의 인박스 아래 창(`{"applet":{"name":"memo","kind
 - 파일은 `<workspaceRoot>/MEMO.md` 하나입니다. 없으면 앱이 시작할 때 작성 기준 헤더를 넣어 만들고, 있으면 건드리지 않습니다.
 - **처음 나오는 `## 메모` 줄 아래가 본문**이고, 메모 창에는 본문만 보입니다. 그 위(작성 기준)는 보이지 않습니다. `## 메모` 줄이 없으면 파일 전체를 보여 주고 경고를 띄웁니다.
 - 키: 읽기 `j`/`k`·`g`/`G` 스크롤, `e`(또는 더블클릭) 편집, `r` 다시 읽기. 편집 `Ctrl+Enter` 저장, `Esc` 취소(바뀐 내용이 있으면 `Y`/`N`, `Enter`는 무시). 편집 중에도 `Alt+…` 앱 단축키는 동작하고 쓰던 글은 남습니다.
+- **vi 편집**(`config.json` `"memo": {"vi": true}`, 기본 꺼짐, 「설정 다시 읽기」 뒤 다음 편집부터): 편집을 열면 보통 모드(`-- NORMAL --`)입니다. 모드 `Esc` `i` `a` `A` `o` `O`, 이동 `h` `j` `k` `l` `w` `b` `0` `$` `gg` `G` `Ctrl+d`/`Ctrl+u`, 편집 `x` `dd` `yy` `p` `P` `u` `Ctrl+r`, 검색 `/` `n` `N`, 명령 `:w`(저장 후 계속) `:wq`·`ZZ`·`Ctrl+Enter`(저장 후 닫기) `:q!`(버리기, 바뀐 내용이 있으면 `Y`/`N`). 키는 자판 위치로 읽어 한글 입력 상태에서도 같고, 보통 모드의 `Esc`는 편집을 닫지 않습니다. 숫자 반복(`3dd`)·비주얼 모드·레지스터는 없습니다.
 - dispatcher는 사용자가 요구할 때만 파일을 직접 고칩니다(역할 지시). 마지막에 쓴 쪽이 이기며, 앱은 내용이 바뀔 때마다 직전 내용을 `.agentboard/memo.bak`에 한 벌 남깁니다. 편집 중에 파일이 바뀌면 "외부에서 바뀜 — 저장하면 덮어씀" 알림만 띄웁니다.
 - **이미 쓰던 설치**: 복사된 `.agentboard/templates/dispatcher-inbox.json`·`roles/*.md`와 저장된 배치는 바뀌지 않습니다. 메모를 붙이려면 앱을 끈 상태에서 `.agentboard/templates/dispatcher-inbox.json`(필요하면 `roles/dispatcher.md`도)과 `%APPDATA%/agentboard/workspace.json`을 지우고 다시 시작하세요(직접 고친 내용은 먼저 옮겨 두세요).
 
@@ -307,7 +309,7 @@ AgentBoard 창들의 상태를 한 화면에 모은 탭입니다(하나만 열�
 ### 세션 등록부(registry.json)에서 옮겨 오기
 
 - `node scripts/import-registry.mjs <registry.json> --only <세션,…> [--root <workspaceRoot>]` — 기존 세션 등록부(session-board `registry.json`)에서 고른 `regular[]` 세션을 Manager 탭 설정으로 바꿔 **화면에만 출력합니다(dry-run, 파일을 하나도 쓰지 않음)**. `--root`를 생략하면 등록부 디스패처 항목의 dir을 씁니다.
-- 출력: `config.json`(dispatcher `dispatcher-inbox`, control | work 그룹, `nightlyRefresh: null`, holla 전체 경로 점검), `startupPrompt`가 있는 세션의 탭별 템플릿(`<세션>-start`), 공존 기간 안내를 붙인 `roles/dispatcher.md`·`roles/manager.md`.
+- 출력: `config.json`(dispatcher `dispatcher-inbox`, control | work 그룹, `nightlyRefresh: null`, holla 전체 경로 점검, 메모 vi 편집 `"memo": {"vi": true}`), `startupPrompt`가 있는 세션의 탭별 템플릿(`<세션>-start`), 공존 기간 안내를 붙인 `roles/dispatcher.md`·`roles/manager.md`.
 - 이미 있는 파일은 `*.imported.*` 이름으로 표시할 뿐 **덮어쓰지 않습니다** — 내용을 확인한 뒤 직접 반영하세요. 디스패처(`workspace-07`)·handover·workspaceRoot 밖 폴더는 탭으로 만들지 않고 경고합니다.
 
 ## 키 배치

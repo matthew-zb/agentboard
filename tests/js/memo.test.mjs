@@ -183,7 +183,7 @@ const HEADER = '# 메모 — 사용자가 고른 오늘 할 일\n\n작성 기준
 const BODY = '- 결제 오류 회신 확인 — billing\n- 주간 보고 초안\n';
 
 /** Fake Tauri: memo_read / memo_save over an in-memory MEMO.md, doc-changed listeners. */
-function setup(text, { answer = true } = {}) {
+function setup(text, { answer = true, vi = false } = {}) {
   const t = { text, calls: [], listeners: {}, rendered: [], confirms: [], toasts: [], answer };
   globalThis.document = fakeDocument();
   globalThis.__TAURI__ = {
@@ -191,6 +191,7 @@ function setup(text, { answer = true } = {}) {
       invoke: async (cmd, args) => {
         t.calls.push([cmd, args]);
         if (cmd === 'memo_read') return { path: 'MEMO.md', text: t.text };
+        if (cmd === 'memo_settings') return { vi: !!t.settingsVi };
         if (cmd === 'memo_save') t.text = args.text;
         return null;
       },
@@ -219,6 +220,8 @@ function setup(text, { answer = true } = {}) {
       return t.answer;
     },
     toast: (m) => t.toasts.push(String(m)),
+    // memo spec §8 V3 b: a fixed answer, or null = follow memo_settings (reset by every test)
+    vi: vi === null ? null : () => vi,
   });
   return t;
 }
@@ -381,5 +384,184 @@ test('memo keeps CRLF on save and unwatches on dispose', async () => {
   t.emit('doc-changed', { paneId: 'p-memo' });
   await settle();
   assert.equal(t.cmds('memo_read').length, reads, 'no reads after dispose');
+  teardown();
+});
+
+// ---------------------------------------------------------------- memo spec §8: vi editing (V3 b: only when configured)
+
+const viBar = (m) => byClass(m.el, 'memo-vi');
+const viMode = (m) => byClass(m.el, 'memo-vi-mode').textContent;
+const cmdline = (m) => byClass(m.el, 'memo-cmdline');
+const L2 = BODY.indexOf('- 주간');
+
+test('vi memo: e enters normal mode (read-only, block cursor, -- NORMAL --); Esc keeps editing', async () => {
+  const t = setup(HEADER + BODY, { vi: true });
+  const m = mountMemo('p-memo');
+  await settle();
+  press(m.el, 'KeyE');
+  const ed = byClass(m.el, 'memo-edit');
+  assert.equal(ed.value, BODY);
+  assert.equal(ed.readOnly, true, 'no typing in normal mode (an IME cannot start composing text)');
+  assert.deepEqual(ed.selection, [0, 1], 'the character under the cursor is selected (block cursor)');
+  assert.equal(viBar(m).classList.contains('hidden'), false);
+  assert.equal(viMode(m), '-- NORMAL --');
+  const j = press(ed, 'KeyJ');
+  assert.ok(j.defaultPrevented);
+  assert.deepEqual(ed.selection, [L2, L2 + 1]);
+  press(ed, 'KeyD');
+  assert.equal(viMode(m), '-- NORMAL -- d', 'a pending operator is shown');
+  press(ed, 'Escape');
+  assert.equal(viMode(m), '-- NORMAL --');
+  assert.equal(byClass(m.el, 'memo-edit'), ed, 'Esc in normal mode does not leave the editor');
+  assert.equal(t.confirms.length, 0);
+  // a key that is not a vi key does nothing to the read-only text and is not typed
+  assert.ok(press(ed, 'KeyQ').defaultPrevented);
+  // app chords (Alt+…) are not taken: the key router runs them first
+  assert.equal(press(ed, 'KeyH', { altKey: true }).defaultPrevented, false);
+  m.dispose();
+  teardown();
+});
+
+test('vi memo: i types in the textarea, Esc back to normal, :w saves and stays, :wq saves and leaves', async () => {
+  const t = setup(HEADER + BODY, { vi: true });
+  const m = mountMemo('p-memo');
+  await settle();
+  press(m.el, 'KeyE');
+  const ed = byClass(m.el, 'memo-edit');
+  press(ed, 'KeyI');
+  assert.equal(ed.readOnly, false);
+  assert.equal(viMode(m), '-- INSERT --');
+  assert.deepEqual(ed.selection, [0, 0]);
+  // typing is the textarea's own; plain keys are not taken in insert mode
+  assert.equal(press(ed, 'KeyJ').defaultPrevented, false);
+  ed.value = `오늘 할 일\n${BODY}`;
+  ed.selectionStart = 6;
+  press(ed, 'Escape');
+  assert.equal(ed.readOnly, true);
+  assert.equal(viMode(m), '-- NORMAL --');
+  assert.deepEqual(ed.selection, [5, 6], 'one to the left, like vi');
+  // :w — the command line, then Enter
+  press(ed, 'Semicolon', { shiftKey: true });
+  const cl = cmdline(m);
+  assert.equal(cl.classList.contains('hidden'), false);
+  assert.equal(document.activeElement, cl);
+  assert.equal(byClass(m.el, 'memo-vi-prefix').textContent, ':');
+  cl.value = 'w';
+  press(cl, 'Enter');
+  await settle();
+  assert.deepEqual(t.cmds('memo_save'), [['memo_save', { text: `${HEADER}오늘 할 일\n${BODY}` }]]);
+  assert.equal(byClass(m.el, 'memo-edit'), ed, ':w keeps editing');
+  assert.equal(cl.classList.contains('hidden'), true);
+  assert.ok(viMode(m).includes('저장했습니다'), viMode(m));
+  // Ctrl+Enter (memo's own save) still works; :wq saves and leaves
+  press(ed, 'KeyX');
+  press(ed, 'Semicolon', { shiftKey: true });
+  cmdline(m).value = 'wq';
+  press(cmdline(m), 'Enter');
+  await settle();
+  assert.equal(t.cmds('memo_save').length, 2);
+  assert.equal(t.text, `${HEADER}오늘 할 \n${BODY}`, 'x removed the character under the cursor');
+  assert.equal(byClass(m.el, 'memo-edit'), undefined, ':wq left the editor');
+  m.dispose();
+  teardown();
+});
+
+test('vi memo: dd / u, and :q! with changes asks Y/N (Enter ignored)', async () => {
+  const t = setup(HEADER + BODY, { vi: true, answer: false });
+  const m = mountMemo('p-memo');
+  await settle();
+  press(m.el, 'KeyE');
+  const ed = byClass(m.el, 'memo-edit');
+  press(ed, 'KeyD');
+  press(ed, 'KeyD');
+  assert.equal(ed.value, BODY.slice(L2));
+  press(ed, 'KeyU');
+  assert.equal(ed.value, BODY);
+  press(ed, 'KeyD');
+  press(ed, 'KeyD');
+  press(ed, 'Semicolon', { shiftKey: true });
+  cmdline(m).value = 'q!';
+  press(cmdline(m), 'Enter');
+  await settle();
+  assert.equal(t.confirms.length, 1);
+  assert.deepEqual(t.confirms[0][1], { enterYes: false });
+  assert.equal(byClass(m.el, 'memo-edit'), ed, 'N keeps editing');
+  // :q with changes only explains; nothing is saved
+  press(ed, 'Semicolon', { shiftKey: true });
+  cmdline(m).value = 'q';
+  press(cmdline(m), 'Enter');
+  await settle();
+  assert.ok(viMode(m).includes(':q!'), viMode(m));
+  assert.equal(t.cmds('memo_save').length, 0);
+  m.dispose();
+  teardown();
+});
+
+test('vi memo: / searches from the command line (Korean input), Esc closes it', async () => {
+  setup(HEADER + BODY, { vi: true });
+  const m = mountMemo('p-memo');
+  await settle();
+  press(m.el, 'KeyE');
+  const ed = byClass(m.el, 'memo-edit');
+  press(ed, 'Slash');
+  assert.equal(byClass(m.el, 'memo-vi-prefix').textContent, '/');
+  // composing Hangul in the command line: Enter belongs to the IME
+  cmdline(m).value = '주간';
+  assert.equal(press(cmdline(m), 'Enter', { isComposing: true }).defaultPrevented, false);
+  press(cmdline(m), 'Enter');
+  const at = BODY.indexOf('주간');
+  assert.deepEqual(ed.selection, [at, at + 1]);
+  assert.equal(document.activeElement, ed, 'focus back in the editor');
+  press(ed, 'Slash');
+  cmdline(m).value = '없는말';
+  press(cmdline(m), 'Escape');
+  assert.equal(cmdline(m).classList.contains('hidden'), true);
+  assert.deepEqual(ed.selection, [at, at + 1], 'Esc: no search');
+  press(ed, 'KeyN');
+  assert.deepEqual(ed.selection, [at, at + 1], 'n: the only match (wraps to itself)');
+  m.dispose();
+  teardown();
+});
+
+test('vi memo is off unless configured: the editor is plain and Esc cancels as before', async () => {
+  setup(HEADER + BODY);
+  const m = mountMemo('p-memo');
+  await settle();
+  press(m.el, 'KeyE');
+  const ed = byClass(m.el, 'memo-edit');
+  assert.ok(!ed.readOnly);
+  assert.equal(viBar(m).classList.contains('hidden'), true);
+  press(ed, 'Escape');
+  await settle();
+  assert.equal(byClass(m.el, 'memo-edit'), undefined);
+  m.dispose();
+  teardown();
+});
+
+test('vi follows memo_settings: read at mount, again on config-reloaded', async () => {
+  const t = setup(HEADER + BODY, { vi: null });
+  t.settingsVi = true;
+  const m = mountMemo('p-memo');
+  await settle();
+  assert.equal(t.cmds('memo_settings').length, 1);
+  press(m.el, 'KeyE');
+  assert.equal(byClass(m.el, 'memo-edit').readOnly, true, 'config memo.vi = true: normal mode');
+  press(byClass(m.el, 'memo-edit'), 'Semicolon', { shiftKey: true });
+  cmdline(m).value = 'q';
+  press(cmdline(m), 'Enter');
+  await settle();
+  // the settings are re-read after "설정 다시 읽기" (config-reloaded) and apply to the next edit
+  t.settingsVi = false;
+  t.emit('config-reloaded', null);
+  await settle();
+  assert.equal(t.cmds('memo_settings').length, 2);
+  press(m.el, 'KeyE');
+  const ed = byClass(m.el, 'memo-edit');
+  assert.ok(!ed.readOnly);
+  assert.equal(viBar(m).classList.contains('hidden'), true);
+  m.dispose();
+  t.emit('config-reloaded', null);
+  await settle();
+  assert.equal(t.cmds('memo_settings').length, 2, 'not after dispose');
   teardown();
 });
