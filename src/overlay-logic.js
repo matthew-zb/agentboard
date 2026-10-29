@@ -1,6 +1,7 @@
 // Pure logic behind the overlays (overlays.js draws them): picker key mapping, picker results →
 // WsCommands, palette entries, the new-tab wizard flow and the startup missing-dir flow.
 // No DOM access: unit-tested in Node. The UI is injected into the flows as functions.
+import { focusPaletteItems } from './focus-logic.js';
 import { fuzzyRank } from './fuzzy.js';
 import { leafIds } from './layout.js';
 import { tabGroups } from './groups.js';
@@ -203,7 +204,7 @@ const NOT_LISTED = new Set(['app.palette', 'pane.breakToTab']);
  * `{type:'autostart', on}` (login autostart; listed only when `autostart` — the current state,
  * true/false — is known).
  */
-export function paletteItems(ws, { bindings = {}, has = () => true, autostart = null } = {}) {
+export function paletteItems(ws, { bindings = {}, has = () => true, autostart = null, focus = null } = {}) {
   const out = [];
   const c = chain(ws);
   const groupOrder = leafIds(ws.groupLayout).filter((id) => ws.groups[id]);
@@ -216,6 +217,7 @@ export function paletteItems(ws, { bindings = {}, has = () => true, autostart = 
   out.push({ label: '사이드바 토글', action: { type: 'sidebar' } });
   if (autostart === true) out.push({ label: '로그인 시 자동 실행 끄기', hint: '현재: 켜짐', action: { type: 'autostart', on: false } });
   if (autostart === false) out.push({ label: '로그인 시 자동 실행 켜기', hint: '현재: 꺼짐', action: { type: 'autostart', on: true } });
+  out.push(...focusPaletteItems(focus)); // 집중근무 / 전달 멈춤 / 해제 (listed when the state is known)
 
   const ids = [...new Set(Object.keys(bindings))];
   for (const id of ids) {

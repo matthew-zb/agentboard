@@ -54,13 +54,14 @@ import {
   choose,
   pickDoc,
 } from './overlays.js';
-import { mountInbox, configureInbox } from './inbox.js';
+import { mountInbox, configureInbox, setInboxFocus } from './inbox.js';
 import { mountDoc, configureDocView, renderMarkdown, loadImages } from './docview.js';
 import { mountMemo, configureMemo } from './memo.js';
 import { mountDashboard, configureDashboard, updateDashboard } from './dashboard.js';
 import { configureCopyMode, toggleCopyMode, copyActive, pruneCopySessions } from './copy-ui.js';
 import { pickCommands, paletteItems, missingDirsFlow, closeFlow, envStatusFlag, reloadFlow } from './overlay-logic.js';
 import { hiddenAttentionTabs, statusEntryText } from './attention-logic.js';
+import { focusFlag, makeFocusSync } from './focus-logic.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -191,7 +192,7 @@ async function openPalette() {
   // login autostart state for its entry (unknown → no entry)
   const autostart = await api.autostartGet().catch(() => null);
   if (!current || overlayOpen()) return;
-  const items = paletteItems(current.workspace, { bindings, has: hasCommand, autostart });
+  const items = paletteItems(current.workspace, { bindings, has: hasCommand, autostart, focus: focusSync.state });
   return palette(items.map((it) => ({ label: it.label, hint: it.hint, run: () => runPaletteAction(it.action) })));
 }
 
@@ -222,6 +223,9 @@ function runPaletteAction(a) {
       return setAutostart(a.on);
     case 'reloadConfig':
       return reloadSettings();
+    case 'focus':
+      // the status bar and the inbox follow the focus-changed event (one state in the backend)
+      return api.focusSet(a.mode).catch(showError);
     default:
       return undefined;
   }
@@ -451,6 +455,8 @@ function renderStatus(snap) {
   renderAttentionList($('status').querySelector('.status-attn'), snap);
   const flags = $('status').querySelector('.status-flags');
   flags.replaceChildren();
+  const fm = focusFlag(focusSync.state);
+  if (fm) flags.appendChild(flag(fm.text, 'focus-mode', fm.title));
   if (s.sync) flags.appendChild(flag('[SYNC]', 'sync', '입력 동기화: 이 탭의 모든 실행 중 창에 입력이 전달됩니다'));
   if (s.errors > 0) {
     if (configErrorLines.length !== s.errors) refreshConfigErrors();
@@ -464,6 +470,16 @@ function renderStatus(snap) {
   const env = envStatusFlag(envItems);
   if (env) flags.appendChild(flag(env.text, env.highlight ? 'env env-error' : 'env', env.title));
 }
+
+// 집중근무 / 전달 멈춤 (focus-mode spec): the backend owns the mode; the status bar flag, the
+// palette entries and the inbox (hidden / held / released items) follow it.
+const focusSync = makeFocusSync({
+  get: () => api.focusGet(),
+  apply: (state) => {
+    setInboxFocus(state);
+    if (current) renderStatus(current);
+  },
+});
 
 // Environment check (Task 12): cached items from the backend; re-read when the check finishes
 // (`env-changed`) and after model changes (folder-trust items follow pane state).
@@ -610,6 +626,9 @@ api.onWorkspaceChanged((snap) => {
 });
 api.on('env-changed', refreshEnv);
 refreshEnv();
+// 집중근무 / 전달 멈춤: re-read on every change (palette or the dispatcher's MCP focus_set)
+api.on('focus-changed', () => focusSync.refresh());
+focusSync.refresh();
 api
   .snapshot()
   .then(render)

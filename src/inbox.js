@@ -4,9 +4,9 @@
 // textContent / DOM building — never innerHTML (items are written by agents).
 // No top-level DOM access: the builders take a `doc` and are unit-tested in Node with a fake one.
 import * as api from './api.js';
+import { inboxFocusView, FOCUS_HELD_LINE } from './focus-logic.js';
 import {
   stateLabel,
-  visibleItems,
   keyAction,
   canDo,
   moveSelection,
@@ -36,18 +36,22 @@ function el(doc, tag, cls, text) {
  * The list column. `items` are already filtered and sorted (visibleItems). Rows carry
  * `data-id`; classes `unread` (bold), `close-proposed` (highlight), `done`, `sel`.
  */
-export function buildList(doc, items, { selected = null, hideDone = true, total = 0 } = {}) {
+export function buildList(doc, items, { selected = null, hideDone = true, total = 0, held = 0, released = [] } = {}) {
   const root = el(doc, 'div', 'inbox-list');
   const head = el(doc, 'div', 'inbox-head');
-  const hidden = total - items.length;
+  const shownCount = items.length + released.length;
+  const hidden = total - shownCount;
   head.append(
-    el(doc, 'span', 'inbox-count', `인박스 ${items.length}건`),
-    el(doc, 'span', 'inbox-hint', hideDone ? `h: 완료 보기${hidden > 0 ? ` (숨김 ${hidden})` : ''}` : 'h: 완료 숨기기'),
+    el(doc, 'span', 'inbox-count', `인박스 ${shownCount}건`),
+    el(doc, 'span', 'inbox-hint', hideDone ? `h: 완료 보기${hidden > 0 && !held ? ` (숨김 ${hidden})` : ''}` : 'h: 완료 숨기기'),
   );
   root.appendChild(head);
   const rows = el(doc, 'div', 'inbox-rows');
-  if (!items.length) rows.appendChild(el(doc, 'div', 'inbox-empty', '처리할 항목이 없습니다'));
-  for (const it of items) {
+  // 전달 멈춤: the items of the mode are one line; after a release they come first as a group
+  if (held > 0) rows.appendChild(el(doc, 'div', 'inbox-held', FOCUS_HELD_LINE(held)));
+  if (released.length) rows.appendChild(el(doc, 'div', 'inbox-group', `집중근무 중 들어온 항목 ${released.length}건`));
+  if (!shownCount && !held) rows.appendChild(el(doc, 'div', 'inbox-empty', '처리할 항목이 없습니다'));
+  for (const it of [...released, ...items]) {
     const row = el(doc, 'div', 'inbox-row');
     row.dataset.id = it.id;
     row.classList.toggle('unread', !it.read);
@@ -186,7 +190,13 @@ export function buildDetail(doc, item, { focused = false, files = null, fileSel 
 
 // ---------------------------------------------------------------- shared store
 
-const store = { items: [], version: -1, views: new Set(), unlisten: null, seq: 0, error: null };
+const store = { items: [], version: -1, views: new Set(), unlisten: null, seq: 0, error: null, focus: null };
+
+/** 집중근무 / 전달 멈춤 state (focus-logic.js shape; null = unknown / normal): the list follows it. */
+export function setInboxFocus(focus) {
+  store.focus = focus || null;
+  for (const v of store.views) v.render();
+}
 
 function refresh() {
   const seq = ++store.seq;
@@ -302,7 +312,13 @@ export function mountInbox() {
     );
   };
 
-  const list = () => visibleItems(store.items, { hideDone: st.hideDone });
+  // the focus state decides what is listed: hidden (집중근무), one held line (전달 멈춤) or the
+  // released group first; selection moves over the released group and then the rest
+  const focusView = () => inboxFocusView(store.items, store.focus, { hideDone: st.hideDone });
+  const list = () => {
+    const v = focusView();
+    return [...v.released, ...v.rest];
+  };
   const selected = () => store.items.find((it) => it.id === st.sel) || null;
 
   const view = {
@@ -319,7 +335,8 @@ export function mountInbox() {
       const keepScroll = oldDetail && oldDetail.dataset.id === (item && item.id) ? oldDetail.scrollTop : 0;
       const oldRows = root.querySelector('.inbox-rows');
       const rowsScroll = oldRows ? oldRows.scrollTop : 0;
-      const l = buildList(document, items, { selected: st.sel, hideDone: st.hideDone, total: store.items.length });
+      const fv = focusView();
+      const l = buildList(document, fv.rest, { selected: st.sel, hideDone: st.hideDone, total: store.items.length, held: fv.held, released: fv.released });
       const showFiles = st.view === 'detail' && item && item.issue && fl.id === item.id;
       if (!showFiles) fl.mode = false;
       const d = buildDetail(document, item, {
