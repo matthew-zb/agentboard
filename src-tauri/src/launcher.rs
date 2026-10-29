@@ -124,7 +124,9 @@
 //!   `ws -> loaded(read)`, released; config.json edit under `loaded(write)` alone; (rename, R29)
 //!   the inbox owner names under the inbox lock alone; then the model; rollback on failure. So
 //!   no code may call `execute` with one of those commands while holding `CONFIG_WRITE`
-//!   (nothing does: `create_manager_tab` only executes `CreateTab` under it).
+//!   (nothing does: `create_manager_tab` only executes `CreateTab` under it). Before a
+//!   `CloseTab`, still under `CONFIG_WRITE`, `removal_blockers` reads `ws` (released), then the
+//!   inbox (leaf), then the tab's `teams/` folder with no lock: none nested.
 //! * Config reload (`reload_config_from`): `CONFIG_WRITE` → `load_all` with no app lock →
 //!   `ws` → `loaded(read)` (released) → `loaded(write)` while `ws` is still held (the allowed
 //!   `ws -> loaded` direction; nothing takes `ws` while holding `loaded`) → both released, then
@@ -472,6 +474,10 @@ pub fn execute(state: &AppState, cmd: WsCommand) -> Result<Snapshot, String> {
             // CONFIG_WRITE first, then the tab's name/dir are read: two concurrent renames of
             // the same role tab cannot both act on the name read before the other's edit
             let _cfg = config::CONFIG_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+            // decision c (④): MCP and UI closes both pass here, before anything changes
+            if let WsCommand::CloseTab { tab } = &cmd {
+                removal_blockers(state, tab)?;
+            }
             match role_tab_config_edit(state, &cmd) {
                 Some((name, dir, edit)) => execute_with_config(state, cmd, &name, &dir, &edit),
                 None => execute_model(state, cmd),
@@ -479,6 +485,55 @@ pub fn execute(state: &AppState, cmd: WsCommand) -> Result<Snapshot, String> {
         }
         _ => execute_model(state, cmd),
     }
+}
+
+/// Decision c (remove-tab spec §2): a Manager tab is not closed while it has unfinished inbox
+/// items (owner = its name, state ≠ done — a closing proposal too) or a running team: a team
+/// pane (lead/member) in the tab, or a `teams/<id>/brief.md` whose first line is not
+/// `상태: 완료` (catches a team between a restart and the Manager's re-hire). The Korean refusal
+/// lists both kinds and how to finish them. Other tabs (plain, handover; the Dispatcher tab is
+/// refused by the model) pass. Folders, issues, teams and done items are never touched here.
+pub fn removal_blockers(state: &AppState, tab: &str) -> Result<(), String> {
+    let (name, workspace, live) = {
+        let ws = state.ws.lock().unwrap();
+        let Some(t) = ws.tabs.get(tab).filter(|t| t.role == Some(Role::Manager)) else { return Ok(()) };
+        // team id -> a lead is among its panes
+        let mut live: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+        for p in ws.panes.values().filter(|p| p.tab == tab) {
+            if let Some(team) = &p.team {
+                *live.entry(team.clone()).or_default() |= p.role == Some(Role::Lead);
+            }
+        }
+        (t.name.clone(), t.workspace.clone(), live)
+    };
+    let items = state.inbox.open_count_by_owner(&name);
+    let mut teams: std::collections::BTreeMap<String, String> =
+        live.into_iter().map(|(id, lead)| (id, if lead { "리드 실행 중" } else { "팀원 실행 중" }.to_string())).collect();
+    for (id, line) in crate::teams::briefs_not_done(&workspace) {
+        teams.entry(id).or_insert_with(|| format!("brief 첫 줄 '{line}'"));
+    }
+    if items.total() == 0 && teams.is_empty() {
+        return Ok(());
+    }
+    let mut parts = Vec::new();
+    if items.total() > 0 {
+        let kinds: Vec<String> = [("새", items.new), ("진행 중", items.in_progress), ("종료 제안", items.close_proposed)]
+            .iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(k, n)| format!("{k} {n}"))
+            .collect();
+        parts.push(format!("끝나지 않은 인박스 항목 {}개({})", items.total(), kinds.join("·")));
+    }
+    if !teams.is_empty() {
+        let list: Vec<String> = teams.iter().map(|(id, why)| format!("{id}: {why}")).collect();
+        parts.push(format!("진행 중인 팀 {}개({})", teams.len(), list.join(", ")));
+    }
+    let fix = match (items.total() > 0, !teams.is_empty()) {
+        (true, true) => "항목을 완료(종료 확인)하고, 팀은 brief 첫 줄을 '상태: 완료'로 바꾼 뒤 해산(dismiss_team)하고 다시 시도하세요.",
+        (true, false) => "항목을 완료(종료 확인)하고 다시 시도하세요.",
+        _ => "팀은 brief 첫 줄을 '상태: 완료'로 바꾼 뒤 해산(dismiss_team)하고 다시 시도하세요.",
+    };
+    Err(format!("'{name}' 상시업무를 닫지 않았습니다 — {}. {fix}", parts.join(", ")))
 }
 
 /// R27: renaming / closing a Manager or handover tab also edits its config.json `tabs[]`

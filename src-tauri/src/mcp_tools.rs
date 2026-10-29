@@ -36,6 +36,7 @@ pub const PERMISSIONS: &[(&str, &[Role])] = &[
     ("list_team", &[M, L]),
     ("handoff_done", &[M, D, H]),
     ("create_manager_tab", &[D]),
+    ("close_manager_tab", &[D]),
     ("need_user", &[D, H, M, L, Mb]),
     ("env_status", &[D, H, M, L, Mb]),
     ("env_skip", &[D]),
@@ -207,6 +208,18 @@ fn implemented() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "close_manager_tab",
+            description: "사용자가 요구할 때만 상시업무(Manager) 탭을 닫습니다 — 창이 종료되고 config.json의 tabs에서 빠집니다. 작업 폴더·issues·teams와 완료된 인박스 항목은 남습니다. 끝나지 않은 인박스 항목이나 진행 중인 팀이 있으면 거부됩니다(이유와 정리 방법을 사용자에게 그대로 전하세요). handover·일반 탭은 닫지 않습니다.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "닫을 상시업무 탭 이름(= Manager 세션 이름)" }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
             name: "need_user",
             description: "사용자의 판단·결정이 필요할 때 호출합니다. 먼저 질문을 화면에 쓰고 이 도구를 부르면, 앱이 이 창의 탭에 ⚠ 표시와 사유를 띄웁니다(사용자가 이 창으로 오면 해제). 포커스는 옮기지 않습니다.",
             input_schema: json!({
@@ -316,6 +329,7 @@ pub fn call(state: &AppState, caller: &Caller, name: &str, args: Value) -> Resul
         "dismiss" => dismiss(state, caller, &args),
         "dismiss_team" => dismiss_team(state, caller, &args),
         "create_manager_tab" => create_manager_tab(state, caller, &args),
+        "close_manager_tab" => close_manager_tab(state, &args),
         "need_user" => crate::attention::need_user(state, caller, &args),
         "env_status" => Ok(json!({ "items": crate::envcheck::status(state) })),
         "env_skip" => env_skip(state, &args),
@@ -705,6 +719,34 @@ fn create_manager_tab(state: &AppState, _caller: &Caller, args: &Value) -> Resul
     create_manager_tab_with(state, name, dir, template, false)
 }
 
+/// `close_manager_tab(name)` (Dispatcher, remove-tab spec RC2 / R1 a — the role prompt says
+/// "only when the user asks"): the name's Manager tab goes through the same `CloseTab` path as
+/// the UI, so decision c's refusal (unfinished inbox items, running teams) comes back word for
+/// word and config.json loses the entry (R27). The handover tab closes only from the UI with a
+/// Y/N (R3 a); plain and Dispatcher tabs are not standing tasks.
+fn close_manager_tab(state: &AppState, args: &Value) -> Result<Value, String> {
+    let name = req_str(args, "name")?;
+    cap_chars("name", &name, NAME_MAX)?;
+    let (tab, role) = {
+        let ws = state.ws.lock().unwrap();
+        let t = ws.tabs.values().find(|t| t.name == name).ok_or_else(|| format!("'{name}' 탭이 없습니다"))?;
+        (t.id.clone(), t.role)
+    };
+    match role {
+        Some(Role::Manager) => {}
+        Some(Role::Handover) => {
+            return Err(format!(
+                "'{name}'은(는) handover 탭이라 close_manager_tab으로 닫지 않습니다 — 사용자가 그 탭에서 팔레트의 '현재 탭 닫기'(Y/N)로 닫습니다"
+            ))
+        }
+        _ => return Err(format!("'{name}'은(는) 상시업무(Manager) 탭이 아닙니다 — close_manager_tab은 상시업무 탭만 닫습니다")),
+    }
+    launcher::execute(state, WsCommand::CloseTab { tab })?;
+    Ok(Value::String(format!(
+        "'{name}' 상시업무를 닫았습니다 — 작업 폴더·issues·teams와 완료된 인박스 항목은 남습니다(같은 이름·dir로 다시 만들면 이어집니다)"
+    )))
+}
+
 /// The new-tab wizard's "Manager" choice (Task 12): the same checks and config.json entry as
 /// `create_manager_tab`, but a user action — the tab opens in the focused group and takes the
 /// focus (`CreateTab{group: None}`). Template: `manager` if present, else defaultTemplate (R2).
@@ -928,8 +970,8 @@ mod tests {
         assert_eq!(
             names(Role::Dispatcher),
             [
-                "inbox_list", "handoff_done", "create_manager_tab", "need_user", "env_status", "env_skip", "env_set_source", "config_reload",
-                "focus_status", "focus_set"
+                "inbox_list", "handoff_done", "create_manager_tab", "close_manager_tab", "need_user", "env_status", "env_skip",
+                "env_set_source", "config_reload", "focus_status", "focus_set"
             ]
         );
         assert_eq!(names(Role::Lead), ["inbox_list", "hire_member", "dismiss", "dismiss_team", "list_team", "need_user", "env_status"]);
@@ -1028,7 +1070,8 @@ mod tests {
 
     /// R29: renaming a Manager tab moves the owner of its inbox items in the same operation
     /// (config entry + items + model), so the renamed Manager keeps its items and nobody else
-    /// gets them; closing a role tab orphans its items (owner unknown, dispatcher only).
+    /// gets them; closing a role tab orphans its items (owner unknown, dispatcher only) — only
+    /// done ones since ④ decision c refuses to close a Manager tab with open items.
     #[test]
     fn rename_of_a_manager_tab_moves_its_inbox_items() {
         let f = fx(TWO_MANAGERS);
@@ -1047,11 +1090,16 @@ mod tests {
         let o = f.who("ops").tab;
         assert!(crate::launcher::execute(&f.state, WsCommand::RenameTab { tab: o.clone(), name: "billing2".into() }).is_err());
         assert_eq!(f.state.inbox.get(&id).unwrap().owner_name, "billing2");
-        // closing the owner tab leaves the item to the dispatcher only
+        // closing the owner tab: refused while the item is open (④ decision c) …
         let b = f.who("billing").tab;
+        let err = crate::launcher::execute(&f.state, WsCommand::CloseTab { tab: b.clone() }).unwrap_err();
+        assert!(err.contains("끝나지 않은 인박스 항목 1개"), "{err}");
+        // … and once it is done, the item stays, left to the dispatcher only
+        f.call("billing", "inbox_propose_close", json!({"item": id, "final_opinion": "끝"})).unwrap();
+        f.state.inbox.confirm_done(&id).unwrap();
         crate::launcher::execute(&f.state, WsCommand::CloseTab { tab: b }).unwrap();
-        assert_eq!(f.call("ops", "inbox_list", json!({})).unwrap().as_array().unwrap().len(), 0);
-        assert_eq!(f.call("dispatcher", "inbox_list", json!({})).unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(f.call("ops", "inbox_list", json!({"state": "done"})).unwrap().as_array().unwrap().len(), 0);
+        assert_eq!(f.call("dispatcher", "inbox_list", json!({"state": "done"})).unwrap().as_array().unwrap().len(), 1);
     }
 
     /// QA #16 (2단계): an item belongs to its Manager by tab name (R29), not by tab id. After a
@@ -1588,6 +1636,210 @@ mod tests {
   "nightlyRefresh": "04:30"
 }
 "#;
+
+    // ---- ④ removal (decision c): a Manager tab with unfinished work is not closed ----
+
+    const REMOVE_CONFIG: &str = r#"{"tabs":[
+  {"name":"billing","role":"manager","dir":"billing"},
+  {"name":"ops","role":"manager","dir":"ops"},
+  {"name":"api","dir":"api"},
+  {"name":"handover","role":"handover","dir":""}]}
+"#;
+
+    fn close(f: &Fx, name: &str) -> Result<crate::Snapshot, String> {
+        crate::launcher::execute(&f.state, WsCommand::CloseTab { tab: tab_of(f, name) })
+    }
+
+    fn post(f: &Fx, who: &str, title: &str) -> String {
+        let id = f.call(who, "inbox_post", json!({"title": title, "check": [], "risk": [], "source": "s"})).unwrap();
+        id.as_str().unwrap().to_string()
+    }
+
+    fn write(f: &Fx, rel: &str, text: &str) {
+        let p = f.root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    #[test]
+    fn close_manager_tab_refused_with_open_inbox_items() {
+        let f = fx(REMOVE_CONFIG);
+        post(&f, "billing", "새 항목");
+        let busy = post(&f, "billing", "진행 중 항목");
+        f.state.inbox.instruct(&busy, "이어서 해").unwrap();
+        let proposed = post(&f, "billing", "종료 제안 항목");
+        f.call("billing", "inbox_propose_close", json!({"item": proposed, "final_opinion": "끝"})).unwrap();
+        post(&f, "ops", "다른 탭 항목"); // another Manager's item does not count
+        let err = close(&f, "billing").unwrap_err();
+        assert_eq!(
+            err,
+            "'billing' 상시업무를 닫지 않았습니다 — 끝나지 않은 인박스 항목 3개(새 1·진행 중 1·종료 제안 1). \
+             항목을 완료(종료 확인)하고 다시 시도하세요."
+        );
+        // a closing proposal still counts until the user confirms it; confirmed = done
+        for id in [&busy] {
+            f.call("billing", "inbox_propose_close", json!({"item": id, "final_opinion": "끝"})).unwrap();
+        }
+        f.state.inbox.confirm_done(&busy).unwrap();
+        let err = close(&f, "billing").unwrap_err();
+        assert!(err.contains("인박스 항목 2개(새 1·종료 제안 1)"), "{err}");
+    }
+
+    #[test]
+    fn close_manager_tab_refused_with_live_team_panes() {
+        let f = fx(REMOVE_CONFIG);
+        // the brief already says done: the running lead alone (criterion a) refuses
+        write(&f, "billing/teams/a/brief.md", "상태: 완료\n# brief\n");
+        f.call("billing", "hire_lead", json!({"team": "a", "brief_path": "teams/a/brief.md"})).unwrap();
+        f.call("billing-a-lead", "hire_member", json!({})).unwrap();
+        let err = close(&f, "billing").unwrap_err();
+        assert_eq!(
+            err,
+            "'billing' 상시업무를 닫지 않았습니다 — 진행 중인 팀 1개(a: 리드 실행 중). \
+             팀은 brief 첫 줄을 '상태: 완료'로 바꾼 뒤 해산(dismiss_team)하고 다시 시도하세요."
+        );
+        assert!(f.has("billing-a-lead") && f.has("billing-a-m1"), "the team keeps running");
+    }
+
+    #[test]
+    fn close_manager_tab_refused_when_a_brief_is_not_done() {
+        let f = fx(REMOVE_CONFIG);
+        // criterion b: no team pane (e.g. right after a restart, before the Manager re-hires)
+        write(&f, "billing/teams/rep/brief.md", "상태: 진행 중\n목표: 보고서\n");
+        write(&f, "billing/teams/old/brief.md", "  상태: 완료  \r\n끝난 팀\n"); // trimmed first line: done
+        write(&f, "billing/teams/notes/readme.md", "brief 없음 = 팀이 아님\n");
+        let err = close(&f, "billing").unwrap_err();
+        assert_eq!(
+            err,
+            "'billing' 상시업무를 닫지 않았습니다 — 진행 중인 팀 1개(rep: brief 첫 줄 '상태: 진행 중'). \
+             팀은 brief 첫 줄을 '상태: 완료'로 바꾼 뒤 해산(dismiss_team)하고 다시 시도하세요."
+        );
+        // both kinds at once: one message, both remedies
+        post(&f, "billing", "새 항목");
+        let err = close(&f, "billing").unwrap_err();
+        assert_eq!(
+            err,
+            "'billing' 상시업무를 닫지 않았습니다 — 끝나지 않은 인박스 항목 1개(새 1), \
+             진행 중인 팀 1개(rep: brief 첫 줄 '상태: 진행 중'). \
+             항목을 완료(종료 확인)하고, 팀은 brief 첫 줄을 '상태: 완료'로 바꾼 뒤 해산(dismiss_team)하고 다시 시도하세요."
+        );
+    }
+
+    #[test]
+    fn close_manager_tab_allowed_when_all_done_keeps_folders_and_items() {
+        let f = fx(REMOVE_CONFIG);
+        let done = post(&f, "billing", "끝난 항목");
+        f.call("billing", "inbox_propose_close", json!({"item": done, "final_opinion": "끝"})).unwrap();
+        f.state.inbox.confirm_done(&done).unwrap();
+        write(&f, "billing/issues/20261026-x/input/a.txt", "자료");
+        write(&f, "billing/teams/a/brief.md", "상태: 완료\n# brief\n");
+        f.call("billing", "hire_lead", json!({"team": "a", "brief_path": "teams/a/brief.md"})).unwrap();
+        f.call("billing", "dismiss_team", json!({"team": "a"})).unwrap();
+        close(&f, "billing").unwrap();
+        assert!(tab_of(&f, "billing").is_empty(), "the tab is gone");
+        let v: Value = serde_json::from_str(&f.config_text()).unwrap();
+        assert!(!v["tabs"].as_array().unwrap().iter().any(|t| t["name"] == "billing"));
+        // what stays: the folder, its issues and teams, and the (done) item — owner unknown now
+        assert!(f.root.join("billing/issues/20261026-x/input/a.txt").exists());
+        assert!(f.root.join("billing/teams/a/brief.md").exists());
+        let it = f.state.inbox.get(&done).unwrap();
+        assert_eq!((it.owner_name.as_str(), it.state), ("billing", ItemState::Done));
+        f.valid();
+    }
+
+    #[test]
+    fn refused_close_changes_nothing() {
+        let f = fx(REMOVE_CONFIG);
+        let id = post(&f, "billing", "새 항목");
+        write(&f, "billing/teams/rep/brief.md", "상태: 진행 중\n");
+        let (text, ws, cfg, item) = (
+            f.config_text(),
+            f.state.ws.lock().unwrap().clone(),
+            f.state.loaded.read().unwrap().config.clone(),
+            f.state.inbox.get(&id).unwrap(),
+        );
+        assert!(close(&f, "billing").is_err());
+        assert_eq!(f.config_text(), text, "config.json untouched");
+        assert_eq!(*f.state.ws.lock().unwrap(), ws, "model untouched");
+        assert_eq!(f.state.loaded.read().unwrap().config, cfg, "loaded config untouched");
+        assert_eq!(f.state.inbox.get(&id).unwrap(), item, "item untouched");
+        assert!(f._rx.try_recv().is_err(), "no process killed");
+    }
+
+    /// Decision c is about Manager tabs (they own inbox items and teams); plain and handover
+    /// tabs close as before even with items or briefs under their folders.
+    #[test]
+    fn plain_and_handover_tabs_skip_the_inbox_team_check() {
+        let f = fx(REMOVE_CONFIG);
+        f.state.inbox.post_system("api", "이름이 같은 항목", vec![], vec![]).unwrap();
+        write(&f, "api/teams/x/brief.md", "상태: 진행 중\n");
+        close(&f, "api").unwrap();
+        assert!(tab_of(&f, "api").is_empty());
+        f.state.inbox.post_system("handover", "이름이 같은 항목", vec![], vec![]).unwrap();
+        write(&f, "teams/y/brief.md", "상태: 진행 중\n"); // handover's folder is workspaceRoot
+        close(&f, "handover").unwrap();
+        assert!(tab_of(&f, "handover").is_empty());
+        let v: Value = serde_json::from_str(&f.config_text()).unwrap();
+        assert!(!v["tabs"].as_array().unwrap().iter().any(|t| t["name"] == "handover"));
+        f.valid();
+    }
+
+    // ---- ④ RC2: the dispatcher closes a standing task on the user's word ----
+
+    #[test]
+    fn close_manager_tab_is_dispatcher_only() {
+        assert!(allowed("close_manager_tab", Role::Dispatcher));
+        for r in [Role::Handover, Role::Manager, Role::Lead, Role::Member] {
+            assert!(!allowed("close_manager_tab", r), "{}", r.as_str());
+        }
+        let f = fx(REMOVE_CONFIG);
+        let e = f.call("billing", "close_manager_tab", json!({"name": "ops"})).unwrap_err();
+        assert!(e.contains("close_manager_tab"), "{e}");
+        assert!(f.has("ops"), "nothing closed");
+    }
+
+    /// R3 a: the handover tab closes only from the UI (Y/N); plain, unknown and the dispatcher
+    /// tab are refused in Korean and nothing changes.
+    #[test]
+    fn close_manager_tab_rejects_handover_plain_and_unknown() {
+        let f = fx(REMOVE_CONFIG);
+        let text = f.config_text();
+        let e = f.call("dispatcher", "close_manager_tab", json!({"name": "handover"})).unwrap_err();
+        assert!(e.contains("handover") && e.contains("현재 탭 닫기"), "{e}");
+        let e = f.call("dispatcher", "close_manager_tab", json!({"name": "api"})).unwrap_err();
+        assert!(e.contains("'api'") && e.contains("상시업무"), "{e}");
+        let e = f.call("dispatcher", "close_manager_tab", json!({"name": "nope"})).unwrap_err();
+        assert!(e.contains("'nope'") && e.contains("없습니다"), "{e}");
+        let e = f.call("dispatcher", "close_manager_tab", json!({"name": "dispatcher"})).unwrap_err();
+        assert!(e.contains("상시업무"), "{e}");
+        assert!(f.call("dispatcher", "close_manager_tab", json!({})).is_err(), "name is required");
+        for name in ["handover", "api", "dispatcher", "billing", "ops"] {
+            assert!(!tab_of(&f, name).is_empty(), "{name} still there");
+        }
+        assert_eq!(f.config_text(), text);
+    }
+
+    /// The tool goes through the same `CloseTab` path: config.json loses the entry, its group
+    /// listing and trust skip (R27); a refusal (decision c) comes back word for word.
+    #[test]
+    fn close_manager_tab_edits_config_like_close_tab() {
+        let f = fx(R27_CONFIG);
+        let r = f.call("dispatcher", "close_manager_tab", json!({"name": "billing"})).unwrap();
+        assert!(r.as_str().is_some_and(|s| s.contains("'billing'") && s.contains("닫았습니다")), "{r}");
+        assert!(tab_of(&f, "billing").is_empty());
+        let v: Value = serde_json::from_str(&f.config_text()).unwrap();
+        assert_eq!(v["tabs"], json!([{"name":"api","dir":"api"}]));
+        assert_eq!(v["groups"]["children"][1]["group"]["tabs"], json!(["api"]));
+        assert_eq!(v["envSkip"], json!(["git-bash"]));
+        assert!(load_all(&f.appdata).errors.is_empty());
+        f.valid();
+
+        let f = fx(REMOVE_CONFIG);
+        post(&f, "ops", "새 항목");
+        let e = f.call("dispatcher", "close_manager_tab", json!({"name": "ops"})).unwrap_err();
+        assert_eq!(e, close(&f, "ops").unwrap_err());
+        assert!(f.has("ops"));
+    }
 
     fn tab_of(f: &Fx, name: &str) -> String {
         f.state.ws.lock().unwrap().tabs.values().find(|t| t.name == name).map(|t| t.id.clone()).unwrap_or_default()
