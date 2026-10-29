@@ -53,6 +53,9 @@ pub struct BoardEntry {
     pub session_id: Option<String>,
     /// Model of the session: SessionStart's `model`, then the transcript's last assistant model.
     pub model: Option<String>,
+    /// Made by the session-file poll (a plain pane), not by hooks.
+    #[serde(skip)]
+    pub polled: bool,
 }
 
 impl BoardEntry {
@@ -67,6 +70,7 @@ impl BoardEntry {
             transcript: None,
             session_id: None,
             model: None,
+            polled: false,
         }
     }
 }
@@ -131,6 +135,31 @@ impl Board {
             }
         }
         e.updated_at = now_ms;
+    }
+
+    /// A plain pane's polled entry: store `next` (or remove the old polled entry for `None`);
+    /// whether anything but the time changed.
+    fn set_polled(&self, pane: &str, next: Option<BoardEntry>, now_ms: u64) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        match next {
+            None => g.get(pane).is_some_and(|e| e.polled) && g.remove(pane).is_some(),
+            Some(mut n) => {
+                if g.get(pane).is_some_and(|old| BoardEntry { updated_at: 0, ..old.clone() } == n) {
+                    return false;
+                }
+                n.updated_at = now_ms;
+                g.insert(pane.to_string(), n);
+                true
+            }
+        }
+    }
+
+    /// Remove polled entries of panes not in `keep`; whether any went.
+    fn drop_polled_except(&self, keep: &std::collections::HashSet<&PaneId>) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let before = g.len();
+        g.retain(|pane, e| !e.polled || keep.contains(pane));
+        g.len() != before
     }
 
     fn all(&self) -> Vec<(PaneId, BoardEntry)> {
@@ -374,6 +403,151 @@ pub fn status(state: &AppState) -> BoardStatus {
     }
 }
 
+// ───────── plain claude panes: their own session files (D3b) ─────────
+//
+// A pane started without a role gets no hooks. If it runs Claude Code — started by its profile
+// (the PTY child is claude) or typed into its shell (a descendant is) — Claude Code's own
+// session file `~/.claude/sessions/<pid>.json` names the session, and its transcript gives the
+// rest. Only pids of the pane's own process tree are looked up: no other session file is ever
+// opened, and the folder is never listed (AgentBoard shows its own panes only). Fields as
+// session-board reads them (pid, sessionId, cwd, status idle|busy, procStart) 「추정」: not
+// checked against a file written while an AgentBoard pane ran.
+
+/// Interval of [`start_session_poll`].
+pub const SESSION_POLL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Where Claude Code keeps live sessions and transcripts.
+pub struct SessionDirs {
+    pub sessions: PathBuf,
+    pub projects: PathBuf,
+}
+
+impl SessionDirs {
+    /// `~/.claude/sessions` and `~/.claude/projects`.
+    pub fn home() -> Option<SessionDirs> {
+        let c = dirs::home_dir()?.join(".claude");
+        Some(SessionDirs { sessions: c.join("sessions"), projects: c.join("projects") })
+    }
+}
+
+/// The part of `sessions/<pid>.json` the board uses.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SessionFile {
+    pub pid: u32,
+    pub session_id: String,
+    pub cwd: String,
+    /// `status`: `idle` → true, `busy` → false, anything else unknown.
+    pub idle: Option<bool>,
+    /// `procStart` as text (the process creation FILETIME; a number or a string).
+    pub proc_start: Option<String>,
+}
+
+/// `<dir>/<pid>.json`, if it exists, parses, names a session and describes process `pid`.
+pub(crate) fn read_session_file(dir: &Path, pid: u32) -> Option<SessionFile> {
+    let text = std::fs::read_to_string(dir.join(format!("{pid}.json"))).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    if v.get("pid").and_then(Value::as_u64) != Some(u64::from(pid)) {
+        return None;
+    }
+    let session_id = v.get("sessionId").and_then(Value::as_str).filter(|s| !s.is_empty())?.to_string();
+    let cwd = v.get("cwd").and_then(Value::as_str).unwrap_or_default().to_string();
+    let idle = match v.get("status").and_then(Value::as_str) {
+        Some("idle") => Some(true),
+        Some("busy") => Some(false),
+        _ => None,
+    };
+    let proc_start = match v.get("procStart") {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    };
+    Some(SessionFile { pid, session_id, cwd, idle, proc_start })
+}
+
+/// A session's transcript: `<projects>/<cwd with ':' '\' '/' as '-'>/<id>.jsonl`.
+pub(crate) fn transcript_path(projects: &Path, cwd: &str, id: &str) -> PathBuf {
+    let slug: String = cwd.chars().map(|c| if matches!(c, ':' | '\\' | '/') { '-' } else { c }).collect();
+    projects.join(slug).join(format!("{id}.jsonl"))
+}
+
+/// The first of `pids` (the pane's process tree, root first) with a session file of its own: a
+/// file whose `procStart` differs from the live process's creation time was left by an earlier
+/// process with the same id and is skipped.
+pub(crate) fn session_for(dirs: &SessionDirs, pids: &[u32], created: &dyn Fn(u32) -> Option<u64>) -> Option<SessionFile> {
+    pids.iter().find_map(|&pid| {
+        let f = read_session_file(&dirs.sessions, pid)?;
+        match (&f.proc_start, created(pid)) {
+            (Some(s), Some(c)) if *s != c.to_string() => None,
+            _ => Some(f),
+        }
+    })
+}
+
+/// Running terminal panes without a role, with their generation and PTY child pid (`ws`, then
+/// the PtyManager `panes` map, one at a time).
+fn plain_running_panes(state: &AppState) -> Vec<(PaneId, u64, u32)> {
+    let ids: Vec<PaneId> = {
+        let ws = state.ws.lock().unwrap();
+        ws.panes
+            .values()
+            .filter(|p| p.role.is_none() && !p.kind.is_applet() && p.status == crate::workspace::PaneStatus::Running)
+            .map(|p| p.id.clone())
+            .collect()
+    };
+    ids.into_iter().filter_map(|id| Some((id.clone(), state.pty.current_gen(&id)?, state.pty.pid(&id)?))).collect()
+}
+
+/// One round for the plain panes: each pane's entry follows its session file (none → no entry)
+/// and transcript (cached by mtime/size). Entries of panes that stopped being plain running
+/// panes go too. `board-changed` once if anything changed; returns whether it did.
+/// `tree`/`created`: [`crate::proctree`] in the app, fakes in tests.
+pub fn poll_session_files(
+    state: &AppState,
+    dirs: &SessionDirs,
+    tree: &dyn Fn(u32) -> Vec<u32>,
+    created: &dyn Fn(u32) -> Option<u64>,
+) -> bool {
+    let candidates = plain_running_panes(state);
+    let mut changed = false;
+    for (pane, gen, child) in &candidates {
+        let next = session_for(dirs, &tree(*child), created).map(|f| {
+            let path = transcript_path(&dirs.projects, &f.cwd, &f.session_id);
+            let info = state.board.transcript_for(&path).unwrap_or_default();
+            BoardEntry {
+                idle: f.idle.unwrap_or(false),
+                last_prompt: info.last_prompt,
+                last_reply: info.last_reply,
+                context_tokens: info.context_tokens,
+                updated_at: 0,
+                gen: *gen,
+                transcript: Some(path),
+                session_id: Some(f.session_id),
+                model: info.model,
+                polled: true,
+            }
+        });
+        changed |= state.board.set_polled(pane, next, now_ms());
+    }
+    let keep: std::collections::HashSet<&PaneId> = candidates.iter().map(|(p, _, _)| p).collect();
+    changed |= state.board.drop_polled_except(&keep);
+    if changed {
+        state.ui.board_changed();
+    }
+    changed
+}
+
+/// The poll thread for plain panes ([`SESSION_POLL`]); lives as long as the app.
+pub fn start_session_poll<H: crate::control::StateHost>(host: H) {
+    let spawned = std::thread::Builder::new().name("agentboard-sessions".into()).spawn(move || loop {
+        std::thread::sleep(SESSION_POLL);
+        let (Some(state), Some(dirs)) = (host.get(), SessionDirs::home()) else { continue };
+        poll_session_files(state, &dirs, &crate::proctree::self_and_descendants, &crate::proctree::creation_time);
+    });
+    if let Err(e) = spawned {
+        eprintln!("[agentboard] 세션 파일 확인 스레드를 시작할 수 없습니다: {e}");
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
@@ -468,7 +642,7 @@ mod tests {
         let s = json!({ "workspaceRoot": root.path().to_string_lossy() });
         std::fs::write(appdata.path().join("settings.json"), s.to_string()).unwrap();
         ensure_dotdir(root.path()).unwrap();
-        std::fs::write(root.path().join(".agentboard/config.json"), r#"{"tabs":[{"name":"billing","role":"manager","dir":"billing"}]}"#)
+        std::fs::write(root.path().join(".agentboard/config.json"), r#"{"tabs":[{"name":"billing","role":"manager","dir":"billing"},{"name":"api","dir":"api"}]}"#)
             .unwrap();
         let loaded = load_all(appdata.path());
         assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
@@ -718,5 +892,147 @@ mod tests {
         let e = f.entry();
         assert_eq!((e.context_tokens, e.model.as_deref()), (Some(5), Some("m")));
         assert_eq!(e.session_id.as_deref(), Some("9887ea82-aaaa"), "kept through the turn");
+    }
+
+    // ---- ③ D3b: plain claude panes through their own session files ----
+
+    /// A pane without a role (no hooks): its PTY child's id is that of the claude process it
+    /// runs (or one of its descendants does — a shell where the user typed `claude`).
+    struct Sess {
+        dirs: SessionDirs,
+        _d: tempfile::TempDir,
+    }
+
+    fn sess() -> Sess {
+        let d = tempfile::tempdir().unwrap();
+        let dirs = SessionDirs { sessions: d.path().join("sessions"), projects: d.path().join("projects") };
+        std::fs::create_dir_all(&dirs.sessions).unwrap();
+        Sess { dirs, _d: d }
+    }
+
+    impl Sess {
+        fn file(&self, pid: u32, body: Value) {
+            std::fs::write(self.dirs.sessions.join(format!("{pid}.json")), body.to_string()).unwrap();
+        }
+        fn transcript(&self, cwd: &str, id: &str, lines: &[String]) {
+            let p = transcript_path(&self.dirs.projects, cwd, id);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, lines.join("\n") + "\n").unwrap();
+        }
+    }
+
+    fn session(pid: u32, id: &str, status: &str) -> Value {
+        json!({"pid": pid, "sessionId": id, "cwd": r"C:\proj\a", "status": status, "procStart": "1330", "kind": "interactive", "name": "x"})
+    }
+
+    #[test]
+    fn session_files_and_transcript_paths() {
+        let s = sess();
+        s.file(4242, session(4242, "s1", "busy"));
+        let f = read_session_file(&s.dirs.sessions, 4242).unwrap();
+        assert_eq!((f.pid, f.session_id.as_str(), f.cwd.as_str(), f.idle), (4242, "s1", r"C:\proj\a", Some(false)));
+        assert_eq!(f.proc_start.as_deref(), Some("1330"));
+        s.file(4243, json!({"pid": 4243, "sessionId": "s2", "cwd": "C:/x", "status": "idle", "procStart": 1331}));
+        let g = read_session_file(&s.dirs.sessions, 4243).unwrap();
+        assert_eq!((g.idle, g.proc_start.as_deref()), (Some(true), Some("1331")), "a numeric procStart compares as text");
+        // the file must describe the process it is named after
+        s.file(4244, session(9999, "s3", "busy"));
+        assert!(read_session_file(&s.dirs.sessions, 4244).is_none());
+        assert!(read_session_file(&s.dirs.sessions, 4245).is_none());
+        // Claude Code's project folder: ':', '\' and '/' become '-'
+        assert_eq!(transcript_path(&s.dirs.projects, r"C:\proj\a", "s1"), s.dirs.projects.join("C--proj-a").join("s1.jsonl"));
+    }
+
+    /// AgentBoard only looks at its own processes: the session file of a pid outside the pane's
+    /// process tree is never opened, and a file left by an earlier process with the same pid
+    /// (procStart differs) is ignored.
+    #[test]
+    fn session_lookup_opens_only_own_pids() {
+        let s = sess();
+        s.file(4242, session(4242, "mine", "busy"));
+        s.file(5555, session(5555, "someone-else", "busy"));
+        let created = |pid: u32| (pid == 4242).then_some(1330u64);
+        assert_eq!(session_for(&s.dirs, &[100, 4242], &created).unwrap().session_id, "mine");
+        assert!(session_for(&s.dirs, &[100, 101], &created).is_none(), "5555 is not ours: never used");
+        let reused = |pid: u32| (pid == 4242).then_some(7777u64);
+        assert!(session_for(&s.dirs, &[4242], &reused).is_none(), "stale file of an earlier process");
+    }
+
+    fn plain_pane(f: &Fx) -> String {
+        let ws = f.state.ws.lock().unwrap();
+        ws.panes.values().find(|p| p.role.is_none() && !p.kind.is_applet()).expect("plain terminal pane").id.clone()
+    }
+
+    #[test]
+    fn poll_fills_a_plain_claude_pane_from_its_session_file() {
+        let f = fixture();
+        let plain = plain_pane(&f);
+        let spec = SpawnSpec {
+            cmd: "cmd.exe".into(),
+            args: vec!["/q".into(), "/k".into()],
+            env: vec![],
+            env_remove: vec![],
+            cwd: std::env::temp_dir(),
+            cols: 80,
+            rows: 24,
+        };
+        f.state.pty.spawn(&plain, spec).unwrap();
+        f.state.ws.lock().unwrap().set_status(&plain, crate::workspace::PaneStatus::Running);
+        let child = f.state.pty.pid(&plain).unwrap();
+        f.spawn(); // the Manager pane runs too: role panes are left to their hooks
+        let s = sess();
+        // the user typed `claude` in the pane's shell: the claude process is a grandchild
+        let tree = move |pid: u32| if pid == child { vec![child, 7001, 4242] } else { vec![pid] };
+        let created = |pid: u32| (pid == 4242).then_some(1330u64);
+        assert!(!poll_session_files(&f.state, &s.dirs, &tree, &created), "no session file yet");
+        assert!(!panes(&f.state).contains_key(&plain));
+        s.file(4242, session(4242, "s1", "busy"));
+        s.transcript(r"C:\proj\a", "s1", &[
+            json!({"type": "user", "message": {"role": "user", "content": "보고서 정리"}}).to_string(),
+            json!({"type": "assistant", "message": {"role": "assistant", "model": "claude-x",
+                "content": [{"type": "text", "text": "정리했습니다"}],
+                "usage": {"input_tokens": 1, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 0}}}).to_string(),
+        ]);
+        let before = f.board_events();
+        assert!(poll_session_files(&f.state, &s.dirs, &tree, &created));
+        let e = panes(&f.state).get(&plain).cloned().expect("entry for the plain pane");
+        assert_eq!((e.idle, e.context_tokens, e.model.as_deref()), (false, Some(101), Some("claude-x")));
+        assert_eq!((e.last_prompt.as_deref(), e.last_reply.as_deref()), (Some("보고서 정리"), Some("정리했습니다")));
+        assert_eq!(f.board_events(), before + 1, "a change emits board-changed");
+        assert!(!panes(&f.state).contains_key(&f.pane), "the role pane is not polled");
+        // nothing changed: no event
+        assert!(!poll_session_files(&f.state, &s.dirs, &tree, &created));
+        assert_eq!(f.board_events(), before + 1);
+        // the session goes idle
+        s.file(4242, session(4242, "s1", "idle"));
+        assert!(poll_session_files(&f.state, &s.dirs, &tree, &created));
+        assert!(panes(&f.state)[&plain].idle);
+        // claude exits (its session file goes): the entry goes too
+        std::fs::remove_file(s.dirs.sessions.join("4242.json")).unwrap();
+        assert!(poll_session_files(&f.state, &s.dirs, &tree, &created));
+        assert!(!panes(&f.state).contains_key(&plain));
+        f.state.pty.remove(&plain);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_tree_lists_real_descendants() {
+        let mut c = std::process::Command::new("cmd.exe")
+            .args(["/c", "ping -n 6 127.0.0.1 >nul"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut d = Vec::new();
+        while d.len() < 2 && std::time::Instant::now() < end {
+            d = crate::proctree::self_and_descendants(c.id());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(d.first(), Some(&c.id()), "the root first");
+        assert!(d.len() >= 2, "ping is a descendant: {d:?}");
+        assert!(d.iter().all(|p| crate::proctree::creation_time(*p).is_some()));
+        assert!(crate::proctree::self_and_descendants(u32::MAX - 7).is_empty(), "no such process");
+        let _ = c.kill();
+        let _ = c.wait();
     }
 }

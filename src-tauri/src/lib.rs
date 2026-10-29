@@ -16,6 +16,7 @@ pub mod mcp_tools;
 pub mod memo;
 pub mod nightly;
 pub mod persist;
+pub mod proctree;
 pub mod profiles;
 pub mod roles;
 pub mod workspace;
@@ -982,6 +983,7 @@ pub fn run() {
             start_doc_watcher(app.handle().clone());
             // nightly refresh scheduler (Task 11); last run date in %APPDATA%/agentboard/nightly.json
             nightly::start(app.handle().clone(), appdata.join(nightly::FILE_NAME));
+            board::start_session_poll(app.handle().clone()); // plain claude panes (dashboard D3b)
             // spawning happens on the launcher thread: window creation is not blocked
             launcher::start(app.handle(), rx, initial);
             // environment check (Task 12): probes run off the UI thread; `env-changed` when done

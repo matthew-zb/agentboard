@@ -78,6 +78,10 @@
 //!   Inbox relay (Task 10, `bridge::relay_*` from Tauri commands): `ws` (released), then the
 //!   inbox, then `inner`/`wake` via `send` — one at a time, never nested.
 //! * Attention (attention.rs, Task 9): `AppState::trust` (folder-trust timers) is a leaf.
+//! * Board session poll (board.rs, D3b, its own thread every 3 s): `ws` (released), then the
+//!   PtyManager `panes` map per pane (released), then process snapshots / session-file and
+//!   transcript reads with no app lock (the context cache lock alone around a read), then the
+//!   board lock alone to store; `board-changed` after, with no lock held.
 //! * Board (board.rs): `AppState::board` (entries) and its context cache are leaves. Hook
 //!   handlers take the PtyManager `panes` map (`current_gen`, released), then the board lock
 //!   (released), then on Stop the cache lock alone around the transcript tail read, then the
