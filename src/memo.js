@@ -11,7 +11,8 @@
 // backup in .agentboard/memo.bak).
 // Keys come from the applet element (bubble phase): app shortcuts (Alt+…) are taken by the key
 // router first and keep working while editing (the draft stays in the textarea).
-// vi editing (spec §8, V3 b — only when `deps.vi()`, i.e. config.json "memo": {"vi": true}):
+// vi editing (spec §8, V3 b — only when config.json "memo": {"vi": true}, read with memo_settings at
+// mount and again on `config-reloaded`):
 // e opens the editor in normal mode — the textarea read-only, the character under the cursor
 // selected as a block cursor, keys run vi-logic.js; i a A o O hand the textarea back for typing
 // (IME included) until Esc / Ctrl+[. ":" and "/" open a command line under the editor. Esc in
@@ -33,7 +34,7 @@ const deps = {
   loadImages: () => {}, // (rel, images, alive): docview.js loadImages
   confirm: async () => false,
   toast: (m) => console.error('[agentboard]', m),
-  vi: () => false, // spec §8 V3 b: vi editing only when configured (read when the editor opens)
+  vi: null, // tests: a fixed `() => bool`; null = follow memo_settings (spec §8 V3 b)
 };
 
 /** `{render, loadImages, confirm(msg, opts), toast(msg, kind?)}` (app.js). */
@@ -207,7 +208,7 @@ export function mountMemo(paneId) {
     st.base = st.memo;
     st.external = false;
     editor.value = st.base.body;
-    st.vi = deps.vi() ? createVi(normalizeEol(st.base.body, '\n')) : null;
+    st.vi = viOn() ? createVi(normalizeEol(st.base.body, '\n')) : null;
     show();
     editor.focus({ preventScroll: true });
     if (st.vi) {
@@ -441,6 +442,20 @@ export function mountMemo(paneId) {
   root.addEventListener('auxclick', onClick);
   root.addEventListener('dblclick', onDbl);
   root.addEventListener('dragstart', onDrag);
+  // memo.vi (config.json): read at mount and after every settings reload; applies to the next edit
+  let viSetting = false;
+  const loadSettings = () =>
+    api.memoSettings().then(
+      (r) => {
+        if (!st.disposed) viSetting = !!(r && r.vi);
+      },
+      () => {}, // unknown: plain editing
+    );
+  const viOn = () => (typeof deps.vi === 'function' ? !!deps.vi() : viSetting);
+  const unlistenCfg = api.on('config-reloaded', () => {
+    if (!st.disposed) loadSettings();
+  });
+  loadSettings();
   const unlisten = api.on('doc-changed', (p) => {
     if (p && p.paneId === paneId && !st.disposed) read();
   });
@@ -468,7 +483,7 @@ export function mountMemo(paneId) {
       root.removeEventListener('auxclick', onClick);
       root.removeEventListener('dblclick', onDbl);
       root.removeEventListener('dragstart', onDrag);
-      Promise.resolve(unlisten).then((f) => typeof f === 'function' && f(), () => {});
+      for (const u of [unlisten, unlistenCfg]) Promise.resolve(u).then((f) => typeof f === 'function' && f(), () => {});
       api.docUnwatch(paneId).catch(() => {});
       root.remove();
     },

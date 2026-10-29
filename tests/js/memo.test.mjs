@@ -191,6 +191,7 @@ function setup(text, { answer = true, vi = false } = {}) {
       invoke: async (cmd, args) => {
         t.calls.push([cmd, args]);
         if (cmd === 'memo_read') return { path: 'MEMO.md', text: t.text };
+        if (cmd === 'memo_settings') return { vi: !!t.settingsVi };
         if (cmd === 'memo_save') t.text = args.text;
         return null;
       },
@@ -219,7 +220,8 @@ function setup(text, { answer = true, vi = false } = {}) {
       return t.answer;
     },
     toast: (m) => t.toasts.push(String(m)),
-    vi: () => vi, // memo spec §8 V3 b (config.json memo.vi); reset by every test
+    // memo spec §8 V3 b: a fixed answer, or null = follow memo_settings (reset by every test)
+    vi: vi === null ? null : () => vi,
   });
   return t;
 }
@@ -533,5 +535,33 @@ test('vi memo is off unless configured: the editor is plain and Esc cancels as b
   await settle();
   assert.equal(byClass(m.el, 'memo-edit'), undefined);
   m.dispose();
+  teardown();
+});
+
+test('vi follows memo_settings: read at mount, again on config-reloaded', async () => {
+  const t = setup(HEADER + BODY, { vi: null });
+  t.settingsVi = true;
+  const m = mountMemo('p-memo');
+  await settle();
+  assert.equal(t.cmds('memo_settings').length, 1);
+  press(m.el, 'KeyE');
+  assert.equal(byClass(m.el, 'memo-edit').readOnly, true, 'config memo.vi = true: normal mode');
+  press(byClass(m.el, 'memo-edit'), 'Semicolon', { shiftKey: true });
+  cmdline(m).value = 'q';
+  press(cmdline(m), 'Enter');
+  await settle();
+  // the settings are re-read after "설정 다시 읽기" (config-reloaded) and apply to the next edit
+  t.settingsVi = false;
+  t.emit('config-reloaded', null);
+  await settle();
+  assert.equal(t.cmds('memo_settings').length, 2);
+  press(m.el, 'KeyE');
+  const ed = byClass(m.el, 'memo-edit');
+  assert.ok(!ed.readOnly);
+  assert.equal(viBar(m).classList.contains('hidden'), true);
+  m.dispose();
+  t.emit('config-reloaded', null);
+  await settle();
+  assert.equal(t.cmds('memo_settings').length, 2, 'not after dispose');
   teardown();
 });
