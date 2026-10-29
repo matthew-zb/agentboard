@@ -51,5 +51,6 @@
   "group.close": "Ctrl+Alt+x",
   "group.maximize": "Ctrl+Alt+z",
   "app.palette": "Alt+;",
+  "app.dashboard": "Ctrl+Alt+d",
   "pane.breakToTab": null
 }

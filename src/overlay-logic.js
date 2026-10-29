@@ -178,6 +178,7 @@ const LABELS = {
   'group.close': '그룹 닫기',
   'group.maximize': '그룹 최대화 토글',
   'app.palette': '커맨드 팔레트',
+  'app.dashboard': '작업 상태',
 };
 
 /** Korean label of a command id (falls back to the id). */
